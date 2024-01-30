@@ -1,104 +1,25 @@
 import * as querystring from 'querystring';
-import { AbstractInitializer, ChosenServerCreationOption, CreatedServerData, DestroyServerOptions, InitializedSSHKeyData, InitializerParams, ProviderServerCreationOptions } from "../Core/AbstractInitializer";
+import { AbstractInitializer } from "../../Core/AbstractInitializer";
+import { ChosenServerCreationOption, CreatedServerData, DestroyServerOptions, InitializedSSHKeyData, InitializerParams, ProviderServerCreationOptions } from '../../types';
 import axios from 'axios';
-import { makeId, asyncTimeout } from '../utils';
+import { makeId, asyncTimeout } from '../../utils';
 import * as path from 'path';
 import * as fs from 'fs';
-import { MACHINE_TYPES } from '../constants';
+import { MACHINE_TYPES, REGION_TYPES } from '../../constants';
+import { DigitalOceanSizeData, DigitalOceanImageData, DigitalOceanDropletData, DigitalOceanCreateDropletParams } from './types';
 
-type DigitalOceanCreateDropletParams = {
-    name: string,
-    image: string,
-    size: string,
-    region: string,
-    ssh_keys?: Array<string | number>
-}
+export class DigitalOcean extends AbstractInitializer {
 
-
-export type DigitalOceanSizeData = {
-    slug: string,
-    memory: number,
-    vcpus: number,
-    disk: number,
-    transfer: number,
-    price_monthly: number
-    price_hourly: number,
-    regions: Array<string>,
-    available: boolean,
-    description: string,
-  }
-  
-  export type DigitalOceanOpts = {
-    sizes: Array<string>,
-  }
-  
-  export type DigitalOceanImageData = {
-    id: number,
-    name:string,
-    distribution: string,
-    slug: string,
-    public: boolean,
-    regions: string[],
-    created_at: string,
-    min_disk_size: number,
-    type: string,
-    size_gigabytes: number,
-    description: string,
-    tags: [],
-    status:  string,
-  }
-  
-  export type DigitalOceanRegionData ={
-    name: string,
-    slug: string,
-    features: string[],
-    available: boolean,
-    sizes: string[]
-  }
-  
-  type DigitalOceanNetworkData = {
-    ip_address: string,
-    netmask: string,
-    gateway:string,
-    type: string,
-  }
-  
-export type DigitalOceanSSHData = {
-    id: number,
-    fingerprint: string,
-    public_key: string,
-    name: string,
-}
-
-  export type DigitalOceanDropletData = {
-    id: number,
-    name: string,
-    memory: number,
-    vcpus: number,
-    disk: number,
-    locked: boolean,
-    status: boolean,
-    kernel: string | null,
-    created_at: string,
-    features: string[],
-    backup_ids: string[],
-    next_backup_window: string | null,
-    snapshot_ids: string[],
-    image: DigitalOceanImageData
-    volume_ids: string[],
-    size: DigitalOceanSizeData,
-    size_slug: string,
-    networks: { v4: DigitalOceanNetworkData[], v6: DigitalOceanNetworkData[] },
-    region: DigitalOceanRegionData,
-    tags: Array<string>,
-    vpc_uuid: string,
-  }
-
-
-export class DigitalOceanInitializer extends AbstractInitializer {
-    constructor(a: InitializerParams) {
+    constructor(a: InitializerParams | string) {
         super(a);
     }
+
+    public static async Init(params: InitializerParams | string) : Promise<DigitalOcean> {
+        const initializer = new DigitalOcean(params);
+        await initializer.init();
+        return initializer;
+    }
+
     public async getMachineTypeSlug(type: MACHINE_TYPES) {
         switch(type) {
             case MACHINE_TYPES.UBUNTU_22:
@@ -107,6 +28,27 @@ export class DigitalOceanInitializer extends AbstractInitializer {
                 return `ubuntu-20-04-x64`;
         }
     }
+
+    public getRegionSlug(type: REGION_TYPES): string | Promise<string> {
+        switch(type) {
+            case REGION_TYPES.TORONTO:
+                return 'tor1';
+            case REGION_TYPES.NYC:
+                return 'nyc1';
+            case REGION_TYPES.NYC_1:
+            case REGION_TYPES.NYC_2:
+            case REGION_TYPES.NYC_3:
+                return type as string;
+            case REGION_TYPES.SAN_FRANCISCO:
+            case REGION_TYPES.SAN_FRANCISCO_1:
+                return 'sfo1'
+            case REGION_TYPES.SAN_FRANCISCO_2:
+                return 'sfo2';
+            case REGION_TYPES.SAN_FRANCISCO_3:
+                return 'sfo3';
+        }
+    }
+
     public async getOptions(tryUseCache = false, forceCacheRefresh = false): Promise<ProviderServerCreationOptions> {
         if (process.env.NODE_ENV === 'test' && tryUseCache) {
             const testOptPath = path.join(process.cwd(), 'do-server-options.test.json');
@@ -126,7 +68,6 @@ export class DigitalOceanInitializer extends AbstractInitializer {
         const sizes = await this.getAll('https://api.digitalocean.com/v2/sizes', 'sizes');
         const ssh_keys = await this.getAll('https://api.digitalocean.com/v2/account/keys', 'ssh_keys');
         const images = await this.getAll('https://api.digitalocean.com/v2/images', 'images');
-
         return {
             size: sizes.map((s: DigitalOceanSizeData) => s.slug),
             ssh: ssh_keys,
@@ -140,28 +81,46 @@ export class DigitalOceanInitializer extends AbstractInitializer {
                 distribution: i.distribution
             })),
         }
-
     }
 
-    readonly digitalOceanOptions : DigitalOceanDropletData
-
-    private availableSizes: Array<string> 
-    private availableImages: Array<string>
-
-    public async initKey(ssh: string, keyName: string): Promise<InitializedSSHKeyData> {
+    public async addSSHKey(publicKey: string, keyName: string): Promise<InitializedSSHKeyData> {
         const { ssh_key } = await this.post(`https://api.digitalocean.com/v2/account/keys`, {
-            public_key: ssh,
+            public_key: publicKey,
             name: keyName
         });
-        const { name, public_key: publicKey, id, fingerprint } = ssh_key;
+        const { name, public_key, id, fingerprint } = ssh_key;
         this.options?.ssh?.push(ssh_key);
         
         return {
-            name, publicKey, id, fingerprint 
+            name, 
+            publicKey: 
+            public_key,
+            id, 
+            fingerprint 
         }
     }
 
-    public async deleteKey(keyId: string | number)  : Promise<boolean> { 
+    public async deleteKeysWithName(keyName: string, waitEvery?: number, waitTimeout=500)  : Promise<number> { 
+        let deleted = 0;
+        const keysToDelete = this.options?.ssh?.filter(k => {
+            return k.name === keyName;
+        }) || [];
+
+        for(let i = 0; i < keysToDelete.length; i++) {
+            try {
+                await this.deleteSSHKey(keysToDelete[i].id);
+                deleted++;
+            } catch (err) {
+            }
+            if(waitEvery && waitTimeout && !(i % waitEvery)) {
+                await asyncTimeout(waitTimeout);  
+
+            }
+        }
+        return deleted;
+    }
+
+    public async deleteSSHKey(keyId: string | number)  : Promise<boolean> { 
         try {
             await this.delete(`https://api.digitalocean.com/v2/account/keys/${keyId}`);
             if(Array.isArray(this.options?.ssh)) {
@@ -177,11 +136,26 @@ export class DigitalOceanInitializer extends AbstractInitializer {
 
     public async deleteAllDroplets() {
         const d = await this.getDroplets();
-        return Promise.all(d.map(dd => this.deleteDroplet(dd.id)))
+        return Promise.all(d.map(dd => this.deleteServer(dd.id)))
     }
 
-    public async deleteDroplet(id: number | string) {
+    public async deleteAllServers() {
+        const d = await this.getDroplets();
+        return Promise.all(d.map(dd => this.deleteServer(dd.id)))
+    }
+
+
+    public async deleteServer(id: number | string) {
         await this.delete(`https://api.digitalocean.com/v2/droplets/${id}`);
+    }
+
+    get availableSizes() {
+        return this.options?.size || [];
+    }
+
+    
+    get availableImages() {
+        return this.options?.image?.map(i => i.slug) || [];
     }
 
     public async onInit(options: ProviderServerCreationOptions) {
@@ -191,7 +165,6 @@ export class DigitalOceanInitializer extends AbstractInitializer {
         }
         */
         if(!options.size?.length) throw new Error(`Expected sizes to come back from get options..`);
-        this.availableSizes = options.size;
 
         /*
         this.options?.ssh?.forEach(s => {
@@ -211,7 +184,7 @@ export class DigitalOceanInitializer extends AbstractInitializer {
 
     private convertDropletToCreatedServerData(d: DigitalOceanDropletData) : CreatedServerData {
         return {
-            internalId: `${d.id}`,
+            id: `${d.id}`,
             ip: this.getPublicIp(d),
             ipv6: this.getPublicIp6(d),
             privateIp: this.getPrivateIp(d),
@@ -263,8 +236,8 @@ export class DigitalOceanInitializer extends AbstractInitializer {
         })
     }
     
-    public async create(options: ChosenServerCreationOption) : Promise<CreatedServerData> {
-        const o = this.validateAndConvertCreateOptions(options);
+    public async createServer(options: Pick<ChosenServerCreationOption, 'size' | 'image' | 'region' | 'image' | 'ssh' | 'name'>) : Promise<CreatedServerData> {
+        const o = await this.validateAndConvertCreateOptions(options);
         let droplet;
         let retryCreate = 0;
         while(!droplet && retryCreate < 5) {
@@ -286,7 +259,7 @@ export class DigitalOceanInitializer extends AbstractInitializer {
         return this.convertDropletToCreatedServerData(droplet);
     }
 
-    private validateAndConvertCreateOptions(options: ChosenServerCreationOption) : DigitalOceanCreateDropletParams {
+    private async validateAndConvertCreateOptions(options: ChosenServerCreationOption) : Promise<DigitalOceanCreateDropletParams> {
         if(!options.size) {
             throw new Error(`Expected options.size`);
         }
@@ -302,10 +275,18 @@ export class DigitalOceanInitializer extends AbstractInitializer {
             throw new Error(`Must provide region...`);
         }
 
-        const image = this.options?.image?.find(o => o.id === options.image || o.name === options.image || o.slug === options.image);
+        const imageSlug = await this.tryGetImageSlug(options.image);
+        if(!imageSlug) {
+            throw new Error(`Can not find slug for image, option given: ${options.image}`)
+        }
+        const regionSlug = await this.tryGetRegionSlug(options.region);
+        if(!regionSlug) {
+            throw new Error(`Can not find slug for region, option given: ${options.region}`)
+        }
 
-        if(!image) {
-            throw new Error(`Image not available.`)
+        const image = this.options!.image!.find(i => i.slug === imageSlug);
+        if(!image?.regions?.includes(regionSlug)) {
+            throw new Error(`Image selected does not provide region for supplied option: ${regionSlug}, the possible region slugs were: ${image?.regions?.join(', ')}`)
         }
 
       //  console.log('all the ssh options were:', this.options?.ssh, this.options?.ssh?.length);
@@ -315,9 +296,9 @@ export class DigitalOceanInitializer extends AbstractInitializer {
 
         const obj : DigitalOceanCreateDropletParams = {
             name: options.name || makeId(14),
-            image: options.image,
+            image: imageSlug,
             size: options.size,
-            region: options.region,
+            region: regionSlug
         }
         if(foundKey) {
             obj.ssh_keys = [foundKey.id]

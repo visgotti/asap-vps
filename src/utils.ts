@@ -54,17 +54,14 @@ function hashKey(key: string): Buffer {
     })
   }
 
-
   export const retryInvoke = async (fn: () => Promise<any>, timeBetween: number, maxTries: number) : Promise<any> => {
     let i = 0;
     let lastErr;
     while(i < maxTries) {
         try {
-            console.log("try #", i);
             const c = await fn();
             return c;
         } catch (err) {
-            console.error("Error:", err.message, "try again in", timeBetween, "ms");
             lastErr = err.message;
             await asyncTimeout(timeBetween);
         }

@@ -34,32 +34,40 @@ export class SSHService {
     }
   }
 
+  public static async connect(ip: string, privateKey: string, decryptionKey?: string):  Promise<NodeSSH>;
   public static async connect(ip: string, sshData: EncryptedSSHData, decryptionKey: string):  Promise<NodeSSH>;
   public static async connect(ip: string, sshData: UnencryptedSSHData) : Promise<NodeSSH>;
-  public static async connect(ip: string, sshData: EncryptedSSHData | UnencryptedSSHData, decryptionKey?: string) : Promise<NodeSSH> {
+  public static async connect(ip: string, sshData: EncryptedSSHData | UnencryptedSSHData | string, decryptionKey?: string) : Promise<NodeSSH> {
     const s = new SSHService();
     return s.connect(ip, sshData as any, decryptionKey as string);
   }
-  
+
+  public async connect(ip: string, privateKey: string, decryptionKey?: string):  Promise<NodeSSH>;
   public async connect(ip: string, sshData: EncryptedSSHData, decryptionKey: string):  Promise<NodeSSH>;
   public async connect(ip: string, sshData: UnencryptedSSHData) : Promise<NodeSSH>;
-  public async connect(ip: string, sshData: SSHData<boolean>, decryptionKey?: string) : Promise<NodeSSH> {
-    if(!sshData.privateKey) throw new Error(`There is no private key on the ssh entity ${JSON.stringify(sshData)}`);
-    if(sshData.isEncrypted && !decryptionKey) {
-      throw new Error(`SSH Entity is encrypted but no decryption key was provided`);
-    }
-
-    const decryptedPrivateKey = sshData.isEncrypted || (sshData.isEncrypted === undefined && decryptionKey) ? decrypt(sshData.privateKey, decryptionKey as string) : sshData.privateKey
-    if(this.openConnections[ip] && decryptedPrivateKey in this.openConnections[ip]) {
-        throw new Error(`There is already an open connection with the publicKey: ${sshData.publicKey} on the ip ${ip}`);
-    }
-    if(!this.openConnections[ip]) {
-        this.openConnections[ip] = {};
-    }
+  public async connect(ip: string, sshData: SSHData<boolean> | string, decryptionKey?: string) : Promise<NodeSSH> {
     const ssh = new NodeSSH();
-    
-    this.openConnections[ip][sshData.publicKey] = ssh;
+    let decryptedPrivateKey = '';
+    if(typeof sshData !== "string") {
+      if(!sshData.privateKey) throw new Error(`There is no private key on the ssh entity ${JSON.stringify(sshData)}`);
+      if(sshData.isEncrypted && !decryptionKey) {
+        throw new Error(`SSH Entity is encrypted but no decryption key was provided`);
+      }
+  
+      decryptedPrivateKey = sshData.isEncrypted || (sshData.isEncrypted === undefined && decryptionKey) ? decrypt(sshData.privateKey, decryptionKey as string) : sshData.privateKey
+      if(this.openConnections[ip] && decryptedPrivateKey in this.openConnections[ip]) {
+          throw new Error(`There is already an open connection with the publicKey: ${sshData.publicKey} on the ip ${ip}`);
+      }
+      if(!this.openConnections[ip]) {
+          this.openConnections[ip] = {};
+      }
+      this.openConnections[ip][sshData.publicKey] = ssh;
+    } else {
+      decryptedPrivateKey = decryptionKey ? decrypt(sshData, decryptionKey as string) : sshData
+    }
+        
     const removeConnection = () => {
+      if(typeof sshData !== "string") {
         let had = ip in this.openConnections;
         if(!had) return false;
 
@@ -73,8 +81,8 @@ export class SSHService {
             delete this.openConnections[ip];
         }
         return had;
+      }
     }
-
     try {
         const _dispose = ssh.dispose;
         ssh.dispose = async () => {

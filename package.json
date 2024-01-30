@@ -2,11 +2,12 @@
   "name": "asap-vps",
   "version": "0.0.1",
   "description": "Library to help setup/deploy virtual private servers.",
-  "main": "index.js",
+  "main": "./dist/index.js",
+  "typings": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc -d",
     "test": "jest",
-    "test:do": "npm run test src/Initializers/DigitalOceanInitializer.spec.ts"
+    "test:do": "npm run test src/Initializers/DigitalOcean/DigitalOceanInitializer.spec.ts"
   },
   "dependencies": {
     "node-ssh": "^13.1.0"
