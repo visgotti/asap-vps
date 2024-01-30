@@ -1,6 +1,6 @@
 {
   "name": "asap-vps",
-  "version": "0.0.2",
+  "version": "0.0.21",
   "description": "Library to help setup/deploy virtual private servers.",
   "main": "dist/index.js",
   "typings": "dist/index.d.ts",
