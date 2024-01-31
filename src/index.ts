@@ -1,6 +1,7 @@
 export * from './constants';
 export * from './types';
-
+import type { NodeSSH } from 'node-ssh';
+export { NodeSSH }
 // export initializers
 export { AbstractInitializer } from './Core/AbstractInitializer';
 

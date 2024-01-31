@@ -110,7 +110,15 @@ export class SSHService {
     }
   }
 
-  
+  public static async sshGetFileText(ssh: NodeSSH, filePath: string) : Promise<string | null> {
+    const fileContents = await ssh.execCommand(`cat ${filePath}`);
+    return fileContents?.stdout?.trim() || null;
+  }
+
+  public static async sshEnsureFileTextExists(ssh: NodeSSH, filePath: string, stringToCheck: string) : Promise<boolean> {
+    const f = await SSHService.sshGetFileText(ssh, filePath);
+    return f === stringToCheck;
+  }
 
   public static async sshExecFile(ssh: NodeSSH, fromPath: string, toPath: string) {
     try {
