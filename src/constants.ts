@@ -16,6 +16,7 @@ export enum REGION_TYPES {
 }
 
 export enum SETUP_SCRIPTS {
+  NVM = 'nvm',
   NODE = "node",
   FOREVER = "forever"
 }

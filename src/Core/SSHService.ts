@@ -110,6 +110,18 @@ export class SSHService {
     }
   }
 
+  
+  public static async installNodeModule(ssh: NodeSSH, options: { module: string, sudo: boolean, global: boolean }) {
+    let cmd = `npm install ${options.module}`;
+    if(options.sudo) {
+      cmd = `sudo ${cmd}`;
+    }
+    if(options.global) {
+      cmd = `${cmd} -g`;
+    }
+    await ssh.execCommand(cmd);
+  }
+
   public static async sshGetFileText(ssh: NodeSSH, filePath: string) : Promise<string | null> {
     const fileContents = await ssh.execCommand(`cat ${filePath}`);
     return fileContents?.stdout?.trim() || null;
@@ -119,6 +131,17 @@ export class SSHService {
     const f = await SSHService.sshGetFileText(ssh, filePath);
     return f === stringToCheck;
   }
+  
+  public static async installNvm(ssh: NodeSSH) {
+    await SSHService.sshSetupScript(ssh, MACHINE_TYPES.UBUNTU_22, SETUP_SCRIPTS.NVM);
+    await ssh.execCommand(`source ~/.profile`);
+  }
+
+  public static async installNode(ssh: NodeSSH, version='--lts') {
+    await SSHService.installNvm(ssh);
+    await ssh.execCommand(`nvm install ${version}`);
+    await ssh.execCommand(`nvm use ${version}`);
+  }
 
   public static async sshExecFile(ssh: NodeSSH, fromPath: string, toPath: string) {
     try {
@@ -127,11 +150,19 @@ export class SSHService {
       await ssh.execCommand(`sed -i -e \'s/\\r$//\' ${toPath}`);
       await ssh.execCommand(toPath);
       await ssh.execCommand(`rm -rf ${toPath}`);
-
     } catch (error) {
       console.error(`Error in sshExecFile: ${error.message}`);
       throw error;
     }
+  }
+
+  public static async writeJsonFile(ssh: NodeSSH, json: object, toPath: string) {
+    const id = `__tempjson${makeId(10)}.json`;
+    fs.writeFileSync(id, JSON.stringify(json, null, 2));
+    try {
+      await ssh.putFile(id, toPath)
+    } catch (err) {};
+    fs.unlinkSync(id);
   }
   
   public static async sshPutTextFile (ssh: NodeSSH, text: string, toPath: string) {
