@@ -121,93 +121,92 @@ export class DigitalOcean extends AbstractInitializer {
     }
 
     public async deleteSSHKey(keyId: string | number)  : Promise<boolean> { 
-        try {
-            await this.delete(`https://api.digitalocean.com/v2/account/keys/${keyId}`);
-            if(Array.isArray(this.options?.ssh)) {
-                this.options!.ssh = this.options!.ssh.filter(p => {
-                    return `${p.id}` !== `${keyId}` && `${p.name !== keyId}`;
-                });
-            }
-            return true;
-        } catch (err) {
-            return false;
+      try {
+        await this.delete(`https://api.digitalocean.com/v2/account/keys/${keyId}`);
+        if(Array.isArray(this.options?.ssh)) {
+          this.options!.ssh = this.options!.ssh.filter(p => {
+            return `${p.id}` !== `${keyId}` && `${p.name}` !== `${keyId}`;
+          });
         }
+        return true;
+      } catch (err) {
+        console.error(`Error deleting SSH key with id ${keyId}:`, err.message);
+        return false;
+      }
     }
 
     public async deleteAllDroplets() {
-        const d = await this.getDroplets();
-        return Promise.all(d.map(dd => this.deleteServer(dd.id)))
+      const d = await this.getDroplets();
+      return Promise.all(d.map(dd => this.deleteServer(dd.id)))
     }
 
     public async deleteAllServers() {
-        const d = await this.getDroplets();
-        return Promise.all(d.map(dd => this.deleteServer(dd.id)))
+      const d = await this.getDroplets();
+      return Promise.all(d.map(dd => this.deleteServer(dd.id)))
     }
 
 
     public async deleteServer(id: number | string) {
-        await this.delete(`https://api.digitalocean.com/v2/droplets/${id}`);
+      await this.delete(`https://api.digitalocean.com/v2/droplets/${id}`);
     }
 
     get availableSizes() {
-        return this.options?.size || [];
+      return this.options?.size || [];
     }
-
     
     get availableImages() {
-        return this.options?.image?.map(i => i.slug) || [];
+      return this.options?.image?.map(i => i.slug) || [];
     }
 
     public async onInit(options: ProviderServerCreationOptions) {
-        /*
-        if(!options.ssh?.length) {
-            throw new Error(`There is no ssh keys initialized on this digital ocean droplet.`)
-        }
-        */
-        if(!options.size?.length) throw new Error(`Expected sizes to come back from get options..`);
+      /*
+      if(!options.ssh?.length) {
+          throw new Error(`There is no ssh keys initialized on this digital ocean droplet.`)
+      }
+      */
+      if(!options.size?.length) throw new Error(`Expected sizes to come back from get options..`);
 
-        /*
-        this.options?.ssh?.forEach(s => {
-            this.deleteKey(s.id)
-        });
-        */
+      /*
+      this.options?.ssh?.forEach(s => {
+          this.deleteKey(s.id)
+      });
+      */
     }
 
-
     public async restart(options: any): Promise<void> {
-        throw new Error(`Unimplemented`);
+      throw new Error(`Unimplemented`);
     }
 
     public async destroy(options: DestroyServerOptions): Promise<void> {
-        throw new Error(`Unimplemented`);
+      throw new Error(`Unimplemented`);
     }
 
     private convertDropletToCreatedServerData(d: DigitalOceanDropletData) : CreatedServerData {
-        return {
-            id: `${d.id}`,
-            ip: this.getPublicIp(d),
-            ipv6: this.getPublicIp6(d),
-            privateIp: this.getPrivateIp(d),
-        }
+      return {
+        id: `${d.id}`,
+        ip: this.getPublicIp(d),
+        ipv6: this.getPublicIp6(d),
+        privateIp: this.getPrivateIp(d),
+      }
     }
 
     private getPrivateIp(droplet: DigitalOceanDropletData)  {
-        const privateIp = droplet.networks?.v4?.find(v => v.type === "private");
-        if(privateIp) return privateIp.ip_address;
-        return '';
+      const privateIp = droplet.networks?.v4?.find(v => v.type === "private");
+      if(privateIp) return privateIp.ip_address;
+      return '';
     }    
     private getPublicIp(droplet: DigitalOceanDropletData) : string {
-        const pub = droplet?.networks?.v4?.find(v => v.type === "public");
-        if(pub) return pub.ip_address;
-        return '';
+      const pub = droplet?.networks?.v4?.find(v => v.type === "public");
+      if(pub) return pub.ip_address;
+      return '';
     }
     private getPublicIp6(droplet: DigitalOceanDropletData)  {
-        const pub = droplet.networks?.v6?.find(v => v.type === "public");
-        if(pub) return pub.ip_address;
-        return '';
+      const pub = droplet.networks?.v6?.find(v => v.type === "public");
+      if(pub) return pub.ip_address;
+      return '';
     }
     private getDroplets() : Promise<DigitalOceanDropletData[]> {
-        return this.getAll(`https://api.digitalocean.com/v2/droplets`, 'droplets');
+      return this.getAll(`https://api.digitalocean.com/v2/droplets`, 'droplets');
     }
     private async getDroplet(id: number | string) : Promise<DigitalOceanDropletData> {
         const { droplet } = await this.get(`https://api.digitalocean.com/v2/droplets/${id}`);
@@ -215,25 +214,23 @@ export class DigitalOcean extends AbstractInitializer {
     }
 
     public async confirmDropletCreated(dropletId: number, polled=0) : Promise<DigitalOceanDropletData> {
-        polled++;
-        return new Promise( async (resolve, reject) => {
-//            console.log("Checking if droplet", dropletId, "finished creating on poll check", polled)
-            const  droplet = await this.getDroplet(dropletId);
-            //console.log('droplet', droplet.networks.v4.length);
-            const ip = this.getPublicIp(droplet)
-            if(ip) {
-                return resolve(droplet)
-            } else {
-                polled++;
-                if(polled < 10) {
-              //      console.log('no droplet with ip try again in 15 seconds...')
-                    await asyncTimeout(15000);
-                    return resolve(this.confirmDropletCreated(dropletId, polled))
-                } else {
-                    return reject(`Can not confirm droplet with public ip ${droplet}`)
-                }
-            }
-        })
+      polled++;
+      return new Promise( async (resolve, reject) => {
+          const  droplet = await this.getDroplet(dropletId);
+          //console.log('droplet', droplet.networks.v4.length);
+          const ip = this.getPublicIp(droplet)
+          if(ip) {
+              return resolve(droplet)
+          } else {
+              polled++;
+              if(polled < 10) {
+                  await asyncTimeout(15000);
+                  return resolve(this.confirmDropletCreated(dropletId, polled))
+              } else {
+                  return reject(`Can not confirm droplet with public ip ${droplet}`)
+              }
+          }
+      })
     }
     
     public async createServer(options: Pick<ChosenServerCreationOption, 'size' | 'image' | 'region' | 'image' | 'ssh' | 'name'>) : Promise<CreatedServerData> {

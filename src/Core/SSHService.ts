@@ -37,15 +37,21 @@ export class SSHService {
   public static async connect(ip: string, privateKey: string, decryptionKey?: string):  Promise<NodeSSH>;
   public static async connect(ip: string, sshData: EncryptedSSHData, decryptionKey: string):  Promise<NodeSSH>;
   public static async connect(ip: string, sshData: UnencryptedSSHData) : Promise<NodeSSH>;
-  public static async connect(ip: string, sshData: EncryptedSSHData | UnencryptedSSHData | string, decryptionKey?: string) : Promise<NodeSSH> {
+  public static async connect(ip: string, privateKey: string, decryptionKey: string | undefined, retryOption: {maxRetries: number, retryTimeout: number}):  Promise<NodeSSH>;
+  public static async connect(ip: string, sshData: EncryptedSSHData | UnencryptedSSHData | string, decryptionKey?: string, retryOption?: {maxRetries: number, retryTimeout: number}) : Promise<NodeSSH> {
     const s = new SSHService();
-    return s.connect(ip, sshData as any, decryptionKey as string);
+    if (retryOption) {
+      return s.connect(ip, sshData as any, decryptionKey as string, retryOption);
+    } else {
+      return s.connect(ip, sshData as any, decryptionKey as string);
+    }
   }
 
   public async connect(ip: string, privateKey: string, decryptionKey?: string):  Promise<NodeSSH>;
   public async connect(ip: string, sshData: EncryptedSSHData, decryptionKey: string):  Promise<NodeSSH>;
   public async connect(ip: string, sshData: UnencryptedSSHData) : Promise<NodeSSH>;
-  public async connect(ip: string, sshData: SSHData<boolean> | string, decryptionKey?: string) : Promise<NodeSSH> {
+  public async connect(ip: string, privateKey: string, decryptionKey: string | undefined, retryOption: {maxRetries: number, retryTimeout: number}):  Promise<NodeSSH>;
+  public async connect(ip: string, sshData: SSHData<boolean> | string, decryptionKey?: string, retryOption={maxRetries: 10, retryTimeout: 5000}) : Promise<NodeSSH> {
     const ssh = new NodeSSH();
     let decryptedPrivateKey = '';
     if(typeof sshData !== "string") {
@@ -74,11 +80,11 @@ export class SSHService {
         had = sshData.publicKey in this.openConnections[ip];
 
         if(had) {
-            delete this.openConnections[ip][sshData.publicKey];
+          delete this.openConnections[ip][sshData.publicKey];
         }
 
         if(!(Object.keys(this.openConnections[ip]).length)) {
-            delete this.openConnections[ip];
+          delete this.openConnections[ip];
         }
         return had;
       }
@@ -101,10 +107,11 @@ export class SSHService {
             }
           });
         }
-        await retryInvoke(doConnection, 5000, 3);
+        await retryInvoke(doConnection, retryOption.retryTimeout, retryOption.maxRetries);
 
         return ssh;
     } catch (err) {
+        console.error(`[SSHService] Failed to connect to ${ip} after ${retryOption.maxRetries} retries:`, err.message);
         removeConnection();
         throw err;
     }
@@ -132,8 +139,8 @@ export class SSHService {
     return f === stringToCheck;
   }
   
-  public static async installNvm(ssh: NodeSSH) {
-    await SSHService.sshSetupScript(ssh, MACHINE_TYPES.UBUNTU_22, SETUP_SCRIPTS.NVM);
+  public static async installNvm(ssh: NodeSSH, machineType: MACHINE_TYPES = MACHINE_TYPES.UBUNTU_22) {
+    await SSHService.sshSetupScript(ssh, machineType, SETUP_SCRIPTS.NVM);
     await ssh.execCommand(`source ~/.profile`);
   }
 
@@ -173,9 +180,9 @@ export class SSHService {
     try {
       const toPath = `~/tempsetup_${makeId(10)}.sh`;
       await SSHService.sshExecFile(
-          ssh,
-          path.resolve(__dirname, '..', 'scripts', 'setup', machineType, scriptType + '.sh'), 
-          toPath
+        ssh,
+        path.resolve(__dirname, '..', 'scripts', 'setup', machineType, scriptType + '.sh'), 
+        toPath
       )
     } catch (error) {
       console.error(`Error in sshSetupScript: ${error.message}`);
@@ -191,15 +198,15 @@ export class SSHService {
     const privateKeyPath = await SSHService.generateSSHKeyPair(path, id);
     const publicKeyPath = privateKeyPath + '.pub';
     const deleteKeys = async () => {
-        try {
-            await Promise.all([
-                unlink(privateKeyPath),
-                unlink(publicKeyPath),
-                rm(path, { recursive: true, force: true })
-            ])
-        } catch(err) {
-            console.error(err);
-        }
+      try {
+        await Promise.all([
+          unlink(privateKeyPath),
+          unlink(publicKeyPath),
+          rm(path, { recursive: true, force: true })
+        ]);
+      } catch(err) {
+        console.error(err);
+      }
     }
     const [ publicKey, privateKey ] = await Promise.all([
       readFile(publicKeyPath, 'utf-8'), 

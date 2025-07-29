@@ -63,7 +63,9 @@ function hashKey(key: string): Buffer {
             return c;
         } catch (err) {
             lastErr = err.message;
-            await asyncTimeout(timeBetween);
+            if (i + 1 < maxTries) {
+                await asyncTimeout(timeBetween);
+            }
         }
         i++;
     }
