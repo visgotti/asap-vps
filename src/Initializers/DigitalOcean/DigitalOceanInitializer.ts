@@ -22,6 +22,8 @@ export class DigitalOcean extends AbstractInitializer {
 
     public async getMachineTypeSlug(type: MACHINE_TYPES) {
         switch(type) {
+            case MACHINE_TYPES.UBUNTU_24:
+                return `ubuntu-24-04-x64`;
             case MACHINE_TYPES.UBUNTU_22:
                 return `ubuntu-22-04-x64`;
             case MACHINE_TYPES.UBUNTU_20:

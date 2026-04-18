@@ -1,4 +1,5 @@
-import { MACHINE_TYPES } from "./constants";
+import { MACHINE_TYPES, PLATFORM, PlatformFamily } from "./constants";
+import type { NodeSSH } from 'node-ssh';
 
 export type SSHOptions = { username?: string, privateKey?: string, publicKey?: string, password?: string };
 
@@ -8,6 +9,45 @@ export type CreatedServerData = {
     ipv6?: string,
     privateIp?: string
 };
+
+export type FirewallRule = {
+    port: number,
+    protocol: 'tcp' | 'udp',
+    allow?: boolean,
+}
+
+export type SSLCertificateConfig = {
+    certContent: string,
+    keyContent: string,
+    certPath?: string,
+    keyPath?: string,
+}
+
+export type SetupStepResult = {
+    step: string,
+    success: boolean,
+    message?: string,
+    output?: string,
+}
+
+export interface ISetupStep {
+    readonly name: string;
+    execute(ssh: NodeSSH, context: SetupContext): Promise<SetupStepResult>;
+}
+
+export type SetupContext = {
+    platform: PLATFORM,
+    platformFamily: PlatformFamily,
+    ip: string,
+    serverData?: CreatedServerData,
+    [key: string]: unknown,
+}
+
+export type SetupPipelineOptions = {
+    stopOnFailure?: boolean,
+    onStepComplete?: (result: SetupStepResult) => void,
+    onStepStart?: (stepName: string) => void,
+}
 
 export type ChosenServerCreationOption = {
     name?: string,
