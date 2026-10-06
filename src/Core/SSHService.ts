@@ -90,7 +90,7 @@ export class SSHService {
       }
     }
     try {
-        const _dispose = ssh.dispose;
+        const _dispose = ssh.dispose.bind(ssh);
         ssh.dispose = async () => {
             try { await _dispose();
             } catch (err) {};
