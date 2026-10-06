@@ -13,7 +13,22 @@ export enum REGION_TYPES {
   SAN_FRANCISCO = 'san_francisco',
   SAN_FRANCISCO_1 = 'san_francisco_1',
   SAN_FRANCISCO_2 = 'san_francisco_2',
-  SAN_FRANCISCO_3 = 'san_francisco_3'
+  SAN_FRANCISCO_3 = 'san_francisco_3',
+  // Scaleway: a region (Paris, Amsterdam, Warsaw, Milan) is its first zone, `_N` a zone (fr-par-N, nl-ams-N, pl-waw-N, it-mil-N).
+  PARIS = 'paris',
+  PARIS_1 = 'paris_1',
+  PARIS_2 = 'paris_2',
+  PARIS_3 = 'paris_3',
+  AMSTERDAM = 'amsterdam',
+  AMSTERDAM_1 = 'amsterdam_1',
+  AMSTERDAM_2 = 'amsterdam_2',
+  AMSTERDAM_3 = 'amsterdam_3',
+  WARSAW = 'warsaw',
+  WARSAW_1 = 'warsaw_1',
+  WARSAW_2 = 'warsaw_2',
+  WARSAW_3 = 'warsaw_3',
+  MILAN = 'milan',
+  MILAN_1 = 'milan_1',
 }
 
 export enum SETUP_SCRIPTS {

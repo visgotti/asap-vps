@@ -1,105 +1,137 @@
 import type { NodeSSH } from 'node-ssh';
+import type { Capable, ComputeTraits, ICompute, ISSHKeys, SSHKeyTraits } from '../capabilities';
 import { PLATFORM } from '../constants';
-import { AbstractInitializer } from './AbstractInitializer';
-import { SSHService } from './SSHService';
+import { NotSupportedError, ProviderError } from '../errors';
+import type { CreateServerOptions, PlatformTypes, Server, SetupPipelineOptions, SetupStepResult, SSHKeyData, SSHRetryOptions, WaitOptions } from '../types';
 import { SetupPipeline } from './SetupPipeline';
-import type { ChosenServerCreationOption, CreatedServerData, SetupStepResult, SetupPipelineOptions } from '../types';
+import { SSHService } from './SSHService';
+import { shellQuote } from './utils';
 
-export type ProvisionResult = {
-    server: CreatedServerData,
-    sshKeyData: { publicKey: string, privateKey: string },
+/**
+ * What a provisioner sets up servers on: a provider that rents servers (VMs,
+ * whose OS it can log in to) and registers SSH keys. Any provider with the
+ * compute and sshKeys capabilities: DigitalOcean, Scaleway, Lambda, ... A
+ * container provider has both too, and is refused at run time (it runs an image).
+ */
+export type ProvisionTarget<T extends PlatformTypes = PlatformTypes> = ICompute<T> & ISSHKeys & Capable & {
+    readonly capabilities: { readonly compute: Readonly<ComputeTraits>, readonly sshKeys: Readonly<SSHKeyTraits> },
+};
+
+/** What a provision made: the server (running, with its ssh endpoint), its key pair and the setup's results. */
+export type ProvisionResult<S = Server> = {
+    server: S,
+    sshKeyData: SSHKeyData,
     setupResults: SetupStepResult[],
+    /** The key's id at the provider, when it was kept (cleanupProviderKey false). */
     providerSshKeyId?: string | number,
 }
 
-export type ProvisionOptions = {
-    serverOptions: ChosenServerCreationOption,
+export type ProvisionOptions<T extends PlatformTypes = PlatformTypes> = {
+    /** What to rent. The provisioner authorizes its own key, so no sshKeyIds. */
+    serverOptions: Omit<CreateServerOptions<T>, 'sshKeyIds'>,
     sshKeyName?: string,
+    /** The OS the steps target (default: read from the server, as images differ by provider). */
     platform?: PLATFORM,
+    /** Read the OS from the server (default: true unless `platform` is given). */
     autoDetectPlatform?: boolean,
     pipelineOptions?: SetupPipelineOptions,
+    /**
+     * Delete the key it registered at the provider once the setup is done.
+     * Default: true, except where `capabilities.sshKeys.appliedAtBoot` (Scaleway),
+     * since there the provider applies its keys at every boot and deleting this
+     * one locks the server out at its next reboot or power-on: the key is kept,
+     * and its id comes back as `providerSshKeyId` for the caller to delete once
+     * it has deleted the server (meanwhile it is authorized on every server of
+     * the account's Project that boots). An explicit value always wins.
+     */
     cleanupProviderKey?: boolean,
-    sshRetry?: { maxRetries: number, retryTimeout: number },
+    sshRetry?: SSHRetryOptions,
+    /** How long the server may take to run (waitUntilRunning's default otherwise). */
+    wait?: WaitOptions,
+    /**
+     * Delete the server, verified gone, when anything after its create fails,
+     * a setup step included (default true: nothing a failed provision made goes on billing).
+     */
+    deleteOnFailure?: boolean,
 }
 
-export class ServerProvisioner {
-    constructor(
-        private readonly initializer: AbstractInitializer,
-    ) {}
+/**
+ * Rents a server, waits until it runs, then runs a SetupPipeline on it over
+ * ssh as the login its image has: the same run for a VPS and a GPU VM, on any
+ * provider that can rent one and register a key. Steps expect root: with
+ * another login (Lambda's ubuntu) every command goes through sudo. A fresh key
+ * pair is made for each run and authorized on the server alone (sshKeyIds).
+ */
+export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
+    constructor(private readonly provider: ProvisionTarget<T>) {}
 
     async provision(
-        options: ProvisionOptions,
-        configurePipeline: (pipeline: SetupPipeline, server: CreatedServerData) => void | Promise<void>,
-    ): Promise<ProvisionResult> {
+        options: ProvisionOptions<T>,
+        configurePipeline: (pipeline: SetupPipeline, server: Server<T['server']>) => void | Promise<void>,
+    ): Promise<ProvisionResult<Server<T['server']>>> {
+        const p = this.provider;
+        if (p.capabilities.compute.kind !== 'vm') {
+            throw new NotSupportedError(p.id, 'provisioning over ssh (a container provider runs an image: put the setup in it)');
+        }
         const {
-            serverOptions,
             sshKeyName = `provision-${Date.now()}`,
-            platform = PLATFORM.UBUNTU_24,
-            autoDetectPlatform = false,
+            platform,
+            autoDetectPlatform = platform === undefined,
+            deleteOnFailure = true,
+            cleanupProviderKey = !p.capabilities.sshKeys.appliedAtBoot,
             pipelineOptions = { stopOnFailure: true },
-            cleanupProviderKey = true,
-            sshRetry = { maxRetries: 12, retryTimeout: 10000 },
+            sshRetry = { maxRetries: 12, retryTimeout: 10_000 },
         } = options;
 
-        // 1. Generate SSH keys
         const sshKeyData = await SSHService.createKeys();
-
-        // 2. Register public key with the provider
-        const providerKey = await this.initializer.addSSHKey(sshKeyData.publicKey, sshKeyName);
-
-        let server: CreatedServerData;
+        const key = await p.addSSHKey(sshKeyData.publicKey, sshKeyName);
+        let server: Server<T['server']> | undefined;
+        let ssh: NodeSSH | undefined;
+        let done = false;
         try {
-            // 3. Create the server
-            server = await this.initializer.createServer({
-                ...serverOptions,
-                ssh: providerKey.id,
-            });
-        } catch (err) {
-            // Cleanup: remove the SSH key from the provider if server creation fails
-            if (cleanupProviderKey) {
-                await this.initializer.deleteSSHKey(providerKey.id).catch(() => {});
+            server = await p.createServer({ ...options.serverOptions, sshKeyIds: [key.id] } as CreateServerOptions<T>);
+            server = await p.waitUntilRunning(server.id, options.wait);
+            const endpoint = server.ssh;
+            if (!endpoint) throw new ProviderError(p.id, `server ${server.id} is running but reports no ssh endpoint`);
+            ssh = await SSHService.connect({ ...endpoint, privateKey: sshKeyData.privateKey, retry: sshRetry });
+            const shell = asRoot(ssh, endpoint.username);
+            const resolvedPlatform = autoDetectPlatform ? await SetupPipeline.detectPlatform(shell) : platform ?? PLATFORM.UBUNTU_24;
+            const pipeline = new SetupPipeline(resolvedPlatform, pipelineOptions);
+            await configurePipeline(pipeline, server);
+            const ip = server.ip ?? endpoint.host;
+            const setupResults = await pipeline.execute(shell, ip, { id: server.id, ip, ipv6: server.ipv6, privateIp: server.privateIp });
+            const failed = setupResults.find((r) => !r.success);
+            if (failed && deleteOnFailure) {
+                throw new ProviderError(p.id, `setup step "${failed.step}" failed${failed.message ? `: ${failed.message}` : ''}`);
             }
-            throw err;
-        }
-
-        // 4. Connect via SSH
-        let ssh: NodeSSH;
-        try {
-            ssh = await SSHService.connect(server.ip, sshKeyData.privateKey, undefined, sshRetry);
-        } catch (err) {
-            if (cleanupProviderKey) {
-                await this.initializer.deleteSSHKey(providerKey.id).catch(() => {});
-            }
-            throw err;
-        }
-
-        // 5. Detect platform if requested
-        let resolvedPlatform = platform;
-        if (autoDetectPlatform) {
-            resolvedPlatform = await SetupPipeline.detectPlatform(ssh);
-        }
-
-        // 6. Build and run the setup pipeline
-        const pipeline = new SetupPipeline(resolvedPlatform, pipelineOptions);
-        await configurePipeline(pipeline, server);
-
-        let setupResults: SetupStepResult[];
-        try {
-            setupResults = await pipeline.execute(ssh, server.ip, server);
+            done = true;
+            return { server, sshKeyData, setupResults, ...(cleanupProviderKey ? {} : { providerSshKeyId: key.id }) };
+        } catch (e) {
+            if (server && deleteOnFailure) await p.deleteServerAndWait(server.id).catch(() => false);
+            throw e;
         } finally {
-            await ssh.dispose();
+            ssh?.dispose();
+            // A key that is kept is kept for the caller to delete (providerSshKeyId): a provision that threw returns no id, so it goes.
+            if (cleanupProviderKey || !done) await p.deleteSSHKey(key.id).catch(() => false);
         }
-
-        // 7. Cleanup provider SSH key if requested
-        if (cleanupProviderKey) {
-            await this.initializer.deleteSSHKey(providerKey.id).catch(() => {});
-        }
-
-        return {
-            server,
-            sshKeyData,
-            setupResults,
-            providerSshKeyId: cleanupProviderKey ? undefined : providerKey.id,
-        };
     }
+}
+
+/**
+ * The steps' commands as root: through passwordless sudo when the login is not
+ * root (as on Lambda's images).
+ */
+export function asRoot(ssh: NodeSSH, username: string): NodeSSH {
+    if (username === 'root') return ssh;
+    return new Proxy(ssh, {
+        get(target, prop) {
+            if (prop === 'execCommand') {
+                return (command: string, opts?: Parameters<NodeSSH['execCommand']>[1]) => (opts === undefined
+                    ? target.execCommand(`sudo -n bash -c ${shellQuote(command)}`)
+                    : target.execCommand(`sudo -n bash -c ${shellQuote(command)}`, opts));
+            }
+            const v = Reflect.get(target, prop, target);
+            return typeof v === 'function' ? v.bind(target) : v;
+        },
+    });
 }

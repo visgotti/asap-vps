@@ -6,3 +6,6 @@ node_modules
 .env.test
 do-server-options.test.json
 jest.setup.js
+scripts
+docs
+jest.live.config.js
