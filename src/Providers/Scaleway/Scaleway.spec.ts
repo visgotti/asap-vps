@@ -1324,12 +1324,16 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         const id = e.id.split('/')[1];
         const ns = fake.state.containers.get(id).namespace_id;
         fake.intercept((r) => r.method === 'GET' && r.path.endsWith(`/containers/${id}`), { answer: () => json(200, { ...fake.state.containers.get(id), status: 'deleting' }), times: 1e9 });
-        await expect(p.deleteEndpoint(e.id, { intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/timed out after 0 s waiting for delete of endpoint sticky: deleting/);
+        // No time to wait at all: the first read that does not find it gone is the timeout, however slow the machine.
+        await expect(p.deleteEndpoint(e.id, { intervalMs: 0, timeoutMs: 0 })).rejects.toThrow(/timed out after 0 s waiting for delete of endpoint sticky: deleting/);
         const { fake: f2, p: p2 } = make();
         const e2 = await p2.createEndpoint({ name: 'nsticky', container: WHOAMI, ...fast });
-        const ns2 = f2.state.containers.get(e2.id.split('/')[1]).namespace_id;
+        const c2 = f2.state.containers.get(e2.id.split('/')[1]);
+        const ns2 = c2.namespace_id;
+        // This container is gone at its first read (no wait of its own to run out): the namespace's wait is the one that does.
+        c2.deleteReads = 0;
         f2.intercept((r) => r.method === 'GET' && r.path.endsWith(`/namespaces/${ns2}`), { answer: () => json(200, { ...f2.state.namespaces.get(ns2), status: 'deleting' }), times: 1e9 });
-        await expect(p2.deleteEndpoint(e2.id, { intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/timed out after 0 s waiting for delete of namespace nsticky: deleting/);
+        await expect(p2.deleteEndpoint(e2.id, { intervalMs: 0, timeoutMs: 0 })).rejects.toThrow(/timed out after 0 s waiting for delete of namespace nsticky: deleting/);
         expect(ns).toBeTruthy();
     });
 
@@ -1582,12 +1586,16 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
 
     it('an import or an image that never ends times out saying what it last saw, and leaves nothing; an image that goes is thrown; a cleanup refused is named, left_behind', async () => {
         const { fake, p } = withKey();
-        const slow = { intervalMs: 0, timeoutMs: 20 };
+        // No time to wait at all: the first read that finds it still being made is the timeout, however slow the machine.
+        const slow = { intervalMs: 0, timeoutMs: 0 };
         const refused = () => json(403, { type: 'permissions_denied', message: 'insufficient permissions', details: [] });
-        fake.intercept((r) => r.method === 'POST' && r.path.endsWith('/import-from-object-storage'), {
-            after: () => { for (const x of fake.state.snapshots.values()) if (x.status === 'creating') x.left = 1e9; }, times: 1,
+        const importsTake = (reads: number) => fake.intercept((r) => r.method === 'POST' && r.path.endsWith('/import-from-object-storage'), {
+            after: () => { for (const x of fake.state.snapshots.values()) if (x.status === 'creating') x.left = reads; }, times: 1,
         });
+        importsTake(1e9);
         await expect(p.importImage({ name: 'slow-import', url: URL_OK, region: 'fr-par-2', ...slow })).rejects.toThrow(/timed out after 0 s waiting for import of slow-import: creating/);
+        // This import is done at its first read (no wait of its own to run out): the image's wait is the one that does.
+        importsTake(0);
         fake.intercept((r) => r.method === 'POST' && r.path === '/instance/v1/zones/fr-par-2/images', {
             after: () => { for (const x of fake.state.images.values()) if (x.state === 'creating') x.left = 1e9; }, times: 1,
         });
