@@ -685,6 +685,10 @@ describe('Scaleway images', () => {
         const copies = [...fake.state.images.values()].filter((i) => (i.tags ?? []).includes(`asap-vps-copy-of:${image.id.split('/')[1]}`));
         expect(copies.map((c) => [c.zone, c.name]).sort()).toEqual([['fr-par-2', 'copy'], ['pl-waw-3', 'copy']]);
         expect((await p.getImage(image.id))?.regions.sort()).toEqual(['fr-par-2', 'pl-waw-2', 'pl-waw-3']);
+        // Listed, the image is the one getImage reads: the same regions. Its copies are images of their zone, listed too.
+        const listed = (await p.listImages()).filter((i) => i.name === 'copy');
+        expect(listed.find((i) => i.id === image.id)).toEqual(await p.getImage(image.id));
+        expect(listed.filter((i) => i.id !== image.id).map((i) => i.regions).sort()).toEqual([['fr-par-2'], ['pl-waw-3']]);
         // Again: nothing more to copy.
         expect((await p.copyImage(image.id, ['fr-par-2'], fast)).regions.sort()).toEqual(['fr-par-2', 'pl-waw-2', 'pl-waw-3']);
         expect(fake.calls.filter((c) => /export/.test(c.path)).length).toBe(1);

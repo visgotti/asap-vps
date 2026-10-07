@@ -33,7 +33,7 @@ import { ScalewayApi } from './api';
 import {
     BILLING_PER_HOUR, BILLING_PER_MINUTE, CONTAINER_SIZES, CONTAINER_TRANSIENT, containerSizeId, copyTag, ENDPOINT_TAG, endpointUrl, epochMs, FILE_REGIONS, fileSystemMountScript,
     fileSystemTag, GB, gpuOf, isCopyOf, isScalewayZone, MOUNT_TAG, mountedVolumeIds, parseContainerSizeId, parseRegionalId, parseZonedId, regionOfZone, SCALEWAY_ENUMS, SCALEWAY_ID,
-    SCALEWAY_REFUSED, SCALEWAY_SSH_USER, TMP_BUCKET_PREFIX, toContainerOffer, toEndpoint, toFileSystemVolume, toImage, toOffer, toServer, toVolume, zonedId,
+    SCALEWAY_REFUSED, SCALEWAY_SSH_USER, TMP_BUCKET_PREFIX, toContainerOffer, toEndpoint, toFileSystemVolume, toImage, toImageWithCopies, toOffer, toServer, toVolume, zonedId,
 } from './mappers';
 import { SCALEWAY_REGIONS } from './types';
 import type {
@@ -273,17 +273,20 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
 
     // ── images ───────────────────────────────────────────────────────────
 
-    /** The Project's own images, in every zone: pick yours by name. */
+    /**
+     * The Project's own images, in every zone: pick yours by name. Each with the
+     * regions getImage gives it: its zone, and those of its copies (copyImage),
+     * which are images of their zone and listed too.
+     */
     public async listImages(): Promise<ServerImage<ScalewayImage>[]> {
-        return (await this.api.forZones((zone) => this.api.listImages(zone))).flat().map(toImage);
+        const all = (await this.api.forZones((zone) => this.api.listImages(zone))).flat();
+        return all.map((image) => toImageWithCopies(image, all));
     }
 
     /** By `fr-par-2/<uuid>`, or a bare id asked of every zone; its regions: its zone and those of its copies (copyImage). */
     public async getImage(id: string): Promise<ServerImage<ScalewayImage> | null> {
         const image = await this.findImage(id);
-        if (!image) return null;
-        const copies = await this.copiesOf(image);
-        return { ...toImage(image), regions: [image.zone, ...copies.map((c) => c.zone)] };
+        return image ? toImageWithCopies(image, await this.copiesOf(image)) : null;
     }
 
     /**

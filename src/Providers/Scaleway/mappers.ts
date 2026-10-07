@@ -491,3 +491,8 @@ export function copyTag(sourceId: string): string {
 export function isCopyOf(image: ScalewayImage, sourceId: string): boolean {
     return image.tags.includes(copyTag(sourceId));
 }
+
+/** An image with every region createServer boots it in: its zone, and those of its copies among `images`. */
+export function toImageWithCopies(image: ScalewayImage, images: ScalewayImage[]): ServerImage<ScalewayImage> {
+    return { ...toImage(image), regions: [image.zone, ...images.filter((i) => isCopyOf(i, image.id)).map((i) => i.zone)] };
+}
