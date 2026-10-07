@@ -82,12 +82,14 @@ export type Manifest = { mediaType: string, digest: string, bytes: Uint8Array, j
 
 /**
  * A client of one registry's HTTP API, logged in with `auth` (anonymous
- * without): the Bearer-token handshake its 401 asks for (a token per
- * repository and scope, basic credentials for the token), and the reads and
- * writes an image copy, a tag list and a delete take.
+ * without): the handshake its 401 asks for (a Bearer token per repository and
+ * scope, got with the login and got again when it expires; or the login
+ * itself, where the registry asks for Basic), and the reads and writes an
+ * image copy, a tag list and a delete take.
  */
 export class RegistryClient {
-    private readonly tokens = new Map<string, string>();
+    /** The Authorization each repository and scope is asked with, once the registry's challenge has said which: a Bearer token, or the login itself. */
+    private readonly authorizations = new Map<string, string>();
     private readonly fetchImpl: FetchImpl;
 
     constructor(readonly host: string, private readonly auth?: RegistryAuth, fetchImpl?: FetchImpl, private readonly sleep: (ms: number) => Promise<unknown> = (ms) => new Promise((r) => setTimeout(r, ms))) {
@@ -110,31 +112,52 @@ export class RegistryClient {
         };
     }
 
-    /** One request to the API, with the token for `repository` and `scope`, fetched once a 401 asks for one. */
+    /**
+     * One request to the API, with the authorization the registry asks of
+     * `repository` and `scope`. A 401 is answered once: with no authorization
+     * yet, or with one that no longer holds (a token expires: Docker Hub's in 5
+     * minutes), the registry's challenge is taken up and the request sent again.
+     */
     private async request(repository: string, scope: 'pull' | 'pull,push' | '*', path: string, init: RequestInit = {}): Promise<Response> {
         const url = `https://${this.host}/v2/${repository}${path}`;
         const key = `${repository} ${scope}`;
-        const send = () => this.fetchImpl(url, { ...init, headers: { ...(init.headers as Record<string, string>), ...(this.tokens.has(key) ? { authorization: `Bearer ${this.tokens.get(key)}` } : {}) } });
-        let r = await send();
-        if (r.status !== 401 || this.tokens.has(key)) return r;
-        const challenge = r.headers.get('www-authenticate') ?? '';
+        const send = () => {
+            const authorization = this.authorizations.get(key);
+            return this.fetchImpl(url, { ...init, headers: { ...(init.headers as Record<string, string>), ...(authorization ? { authorization } : {}) } });
+        };
+        const refused = await send();
+        if (refused.status !== 401) return refused;
+        this.authorizations.delete(key);
+        const authorization = await this.authorizationFor(refused.headers.get('www-authenticate') ?? '', repository, scope);
+        if (!authorization) return refused;
+        await refused.body?.cancel().catch(() => undefined);
+        this.authorizations.set(key, authorization);
+        const r = await send();
+        // A login sent as it is and refused is a refused login: there was no token to be refused first.
+        if (r.status === 401 && authorization.startsWith('Basic ')) throw new Error(`registry ${this.host}: the login was refused for ${repository} (${scope}): 401`);
+        return r;
+    }
+
+    /**
+     * The Authorization a 401's challenge asks for: the login itself where the
+     * registry asks for Basic, else a Bearer token for the repository and scope,
+     * got with the login (anonymously without one). Undefined where the
+     * challenge cannot be answered.
+     */
+    private async authorizationFor(challenge: string, repository: string, scope: string): Promise<string | undefined> {
         const basic = this.auth ? `Basic ${Buffer.from(`${this.auth.username}:${this.auth.password}`).toString('base64')}` : undefined;
-        if (/^basic/i.test(challenge)) {
-            if (!basic) return r;
-            this.tokens.set(key, '');
-            return this.fetchImpl(url, { ...init, headers: { ...(init.headers as Record<string, string>), authorization: basic } });
-        }
+        if (/^basic/i.test(challenge)) return basic;
         const params = Object.fromEntries([...challenge.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1], m[2]]));
-        if (!params.realm) return r;
+        if (!params.realm) return undefined;
         const tokenUrl = new URL(params.realm);
         if (params.service) tokenUrl.searchParams.set('service', params.service);
         tokenUrl.searchParams.set('scope', `repository:${repository}:${scope}`);
         const t = await this.fetchImpl(tokenUrl.toString(), { headers: basic ? { authorization: basic } : {} });
         if (!t.ok) throw new Error(`registry ${this.host}: the token for ${repository} (${scope}) was refused: ${t.status} ${await t.text().catch(() => '')}`);
         const body = await t.json() as { token?: string, access_token?: string };
-        this.tokens.set(key, body.token ?? body.access_token ?? '');
-        r = await send();
-        return r;
+        const token = body.token ?? body.access_token;
+        if (!token) throw new Error(`registry ${this.host}: the token answer for ${repository} (${scope}) holds no token`);
+        return `Bearer ${token}`;
     }
 
     private static async fail(r: Response, what: string): Promise<never> {

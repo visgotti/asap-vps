@@ -107,6 +107,32 @@ describe('RegistryClient and copyRegistryImage', () => {
         await expect(new RegistryClient(DST, undefined, dst.fetchImpl).tags('ns/app')).rejects.toThrow(/tags of dst\.example\/ns\/app: 401/);
     });
 
+    it('a registry that asks for the login itself (Basic) is sent it with every request; a login it refuses is an error, never "nothing there"', async () => {
+        const r = fakeRegistry(DST, { users: { pusher: 'secret' }, basic: true });
+        r.push('ns/app', 'v1');
+        const c = new RegistryClient(DST, push, r.fetchImpl);
+        // The same repository and scope, again and again: each request carries the login.
+        expect(await c.tags('ns/app')).toEqual(['v1']);
+        expect(await c.tags('ns/app')).toEqual(['v1']);
+        expect((await c.manifest('ns/app', 'v1'))?.digest).toBe(r.tags.get('ns/app')?.get('v1'));
+        await expect(new RegistryClient(DST, { username: 'pusher', password: 'nope' }, r.fetchImpl).tags('ns/app')).rejects.toThrow(`registry ${DST}: the login was refused for ns/app (pull): 401`);
+        await expect(new RegistryClient(DST, undefined, r.fetchImpl).tags('ns/app')).rejects.toThrow(/tags of dst\.example\/ns\/app: 401/);
+    });
+
+    it('a token that has expired is asked for again, and the request sent once more: a copy outlives its tokens', async () => {
+        const dst = fakeRegistry(DST, { users: { pusher: 'secret' }, tokenUses: 2 });
+        dst.push('ns/app', 'v1');
+        const c = new RegistryClient(DST, push, dst.fetchImpl);
+        for (let i = 0; i < 5; i++) expect(await c.tags('ns/app')).toEqual(['v1']);
+        // Five reads on tokens good for two: three tokens.
+        expect(dst.calls.filter((x) => x.path === '/token')).toHaveLength(3);
+        const src = fakeRegistry(SRC, { publicRepos: ['library/busybox'], tokenUses: 1 });
+        const { manifestDigest } = src.seed('library/busybox', '1.36');
+        const one = fakeRegistry(DST, { users: { pusher: 'secret' }, tokenUses: 1 });
+        expect(await copyRegistryImage(`${SRC}/library/busybox:1.36`, `${DST}/ns/busybox:1.36`, { toAuth: push, fetchImpl: both({ host: SRC, r: src }, { host: DST, r: one }) })).toBe(manifestDigest);
+        expect(one.tags.get('ns/busybox')?.get('1.36')).toBe(manifestDigest);
+    });
+
     it('an index without linux/amd64 is refused by name; a missing image is an error, a missing manifest null', async () => {
         const src = fakeRegistry(SRC, { publicRepos: ['acme/app'] });
         src.seed('acme/app', '1');
