@@ -6,7 +6,7 @@
 import { CapabilityDescriptor, requireCapability, supports } from '../capabilities';
 import { MACHINE_TYPES, REGION_TYPES } from '../constants';
 import { NotSupportedError, ProviderError, TransportError } from '../errors';
-import type { CreateServerOptions, Offer, Server } from '../types';
+import type { CreateServerOptions, Offer, Server, WaitOptions } from '../types';
 import { ComputeProvider, EnumTranslations } from './ComputeProvider';
 import { ApiClient } from './utils';
 
@@ -48,8 +48,12 @@ class ScriptedProvider extends ComputeProvider {
         return [];
     }
 
-    async deleteServer(): Promise<void> {
+    /** The wait options each deleteServer call was given. */
+    readonly deleteOptions: WaitOptions[] = [];
+
+    async deleteServer(_id: string, o: WaitOptions = {}): Promise<void> {
         this.deletes++;
+        this.deleteOptions.push(o);
     }
 
     callApi(path: string) {
@@ -103,6 +107,38 @@ describe('ComputeProvider', () => {
         expect(e).toMatchObject({ code: 'timeout', cause: refusal });
         expect(e.message).toMatch(/not deleted after .* the delete kept failing \(scripted: precondition_failed/);
         expect(p.deletes).toBeGreaterThan(1);
+    });
+
+    it('a server gone after a delete that failed for good is no verified delete: what it deleted besides is left, and that is thrown', async () => {
+        // A lasting failure (Scaleway: its Block volume refused deletion) while the server itself went.
+        const lasting = new ProviderError('scripted', 'server s1 is deleted, but its block volume v1 is not', { code: 'left_behind' });
+        const p = new ScriptedProvider([{ status: 'running' }, null]);
+        p.deleteServer = async () => {
+            p.deletes++;
+            throw lasting;
+        };
+        await expect(p.deleteServerAndWait('s1', fast)).rejects.toBe(lasting);
+        // A failure that may be transient is one the server outlived or not: its being gone decides.
+        const q = new ScriptedProvider([null]);
+        q.deleteServer = async () => {
+            throw new ProviderError('scripted', '502', { retriable: true });
+        };
+        await expect(q.deleteServerAndWait('s1', fast)).resolves.toBe(true);
+    });
+
+    it('gives each delete the time left, so a provider whose delete waits waits no longer than the caller allows', async () => {
+        const p = new ScriptedProvider([{ status: 'running' }, null]);
+        expect(await p.deleteServerAndWait('s1', { timeoutMs: 60_000, intervalMs: 0 })).toBe(true);
+        expect(p.deleteOptions).toHaveLength(2);
+        for (const o of p.deleteOptions) {
+            expect(o.timeoutMs).toBeGreaterThan(55_000);
+            expect(o.timeoutMs).toBeLessThanOrEqual(60_000);
+            expect(o.intervalMs).toBe(0);
+        }
+        // Without an interval of its own, the provider keeps its own.
+        const q = new ScriptedProvider([null]);
+        await q.deleteServerAndWait('s1', { timeoutMs: 1000 });
+        expect(q.deleteOptions[0]).not.toHaveProperty('intervalMs');
     });
 
     it('getServerCost: the current run, from the rate and start the provider reports; null when it reports none, or the server is gone', async () => {

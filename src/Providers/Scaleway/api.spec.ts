@@ -427,6 +427,22 @@ describe('servers', () => {
     };
     const key = (zone: string, id: string) => `${zone}/${id}`;
 
+    it('a stopped server\'s local volumes that will not delete are named, as nothing finds them once the server is gone', async () => {
+        const { fake, api } = await made();
+        // Its local root disk, and a Block Storage volume it was made with (named by id, and untagged: its own).
+        const block = await api.createBlockVolume('nl-ams-1', { name: 'extra', perf_iops: 5000, project_id: FAKE_SCALEWAY_PROJECT, from_empty: { size: 20_000_000_000 } });
+        const body = { ...launching('two-disks', true), volumes: { 0: { volume_type: 'l_ssd' as const, size: 10_000_000_000 }, 1: { id: block.id, volume_type: 'sbs_volume' as const } } };
+        const s = await api.launchServer('nl-ams-1', body);
+        await stop(api, 'nl-ams-1', s.id);
+        const local = Object.values((await api.getServer('nl-ams-1', s.id))!.volumes).find((v) => v.volume_type === 'l_ssd')!.id;
+        fake.intercept((r) => r.method === 'DELETE' && /^\/(instance|block)\/v1\/zones\/nl-ams-1\/volumes\//.test(r.path), { answer: () => json(500, { message: 'internal error' }) });
+        const e = await api.deleteServer('nl-ams-1', s.id).catch((x) => x);
+        // Both are tried and named; a failure that reads as transient is not one anything will retry.
+        expect(e).toMatchObject({ name: 'ProviderError', code: 'left_behind', retriable: false });
+        expect(e.message).toContain(`its local volume ${local}, block volume ${block.id} are not`);
+        expect(await api.getServer('nl-ams-1', s.id)).toBeNull();
+    });
+
     it('a stopped server has no terminate: it is deleted as it is, and the volumes it keeps are deleted too (local ones through the Instance API, Block Storage ones through their own)', async () => {
         const { fake, api } = await made();
         const before = fake.liveVolumes();

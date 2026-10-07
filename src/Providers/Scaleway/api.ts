@@ -313,18 +313,35 @@ export class ScalewayApi extends ApiClient {
         const volumes = Object.values(server.volumes);
         const mounted = new Set(mountedVolumeIds(server));
         const blocks = volumes.filter((v) => v.volume_type === 'sbs_volume' && !mounted.has(v.id)).map((v) => v.id);
-        if (await this.remove(zone, server, end, intervalMs)) {
-            for (const v of volumes.filter((x) => x.volume_type === 'l_ssd' || x.volume_type === 'b_ssd')) {
+        const local = (await this.remove(zone, server, end, intervalMs)) ? volumes.filter((x) => x.volume_type === 'l_ssd' || x.volume_type === 'b_ssd') : [];
+        // The server is on its way out: a volume not deleted now is found by nothing once it is gone. Each is tried, and every one left is named.
+        const left: string[] = [];
+        let cause: unknown;
+        for (const v of local) {
+            try {
                 await this.deleted(SCALEWAY_ENDPOINTS.deleteVolume, { path: { zone, volume_id: v.id } });
+            } catch (e) {
+                left.push(`local volume ${v.id}`);
+                cause ??= e;
             }
         }
         for (const v of blocks) {
             try {
                 await this.deleteBlockVolume(zone, v, { intervalMs, timeoutMs: Math.max(0, end - Date.now()) });
             } catch (e) {
-                if (!(e instanceof ProviderError) || e.code !== 'timeout') throw e;
-                throw new ProviderError(this.id, `server ${zonedId(zone, id)} still holds block volume ${v} after ${secs} s: it bills until deleted: call deleteServer again while the server exists, or deleteBlockVolume('${zone}', '${v}') once it is gone`, { code: 'timeout' });
+                if (e instanceof ProviderError && e.code === 'timeout') {
+                    throw new ProviderError(this.id, `server ${zonedId(zone, id)} still holds block volume ${v} after ${secs} s: it bills until deleted: call deleteServer again while the server exists, or deleteBlockVolume('${zone}', '${v}') once it is gone`, { code: 'timeout' });
+                }
+                left.push(`block volume ${v}`);
+                cause ??= e;
             }
+        }
+        if (left.length) {
+            // A failure that lasts (no rights for Block Storage: an AuthError) goes as it is; one that may look
+            // transient is not, as the server it belonged to is gone: nothing retries it.
+            if (!isRetriable(cause)) throw cause;
+            throw new ProviderError(this.id, `server ${zonedId(zone, id)} is deleted, but its ${left.join(', ')} ${left.length > 1 ? 'are' : 'is'} not: it bills until deleted (${(cause as Error).message})`,
+                { code: 'left_behind', cause });
         }
         let state = 'unread';
         await pollUntil(async () => {

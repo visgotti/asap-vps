@@ -42,8 +42,12 @@ export interface ICompute<T extends PlatformTypes = PlatformTypes> {
     getServer(id: string): Promise<Server<T['server']> | null>;
     /** The account's servers, every one of them (other people's included): pick yours by name. */
     listServers(options?: ServerListOptions): Promise<Server<T['server']>[]>;
-    /** Idempotent: deleting a server that is already gone succeeds. */
-    deleteServer(id: string): Promise<void>;
+    /**
+     * Idempotent: deleting a server that is already gone succeeds. A provider
+     * whose delete waits (Scaleway deletes the server's volumes as they come
+     * free) waits for at most `o.timeoutMs`.
+     */
+    deleteServer(id: string, o?: WaitOptions): Promise<void>;
     /** Poll getServer until `done` accepts what it read (a server, or null once it is gone). */
     waitForServer(id: string, done: (s: Server<T['server']> | null) => boolean, o?: WaitOptions): Promise<Server<T['server']> | null>;
     /** Until the server is running (a VM also needs its public address); throws when it errors or disappears instead. */

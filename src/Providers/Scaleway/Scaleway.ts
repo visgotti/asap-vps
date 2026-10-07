@@ -206,12 +206,17 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         return perZone.flat();
     }
 
-    /** Terminates the server, waits until it is gone, and deletes its volumes. Idempotent: deleting a server that is already gone succeeds. */
-    public async deleteServer(id: string): Promise<void> {
+    /**
+     * Terminates the server, waits until it is gone (up to `o.timeoutMs`), and
+     * deletes its volumes. Idempotent: deleting a server that is already gone
+     * succeeds. A volume it could not delete is a ProviderError (`left_behind`)
+     * naming it: it bills until deleted, and nothing finds it once the server is gone.
+     */
+    public async deleteServer(id: string, o: WaitOptions = {}): Promise<void> {
         const r = parseZonedId(id);
         if (!r) return;
         const server = r.zone ? { zone: r.zone, id: r.id } : await this.api.findServer(id);
-        if (server) await this.api.deleteServer(server.zone, server.id);
+        if (server) await this.api.deleteServer(server.zone, server.id, o);
     }
 
     // ── power, restart ───────────────────────────────────────────────────

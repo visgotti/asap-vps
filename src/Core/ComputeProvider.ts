@@ -55,7 +55,7 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
     public abstract createServer(options: CreateServerOptions<T>): Promise<Server<T['server']>>;
     public abstract getServer(id: string): Promise<Server<T['server']> | null>;
     public abstract listServers(options?: ServerListOptions): Promise<Server<T['server']>[]>;
-    public abstract deleteServer(id: string): Promise<void>;
+    public abstract deleteServer(id: string, o?: WaitOptions): Promise<void>;
 
     /**
      * Poll getServer until `done` accepts what it read (a server, or null once
@@ -86,7 +86,10 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
      * Delete, and keep asking (and deleting again) until the provider says it is
      * gone. true only when verified; false when the deletes were accepted but the
      * server is still there at the timeout. When the provider kept refusing the
-     * delete, the timeout throws, its last refusal as the cause.
+     * delete, the timeout throws, its last refusal as the cause. A server that is
+     * gone after a delete that failed for good (not isRetriable: what it deletes
+     * with the server, such as Scaleway's volumes, is left) throws that failure.
+     * `o.timeoutMs` bounds the whole of it, the provider's own waits included.
      */
     public async deleteServerAndWait(id: string, o: WaitOptions = {}): Promise<boolean> {
         const timeoutMs = o.timeoutMs ?? 5 * 60_000;
@@ -94,17 +97,25 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
         let refused: unknown;
         for (;;) {
             try {
-                await this.deleteServer(id);
+                // The time left is the delete's too: a provider whose delete waits waits no longer.
+                await this.deleteServer(id, { timeoutMs: Math.max(0, end - Date.now()), ...(o.intervalMs !== undefined ? { intervalMs: o.intervalMs } : {}) });
                 refused = undefined;
             } catch (e) {
                 // Only the read below may say gone: a failed delete is retried, and remembered.
                 refused = e;
             }
+            let gone = false;
             try {
                 const s = await this.getServer(id);
-                if (!s || s.status === 'terminated') return true;
+                gone = !s || s.status === 'terminated';
             } catch (e) {
                 if (!isRetriable(e)) throw e;
+            }
+            if (gone) {
+                // Gone, but the delete failed for good at what it does besides (the volumes Scaleway deletes with
+                // the server): not a verified delete. A failure that may be transient is one the server outlived.
+                if (refused !== undefined && !isRetriable(refused)) throw refused;
+                return true;
             }
             if (Date.now() >= end) {
                 if (refused === undefined) return false;

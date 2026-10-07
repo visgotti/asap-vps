@@ -324,6 +324,29 @@ describe('Scaleway without stock, quota, or room', () => {
 });
 
 describe('Scaleway servers', () => {
+    it('a volume its delete could not delete is no verified delete: deleteServerAndWait names it, and it is still there', async () => {
+        const { fake, p } = make();
+        const s = await running(p);
+        const root = (await p.getServer(s.id))!.raw.volumes['0'].id;
+        // A Block Storage failure that reads as transient: the server goes, its volume does not.
+        fake.intercept((r) => r.method === 'DELETE' && r.path.startsWith('/block/'), { answer: () => json(500, { message: 'internal error' }) });
+        const e = await p.deleteServerAndWait(s.id, fast).catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e).toMatchObject({ code: 'left_behind', retriable: false });
+        expect(e.message).toContain(`block volume ${root}`);
+        expect(await p.getServer(s.id)).toBeNull();
+        expect(fake.state.volumes.has(root)).toBe(true);
+    });
+
+    it('deleteServerAndWait bounds the whole delete by its timeout: a server that will not settle is waited for no longer', async () => {
+        const { p } = make({ bootReads: Number.POSITIVE_INFINITY });
+        const [offer] = await p.listOffers({ kind: 'gpu' });
+        const s = await p.createServer({ name: 'stuck', offer });
+        const t0 = Date.now();
+        await expect(p.deleteServerAndWait(s.id, { timeoutMs: 50, intervalMs: 0 })).rejects.toThrow(/not deleted after/);
+        expect(Date.now() - t0).toBeLessThan(3000);
+    });
+
     it('are named by zone and id; a bare id is asked of every zone, and an id that is nothing\'s is not asked at all', async () => {
         const { p, fake } = make();
         const s = await running(p);

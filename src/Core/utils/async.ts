@@ -1,3 +1,5 @@
+import type { WaitOptions } from '../../types';
+
 /** How a wait waits: real time by default, a no-op in tests. */
 export type Sleep = (ms: number) => Promise<unknown>;
 
@@ -26,6 +28,17 @@ export const retryInvoke = async (fn: () => Promise<any>, timeBetween: number, m
     }
     throw new Error(lastErr as string || `Can not invoke without failing.`);
 };
+
+/**
+ * The wait options of a run of waits under one deadline: each call gives the
+ * time left of `o.timeoutMs` (counted from this call). Without a timeoutMs,
+ * `o` as it is: each wait keeps its own default.
+ */
+export function timeLeft<O extends WaitOptions>(o: O): () => O {
+    if (o.timeoutMs === undefined) return () => o;
+    const end = Date.now() + o.timeoutMs;
+    return () => ({ ...o, timeoutMs: Math.max(0, end - Date.now()) });
+}
 
 /** What a poll read last before it timed out. */
 export type PollLastRead<T> = { seen: false } | { seen: true, value: T };

@@ -16,7 +16,7 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider, ResolvedMount } from '../../Core/ComputeProvider';
 import {
-    compareCudaVersions, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey, RegistryClient, registryOf,
+    compareCudaVersions, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey, RegistryClient, registryOf, timeLeft,
 } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
 import type {
@@ -241,10 +241,11 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
      */
     public override async deleteServerAndWait(id: string, o: WaitOptions = {}): Promise<boolean> {
         const held = (await this.listVolumes().catch((): Volume<VastVolume>[] => [])).filter((v) => v.serverIds?.includes(id)).map((v) => v.id);
-        if (!(await super.deleteServerAndWait(id, o))) return false;
+        const left = timeLeft(o);
+        if (!(await super.deleteServerAndWait(id, left()))) return false;
         if (held.length) {
             await this.poll(() => this.listVolumes(), (all) => !all.some((v) => held.includes(v.id) && (v.serverIds?.includes(id) || v.status === 'attached')), {
-                timeoutMs: 5 * 60_000, ...o, what: `volume ${held.join(', ')} to let go of instance ${id}`, describe: () => `still in use by instance ${id}, which is gone`,
+                timeoutMs: 5 * 60_000, ...left(), what: `volume ${held.join(', ')} to let go of instance ${id}`, describe: () => `still in use by instance ${id}, which is gone`,
             });
         }
         return true;

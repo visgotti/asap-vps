@@ -14,7 +14,7 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider } from '../../Core/ComputeProvider';
-import { filterOffers, findSSHKey, pickSSHKeys, sshKeyFingerprint } from '../../Core/utils';
+import { filterOffers, findSSHKey, pickSSHKeys, sshKeyFingerprint, timeLeft } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, QuotaError } from '../../errors';
 import type {
     CreateServerOptions, CreateVolumeOptions, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerImage, ServerListOptions, Volume,
@@ -401,10 +401,11 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
      */
     public override async deleteServerAndWait(id: string, o: WaitOptions = {}): Promise<boolean> {
         const held = (await this.api.getDroplet(id).catch(() => null))?.volume_ids ?? [];
-        if (!(await super.deleteServerAndWait(id, o))) return false;
+        const left = timeLeft(o);
+        if (!(await super.deleteServerAndWait(id, left()))) return false;
         for (const volumeId of held) {
             const v = await this.api.getVolume(volumeId);
-            if (v) await this.releasedByGone(v, o);
+            if (v) await this.releasedByGone(v, left());
         }
         return true;
     }

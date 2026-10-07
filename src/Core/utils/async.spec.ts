@@ -1,4 +1,4 @@
-import { pollUntil } from './async';
+import { pollUntil, timeLeft } from './async';
 
 describe('pollUntil', () => {
     const noSleep = async () => {};
@@ -33,5 +33,18 @@ describe('pollUntil', () => {
             throw new Error('blip');
         }, () => true, { timeoutMs: 5, intervalMs: 1, retryOn: () => true, timeoutError: (last) => new Error(last.seen ? 'seen' : 'never read') }))
             .rejects.toThrow(/never read/);
+    });
+});
+
+describe('timeLeft', () => {
+    it('gives each wait of a run what is left of one deadline; without a timeout, the options as they are', async () => {
+        const left = timeLeft({ timeoutMs: 1000, intervalMs: 5 });
+        expect(left()).toMatchObject({ intervalMs: 5 });
+        expect(left().timeoutMs).toBeLessThanOrEqual(1000);
+        await new Promise((r) => setTimeout(r, 30));
+        expect(left().timeoutMs).toBeLessThanOrEqual(975);
+        expect(timeLeft({ timeoutMs: 0 })().timeoutMs).toBe(0);
+        const none = { intervalMs: 7 };
+        expect(timeLeft(none)()).toBe(none);
     });
 });
