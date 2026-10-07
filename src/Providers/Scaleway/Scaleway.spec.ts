@@ -873,6 +873,27 @@ describe('Scaleway volumes (Block Storage)', () => {
         await expect(p.deleteVolume('not-a-volume')).resolves.toBeUndefined();
     });
 
+    it('providerOptions add tags and may name volumes, but never drop what marks a volume as the caller\'s: it outlives the server', async () => {
+        const { fake, p } = make();
+        const [offer] = await p.listOffers({ kind: 'gpu' });
+        // A mount, with tags of the caller's own in providerOptions.
+        const v = await volume(p);
+        const s = await p.createServer({ name: 'gpu', offer, mounts: [{ volume: v }], providerOptions: { tags: ['team-a'] } });
+        expect(creates(fake).pop()?.body.tags).toEqual(['team-a', `${MOUNT_TAG}${v.id.split('/')[1]}`]);
+        expect(await p.deleteServerAndWait(s.id, fast)).toBe(true);
+        expect(await p.getVolume(v.id)).toMatchObject({ status: 'available' });
+        // A volume named in providerOptions.volumes exists already: it is the caller's too.
+        const w = await volume(p);
+        const raw = await p.createServer({ name: 'gpu-raw', offer, providerOptions: { volumes: { 1: { id: w.id.split('/')[1], volume_type: 'sbs_volume' } } } });
+        expect(creates(fake).pop()?.body.tags).toEqual([`${MOUNT_TAG}${w.id.split('/')[1]}`]);
+        expect(await p.deleteServerAndWait(raw.id, fast)).toBe(true);
+        expect(await p.getVolume(w.id)).toMatchObject({ status: 'available' });
+        // Both ways of naming the server's volumes at once are refused before anything is made.
+        const before = creates(fake).length;
+        await expect(p.createServer({ name: 'x', offer, diskGb: 50, providerOptions: { volumes: { 1: { id: w.id.split('/')[1] } } } })).rejects.toThrow(/providerOptions.volumes with diskGb or mounts/);
+        expect(creates(fake)).toHaveLength(before);
+    });
+
     it('an account image\'s extra volumes keep keys 1..n: the volume goes after them, and they go with the server while it stays', async () => {
         const { fake, p } = make();
         const [offer] = await p.listOffers({ kind: 'gpu' });

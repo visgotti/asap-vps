@@ -159,7 +159,16 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
             ...(o.diskGb !== undefined ? { 0: { volume_type: type.capabilities?.block_storage ? 'sbs_volume' : 'l_ssd', size: Math.round((o.diskGb * GB) / 512) * 512 } } : {}),
             ...attached.volumes,
         };
-        const tags = [...(o.tags ?? []), ...attached.tags, ...files.map((x) => fileSystemTag(x.fs.id, x.path))];
+        // The server's tags name what it holds but does not own (MOUNT_TAG, the filesystems): what its deletion and
+        // its images leave alone. providerOptions may add tags and name volumes, never drop that bookkeeping.
+        const { tags: rawTags, volumes: rawVolumes, ...raw } = o.providerOptions ?? {};
+        if (rawVolumes !== undefined && Object.keys(volumes).length) {
+            throw new NotSupportedError(this.id, 'providerOptions.volumes with diskGb or mounts (both set the server\'s volumes: pass one)');
+        }
+        const allVolumes: Record<string, ScalewayVolumeTemplate> = rawVolumes ?? volumes;
+        // A volume named by id exists already: it is the caller's, as a mount is, however it was named.
+        const held = Object.values(allVolumes).flatMap((v) => (v.id ? [`${MOUNT_TAG}${v.id}`] : []));
+        const tags = [...new Set([...(o.tags ?? []), ...(rawTags ?? []), ...attached.tags, ...held, ...files.map((x) => fileSystemTag(x.fs.id, x.path))])];
         const body: ScalewayCreateServerBody = {
             name: o.name,
             commercial_type: resolved.id,
@@ -168,9 +177,9 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
             dynamic_ip_required: true,
             boot_type: 'local',
             protected: false,
-            ...(Object.keys(volumes).length ? { volumes } : {}),
+            ...raw,
+            ...(Object.keys(allVolumes).length ? { volumes: allVolumes } : {}),
             ...(tags.length ? { tags } : {}),
-            ...o.providerOptions,
         };
         const own = fileSystemMountScript(files.map((x) => ({ id: x.fs.id, path: x.path })));
         const userData = this.userDataWith(o, !!gpuOf(type), own ? [own] : []);
