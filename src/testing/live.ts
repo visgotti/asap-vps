@@ -130,6 +130,25 @@ export async function teardown(
     return left ? [...left.values()] : ['(could not list)'];
 }
 
+/** The calls that make something on the account: what a run that is over makes no more of. */
+const MAKES = ['createServer', 'createVolume', 'createImage', 'copyImage', 'importImage', 'createEndpoint', 'addSSHKey'] as const;
+
+/**
+ * Ends a run on `p`: from now on, every call that makes something refuses.
+ * Call it before the teardown. A step jest gave up on (its timeout) is not
+ * stopped: it runs on, and would otherwise rent its next offer after the
+ * teardown had verified the account clean and the watchdog stood down.
+ */
+export function endRun(p: ComputeSubject, runName: string): void {
+    const calls = p as unknown as Record<string, unknown>;
+    for (const name of MAKES) {
+        if (typeof calls[name] !== 'function') continue;
+        calls[name] = async () => {
+            throw new Error(`${runName} is over: ${name} is refused (a step outlived its run)`);
+        };
+    }
+}
+
 /**
  * Records the id of every SSH key registered through `p` from now on (addSSHKey,
  * and what calls it: ServerProvisioner). deleteRunKeys deletes those by id, so

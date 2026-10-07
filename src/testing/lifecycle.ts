@@ -22,7 +22,7 @@ import type {
 } from '../types';
 import { testPublicKey } from './fakes/util';
 import {
-    ComputeSubject, deleteRunImages, deleteRunKeys, liveOptions, liveRequested, loadCredentials, newRunName, providerFromEnv, runMatcher, startWatchdog, sweepLeftovers,
+    ComputeSubject, deleteRunImages, deleteRunKeys, endRun, liveOptions, liveRequested, loadCredentials, newRunName, providerFromEnv, runMatcher, startWatchdog, sweepLeftovers,
     teardown, TEST_IMAGE, TEST_IMAGE_CUDA, trackSSHKeys, trackVolumes, deleteRunVolumes,
 } from './live';
 
@@ -392,6 +392,8 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
 
         afterAll(async () => {
             if (!p || refused) return;
+            // A step that timed out is still running: it makes nothing more, so what the teardown verifies stays true.
+            endRun(p, runName);
             const servers = await teardown(p, run, { log: t.log, sleep: t.sleep, intervalMs: t.wait.intervalMs });
             // By id as well as by name, read until two lists agree: a list may lag its writes by seconds, and a volume
             // detaches from its deleted server a little after it is gone.

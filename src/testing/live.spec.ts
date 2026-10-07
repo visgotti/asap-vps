@@ -15,7 +15,7 @@ import { fakeLambda } from './fakes/lambda';
 import { fakeRunPod } from './fakes/runpod';
 import { testPublicKey } from './fakes/util';
 import {
-    deleteRunImages, deleteRunKeys, deleteRunVolumes, liveOptions, liveRequested, loadCredentials, newRunName, RUN_PREFIX, runMatcher, startWatchdog, sweepLeftovers,
+    deleteRunImages, deleteRunKeys, deleteRunVolumes, endRun, liveOptions, liveRequested, loadCredentials, newRunName, RUN_PREFIX, runMatcher, startWatchdog, sweepLeftovers,
     teardown, trackSSHKeys, trackVolumes, watchdogFiles, watchdogLoop,
 } from './live';
 
@@ -79,6 +79,21 @@ describe('teardown and sweep', () => {
         p.deleteImage = remove;
         expect(await deleteRunImages(p, runMatcher(`${RUN_PREFIX}r`), fast)).toEqual([]);
         expect((await p.listImages()).map((i) => i.id)).not.toContain(image.id);
+    });
+
+    it('a run that is over makes nothing more: a step that outlived it cannot rent after the teardown', async () => {
+        const fake = fakeDigitalOcean();
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
+        const before = fake.liveServers();
+        const [offer] = await p.listOffers();
+        await p.createServer({ name: `${RUN_PREFIX}loop`, offer });
+        endRun(p, `${RUN_PREFIX}loop`);
+        expect(await teardown(p, `${RUN_PREFIX}loop`, fast)).toEqual([]);
+        // What a step still running would do next: rent again, register a key.
+        await expect(p.createServer({ name: `${RUN_PREFIX}loop-2`, offer })).rejects.toThrow(`${RUN_PREFIX}loop is over: createServer is refused`);
+        await expect(p.addSSHKey(testPublicKey(), `${RUN_PREFIX}loop`)).rejects.toThrow(/is over: addSSHKey is refused/);
+        expect(fake.liveServers()).toBe(before);
+        expect(await p.listSSHKeys()).toEqual([]);
     });
 
     it('one empty list is not proof that nothing is left: a server the list does not show yet is found by the next read, and deleted', async () => {

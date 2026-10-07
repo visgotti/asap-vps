@@ -60,11 +60,25 @@ function connect(o: SSHConnectOptions): NodeSSH {
 beforeAll(() => {
     jest.spyOn(SSHService, 'connect').mockImplementation((async (o: SSHConnectOptions) => connect(o)) as never);
 });
-afterAll(() => jest.restoreAllMocks());
+/** Each lifecycle's provider, as its run left it: the last one it made (the one before is only asked what it can do). */
+const ran = new Map<string, ReturnType<(typeof CONTRACT_SUBJECTS)[number]['make']>['provider']>();
+
+afterAll(async () => {
+    jest.restoreAllMocks();
+    // Each run was ended before its teardown: a step that outlived it (jest's timeout does not stop one) can rent nothing more.
+    expect(ran.size).toBeGreaterThan(CONTRACT_SUBJECTS.length);
+    for (const p of ran.values()) {
+        await expect(p.createServer({ name: 'after-the-run', offer: 'any' })).rejects.toThrow(/is over: createServer is refused/);
+        await expect(p.listServers()).resolves.toEqual(expect.any(Array));
+    }
+});
 
 const target = (subject: (typeof CONTRACT_SUBJECTS)[number], o: { cpu?: boolean } = {}) => fakeLifecycle(subject.name, (apiKey) => {
     const { provider, fake } = subject.make(apiKey ? { apiKey } : {});
-    if (!apiKey) current = fake;
+    if (!apiKey) {
+        current = fake;
+        ran.set(`${subject.name}${o.cpu ? ' (cpu)' : ''}`, provider);
+    }
     return provider;
 }, o);
 
