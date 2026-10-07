@@ -316,6 +316,8 @@ Failures are typed, all extending `ProviderError`:
 - `NotSupportedError`.
 - `TransportError`: no answer at all, or one cut off.
 
+A create that fails once it has made something deletes what it made (Scaleway: an image, a volume, a filesystem, a snapshot, an endpoint whose wait runs out or ends in an error). Where that delete fails too, the error has the code `left_behind` and names what is left: it bills until you delete it, and nothing else would find it.
+
 `isRetriable(e)` says whether a failure is safe to try again as it is: a read or an idempotent request that got no answer or a temporary error, or a refusal such as a rate limit. A create is never retried after a server error or a lost answer, and `isRetriable` is false for those, because it may already have made a (billed) machine: find it by its name instead.
 
 # What each platform does

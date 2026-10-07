@@ -313,12 +313,17 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
             ?? (await this.api.listImages(s.zone)).filter((i) => i.name === o.name && i.from_server === s.id)
                 .sort((a, b) => createdAt(b) - createdAt(a))[0]?.id;
         if (!id) throw new ProviderError(this.id, `the backup of server ${serverId} did not say which image it makes`);
-        const image = await this.poll(() => this.api.getImage(s.zone, id), (i) => !i || i.state !== 'creating', {
-            timeoutMs: o.timeoutMs ?? 60 * 60_000, intervalMs: o.intervalMs ?? 15_000, what: `image ${zonedId(s.zone, id)}`, describe: (i) => String(i?.state),
-        });
-        if (!image) throw new NotFoundError(this.id, `image ${zonedId(s.zone, id)} disappeared while it was made`);
-        if (image.state === 'error') throw new ProviderError(this.id, `image ${zonedId(s.zone, id)} of server ${serverId} ended in an error`);
-        return toImage(image);
+        try {
+            const image = await this.poll(() => this.api.getImage(s.zone, id), (i) => !i || i.state !== 'creating', {
+                timeoutMs: o.timeoutMs ?? 60 * 60_000, intervalMs: o.intervalMs ?? 15_000, what: `image ${zonedId(s.zone, id)}`, describe: (i) => String(i?.state),
+            });
+            if (!image) throw new NotFoundError(this.id, `image ${zonedId(s.zone, id)} disappeared while it was made`);
+            if (image.state === 'error') throw new ProviderError(this.id, `image ${zonedId(s.zone, id)} of server ${serverId} ended in an error`);
+            return toImage(image);
+        } catch (e) {
+            // An error or a timeout leaves nothing billing: the image goes, its snapshots with it.
+            return this.unmade(e, `image ${zonedId(s.zone, id)}`, () => this.api.deleteImage(s.zone, id));
+        }
     }
 
     /**
@@ -463,12 +468,18 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const made = await this.api.createBlockVolume(zone, {
             name: o.name, perf_iops: 5000, project_id: this.api.requireProject('create a volume'), from_empty: { size: Math.ceil(o.sizeGb) * GB }, ...o.providerOptions,
         });
-        const v = await this.poll(() => this.api.getBlockVolume(zone, made.id), (x) => !x || x.status !== 'creating', {
-            timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 2000, what: `volume ${zonedId(zone, made.id)}`, describe: (x) => String(x?.status),
-        });
-        if (!v) throw new NotFoundError(this.id, `volume ${zonedId(zone, made.id)} disappeared while it was made`);
-        if (v.status !== 'available') throw new ProviderError(this.id, `volume ${zonedId(zone, made.id)} is ${v.status}, not available`);
-        return toVolume(v);
+        const wait = { timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 2000 };
+        try {
+            const v = await this.poll(() => this.api.getBlockVolume(zone, made.id), (x) => !x || x.status !== 'creating', {
+                ...wait, what: `volume ${zonedId(zone, made.id)}`, describe: (x) => String(x?.status),
+            });
+            if (!v) throw new NotFoundError(this.id, `volume ${zonedId(zone, made.id)} disappeared while it was made`);
+            if (v.status !== 'available') throw new ProviderError(this.id, `volume ${zonedId(zone, made.id)} is ${v.status}, not available`);
+            return toVolume(v);
+        } catch (e) {
+            // Deleted once it is no longer being made, waited for as long as the create was.
+            return this.unmade(e, `volume ${zonedId(zone, made.id)}`, () => this.api.deleteBlockVolume(zone, made.id, wait));
+        }
     }
 
     /**
@@ -601,8 +612,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
             return toEndpoint(await this.settled(`endpoint ${o.name}`, () => this.api.getContainer(region, made.id), wait));
         } catch (e) {
             // Nothing half-made is left: the namespace goes, and its container with it, waited for.
-            await this.deleteNamespaceAndWait(region, ns.id, ns.name, wait).catch(() => undefined);
-            throw e;
+            return this.unmade(e, `namespace ${ns.name} (${region}/${ns.id}, with its container)`, () => this.deleteNamespaceAndWait(region, ns.id, ns.name, wait));
         }
     }
 
@@ -718,8 +728,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
             if (f.status !== 'available') throw new ProviderError(this.id, `filesystem ${o.name} is ${f.status}, not available`);
             return toFileSystemVolume(f);
         } catch (e) {
-            await this.api.deleteFileSystem(region, made.id).catch(() => undefined);
-            throw e;
+            return this.unmade(e, `filesystem ${o.name} (${region}/${made.id})`, () => this.api.deleteFileSystem(region, made.id));
         }
     }
 
@@ -754,24 +763,40 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
     private async imageFromObject(zone: ScalewayZone, from: { bucket: string, key: string, name: string, project: string }, wait: Required<WaitOptions>,
         extra?: Partial<ScalewayTypes['imageImportBody']>): Promise<ServerImage<ScalewayImage>> {
         const made = await this.api.importBlockSnapshot(zone, { bucket: from.bucket, key: from.key, name: from.name, project_id: from.project });
-        let imaged = false;
+        let image: ScalewayImage | undefined;
         try {
             const snap = await this.poll(() => this.api.getBlockSnapshot(zone, made.id), (x) => !x || x.status !== 'creating', { ...wait, what: `import of ${from.name}`, describe: (x) => String(x?.status) });
             if (!snap) throw new NotFoundError(this.id, `the snapshot of ${from.name} disappeared while it was imported`);
             if (snap.status !== 'available') throw new ProviderError(this.id, `the import of ${from.name} is ${snap.status}: Scaleway could not read the file (a QCOW2, unencrypted, no backing file, at most 1 TB)`);
-            const image = await this.api.createImage(zone, { name: from.name, root_volume: snap.id, arch: 'x86_64', project: from.project, ...extra });
-            imaged = true;
-            const done = await this.poll(() => this.api.getImage(zone, image.id), (i) => !i || i.state !== 'creating', { ...wait, what: `image ${zonedId(zone, image.id)}`, describe: (i) => String(i?.state) });
-            if (!done || done.state !== 'available') {
-                // The image goes, its snapshot with it.
-                await this.api.deleteImage(zone, image.id).catch(() => undefined);
-                throw new ProviderError(this.id, `image ${zonedId(zone, image.id)} of ${from.name} is ${done?.state ?? 'gone'}, not available`);
-            }
+            image = await this.api.createImage(zone, { name: from.name, root_volume: snap.id, arch: 'x86_64', project: from.project, ...extra });
+            const id = image.id;
+            const done = await this.poll(() => this.api.getImage(zone, id), (i) => !i || i.state !== 'creating', { ...wait, what: `image ${zonedId(zone, id)}`, describe: (i) => String(i?.state) });
+            if (!done || done.state !== 'available') throw new ProviderError(this.id, `image ${zonedId(zone, id)} of ${from.name} is ${done?.state ?? 'gone'}, not available`);
             return toImage(done);
         } catch (e) {
-            if (!imaged) await this.api.deleteBlockSnapshot(zone, made.id).catch(() => undefined);
-            throw e;
+            // An error or a timeout leaves nothing billing: the image (its snapshot with it), then the snapshot, should the image be gone already.
+            const imageId = image?.id;
+            return this.unmade(e, imageId ? `image ${zonedId(zone, imageId)} and snapshot ${zonedId(zone, made.id)}` : `snapshot ${zonedId(zone, made.id)}`, async () => {
+                if (imageId) await this.api.deleteImage(zone, imageId);
+                await this.api.deleteBlockSnapshot(zone, made.id);
+            });
         }
+    }
+
+    /**
+     * A create's failure `e`, thrown once `cleanup` has deleted what the
+     * create made. Where that delete fails too, a `left_behind` error naming
+     * `what`, which then stays (and bills) until deleted and which nothing else
+     * would find; `e` is its cause.
+     */
+    private async unmade(e: unknown, what: string, cleanup: () => Promise<unknown>): Promise<never> {
+        try {
+            await cleanup();
+        } catch (failed) {
+            throw new ProviderError(this.id, `${(e as Error).message}; and ${what}, made for it, is not deleted (${(failed as Error).message}): it stays, and bills, until deleted`,
+                { code: 'left_behind', cause: e });
+        }
+        throw e;
     }
 
     /** Deletes a namespace (and its containers), and waits until it is gone. */

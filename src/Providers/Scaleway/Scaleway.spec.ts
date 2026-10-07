@@ -573,6 +573,20 @@ describe('Scaleway images', () => {
         await expect(gone.p.createImage(gone.s.id, { name: 'gone', ...fast })).rejects.toBeInstanceOf(NotFoundError);
         const failed = await stopped({ imageFails: true });
         await expect(failed.p.createImage(failed.s.id, { name: 'failed', ...fast })).rejects.toThrow(/of server .* ended in an error/);
+        // Nothing is left billing: the image that failed is deleted, its snapshots with it.
+        expect([...failed.fake.state.images.values()].filter((i) => i.name === 'failed')).toEqual([]);
+    });
+
+    it('an image still being made when the wait is over is deleted; one Scaleway will not delete is named, left_behind', async () => {
+        const { p, fake, s } = await stopped();
+        fake.intercept(isBackup, { after: () => { for (const i of fake.state.images.values()) if (i.state === 'creating') i.left = 1e9; }, times: 1 });
+        await expect(p.createImage(s.id, { name: 'slow', intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/timed out after 0 s waiting for image pl-waw-2\/[0-9a-f-]{36}: creating/);
+        expect([...fake.state.images.values()].filter((i) => i.name === 'slow')).toEqual([]);
+        fake.intercept(isBackup, { after: () => { for (const i of fake.state.images.values()) if (i.state === 'creating') i.left = 1e9; }, times: 1 });
+        fake.intercept((r) => r.method === 'DELETE' && /\/images\/[0-9a-f-]{36}$/.test(r.path), { answer: () => json(403, { type: 'permissions_denied', message: 'insufficient permissions' }), times: 1 });
+        const kept = p.createImage(s.id, { name: 'kept', intervalMs: 0, timeoutMs: 20 });
+        await expect(kept).rejects.toThrow(/waiting for image pl-waw-2\/([0-9a-f-]{36}): creating; and image pl-waw-2\/\1, made for it, is not deleted \(.*insufficient permissions.*\): it stays, and bills, until deleted/);
+        await expect(kept).rejects.toMatchObject({ code: 'left_behind' });
     });
 
     it('keeps a state it does not know as its own word', async () => {
@@ -904,9 +918,13 @@ describe('Scaleway volumes (Block Storage)', () => {
         await expect(volume(p)).rejects.toThrow(/disappeared while it was made/);
         fake.intercept((r) => r.method === 'GET' && /\/block\/v1\/zones\/pl-waw-2\/volumes\/[^/]+$/.test(r.path), { times: 1, answer: (r) => json(200, { ...blockVolume(fake, `x/${r.path.split('/').pop()}`), status: 'error' }) });
         await expect(volume(p)).rejects.toThrow(/is error, not available/);
-        // One still being made when the wait is over: the wait says what it saw.
+        // The two that failed are gone: none of them is left billing.
+        expect([...fake.state.volumes.values()].filter((v) => v.name === 'v')).toEqual([]);
+        // One still being made when the wait is over (and for as long again): the wait says what it saw, and that the volume is left.
         fake.intercept((r) => r.method === 'GET' && /\/block\/v1\/zones\/pl-waw-2\/volumes\/[^/]+$/.test(r.path), { answer: (r) => json(200, { ...blockVolume(fake, `x/${r.path.split('/').pop()}`), status: 'creating' }) });
-        await expect(p.createVolume({ name: 'slow', region: 'pl-waw-2', sizeGb: 20, timeoutMs: 0, intervalMs: 0 })).rejects.toThrow(/waiting for volume pl-waw-2\/.*: creating/);
+        const slow = p.createVolume({ name: 'slow', region: 'pl-waw-2', sizeGb: 20, timeoutMs: 0, intervalMs: 0 });
+        await expect(slow).rejects.toThrow(/waiting for volume pl-waw-2\/.*: creating; and volume pl-waw-2\/[0-9a-f-]+, made for it, is not deleted \(.*\): it stays, and bills, until deleted/);
+        await expect(slow).rejects.toMatchObject({ code: 'left_behind' });
     });
 
     it('is attached at create after the image\'s own volumes, named in a tag; it outlives the server, which still deletes its own', async () => {
@@ -1287,6 +1305,13 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         });
         stuck(/\/containers\/[0-9a-f-]{36}$/, 'creating');
         await expect(p.createEndpoint({ name: 'slow', container: WHOAMI, intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/timed out after 0 s waiting for endpoint slow: creating/);
+        // Its namespace, which Scaleway will not delete: named with the failure, left_behind.
+        const { fake: f2, p: p2 } = make();
+        f2.intercept((r) => r.method === 'GET' && /\/containers\/[0-9a-f-]{36}$/.test(r.path), { answer: (r) => json(200, { ...f2.state.containers.get(r.path.split('/').pop()!), status: 'creating' }) });
+        f2.intercept((r) => r.method === 'DELETE' && /\/namespaces\/[0-9a-f-]{36}$/.test(r.path), { answer: () => json(403, { type: 'permissions_denied', message: 'insufficient permissions' }) });
+        const kept = p2.createEndpoint({ name: 'kept', container: WHOAMI, intervalMs: 0, timeoutMs: 20 });
+        await expect(kept).rejects.toThrow(/waiting for endpoint kept: creating; and namespace kept \(fr-par\/[0-9a-f-]{36}, with its container\), made for it, is not deleted \(.*insufficient permissions.*\)/);
+        await expect(kept).rejects.toMatchObject({ code: 'left_behind' });
     });
 
     it('a container that is never gone, or a namespace that is never gone, is a timeout that says so', async () => {
@@ -1426,6 +1451,12 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
             { answer: (r) => json(200, { ...fake.state.filesystems.get(r.path.split('/').pop()!), status }), times: 1e9 });
         stuck('creating');
         await expect(p.createVolume({ name: 'slow', region: 'fr-par-2', sizeGb: 25, shared: true, intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/waiting for filesystem slow: creating/);
+        // Deleted: nothing left billing. One Scaleway will not delete is named, left_behind.
+        expect([...fake.state.filesystems.values()].filter((x) => x.name === 'slow')).toEqual([]);
+        fake.intercept((r) => r.method === 'DELETE' && /\/filesystems\/[0-9a-f-]{36}$/.test(r.path), { answer: () => json(403, { type: 'permissions_denied', message: 'insufficient permissions' }), times: 1 });
+        const kept = p.createVolume({ name: 'kept', region: 'fr-par-2', sizeGb: 25, shared: true, intervalMs: 0, timeoutMs: 20 });
+        await expect(kept).rejects.toThrow(/waiting for filesystem kept: creating; and filesystem kept \(fr-par\/[0-9a-f-]{36}\), made for it, is not deleted/);
+        await expect(kept).rejects.toMatchObject({ code: 'left_behind' });
         const { fake: f2, p: p2 } = make();
         const share = await p2.createVolume({ name: 'sticky', region: 'fr-par-2', sizeGb: 25, shared: true, ...fast });
         f2.intercept((r) => r.method === 'GET' && r.path.endsWith(share.id.split('/')[1]), { answer: () => json(200, { ...[...f2.state.filesystems.values()][0] ?? {}, id: share.id.split('/')[1], status: 'available' }), times: 1e9 });
@@ -1545,7 +1576,7 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
         expect((await p.importImage({ name: 'defaults', url: URL_OK, region: 'fr-par-2' })).status).toBe('available');
     });
 
-    it('an import or an image that never ends times out saying what it last saw; an image that goes is thrown; a cleanup refused does not hide the failure', async () => {
+    it('an import or an image that never ends times out saying what it last saw, and leaves nothing; an image that goes is thrown; a cleanup refused is named, left_behind', async () => {
         const { fake, p } = withKey();
         const slow = { intervalMs: 0, timeoutMs: 20 };
         const refused = () => json(403, { type: 'permissions_denied', message: 'insufficient permissions', details: [] });
@@ -1557,14 +1588,21 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
             after: () => { for (const x of fake.state.images.values()) if (x.state === 'creating') x.left = 1e9; }, times: 1,
         });
         await expect(p.importImage({ name: 'slow-image', url: URL_OK, region: 'fr-par-2', ...slow })).rejects.toThrow(/timed out after 0 s waiting for image fr-par-2\/[0-9a-f-]{36}: creating/);
+        // Neither the import that never ended nor the image that never did is left: no snapshot, no image.
+        expect([...fake.state.snapshots.values()].filter((x) => ['slow-import', 'slow-image'].includes(x.name))).toEqual([]);
+        expect([...fake.state.images.values()].filter((x) => x.name === 'slow-image')).toEqual([]);
         fake.intercept((r) => r.method === 'GET' && /\/images\/[0-9a-f-]{36}$/.test(r.path), { answer: () => json(404, { type: 'not_found', message: 'gone' }), times: 1 });
         await expect(p.importImage({ name: 'vanished', url: URL_OK, region: 'fr-par-2', ...fast })).rejects.toThrow(/of vanished is gone, not available/);
-        // The snapshot of a file Scaleway cannot read, an image that errors: their deletes refused, the failure is what is thrown.
+        // The snapshot of a file Scaleway cannot read, an image that errors: their deletes refused, each is named with the failure (left_behind).
         fake.intercept((r) => r.method === 'DELETE' && r.path.startsWith('/block/v1/zones/fr-par-2/snapshots/'), { answer: refused, times: 1 });
-        await expect(p.importImage({ name: 'bad', url: 'https://cloud-images.example.com/corrupt.qcow2', region: 'fr-par-2', ...fast })).rejects.toThrow(/the import of bad is error/);
+        const bad = p.importImage({ name: 'bad', url: 'https://cloud-images.example.com/corrupt.qcow2', region: 'fr-par-2', ...fast });
+        await expect(bad).rejects.toThrow(/the import of bad is error: .*; and snapshot fr-par-2\/[0-9a-f-]{36}, made for it, is not deleted \(.*insufficient permissions.*\)/);
+        await expect(bad).rejects.toMatchObject({ code: 'left_behind' });
         fake.intercept((r) => r.method === 'GET' && /\/images\/[0-9a-f-]{36}$/.test(r.path), { answer: (r) => json(200, { image: { ...fake.state.images.get(r.path.split('/').pop()!), state: 'error' } }), times: 1 });
         fake.intercept((r) => r.method === 'DELETE' && /\/images\/[0-9a-f-]{36}$/.test(r.path), { answer: refused, times: 1 });
-        await expect(p.importImage({ name: 'broken', url: URL_OK, region: 'fr-par-2', ...fast })).rejects.toThrow(/of broken is error, not available/);
+        const broken = p.importImage({ name: 'broken', url: URL_OK, region: 'fr-par-2', ...fast });
+        await expect(broken).rejects.toThrow(/of broken is error, not available; and image fr-par-2\/[0-9a-f-]{36} and snapshot fr-par-2\/[0-9a-f-]{36}, made for it, is not deleted/);
+        await expect(broken).rejects.toMatchObject({ code: 'left_behind' });
         expect(fake.state.s3['fr-par'].buckets.size).toBe(0);
     });
 
