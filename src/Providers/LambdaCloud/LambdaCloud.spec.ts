@@ -5,7 +5,7 @@
 // each refused before anything is sent; and filesystems (its volumes): no size,
 // mounted at launch under /home, /lambda/nfs or /data, never deleted in use.
 
-import { NotSupportedError, ProviderError, QuotaError } from '../../errors';
+import { AuthError, CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
 import { fakeLambda } from '../../testing/fakes/lambda';
 import { LambdaCloud } from './LambdaCloud';
 
@@ -46,6 +46,33 @@ describe('LambdaCloud', () => {
     it('the account quota is a QuotaError', async () => {
         const { p } = make({ instanceQuota: 1 });
         await expect(p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] })).rejects.toBeInstanceOf(QuotaError);
+    });
+
+    it('reads each answer a launch documents by its code, whatever status carries it', async () => {
+        // The launch's documented failures (openapi 1.10.0): the status, the code, and what it is to a caller.
+        const documented: Array<[number, string, new (...a: never[]) => Error, boolean]> = [
+            [400, 'global/object-does-not-exist', NotFoundError, false],
+            [404, 'global/object-does-not-exist', NotFoundError, false],
+            [400, 'instance-operations/launch/insufficient-capacity', CapacityError, false],
+            [400, 'global/quota-exceeded', QuotaError, false],
+            // A 403 that is the account's state, not the key's: nothing a new key fixes.
+            [403, 'global/account-inactive', QuotaError, false],
+            [403, 'global/invalid-address', QuotaError, false],
+            [401, 'global/invalid-api-key', AuthError, false],
+            [400, 'global/invalid-parameters', ProviderError, false],
+            [400, 'instance-operations/launch/file-system-in-wrong-region', ProviderError, false],
+            [429, 'global/rate-limited', ProviderError, true],
+        ];
+        for (const [status, code, kind, retriable] of documented) {
+            const fake = fakeLambda();
+            const answering = (async (url: string, init?: RequestInit) => (init?.method === 'POST' && new URL(url).pathname.endsWith('/instance-operations/launch')
+                ? new Response(JSON.stringify({ error: { code, message: 'refused', suggestion: 'see the docs' } }), { status, headers: { 'content-type': 'application/json' } })
+                : fake.fetchImpl(url, init))) as typeof fetch;
+            const p = new LambdaCloud({ apiKey: 'lambda-test', fetchImpl: answering, sleep: noSleep });
+            const e = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] }).catch((x) => x);
+            expect([code, status, e.constructor.name, e.code, isRetriable(e)]).toEqual([code, status, kind.name, code, retriable]);
+            expect(e.message).toContain('(see the docs)');
+        }
     });
 
     it('lists GPU instances, CPU instances, or both (the default); logs in as ubuntu', async () => {
