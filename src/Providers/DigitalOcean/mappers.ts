@@ -28,7 +28,13 @@ export const DROPLET_STATUS: Readonly<Record<DigitalOceanDropletStatus, ServerSt
  */
 export const DIGITALOCEAN_BILLING: Billing = Object.freeze({ incrementSeconds: 1, minimumSeconds: 60, minimumUsd: 0.01 });
 
-/** The library's enums by DigitalOcean's names: its regions (a region is its first datacenter) and its Ubuntu images. */
+/**
+ * The library's enums by DigitalOcean's names: its regions and its Ubuntu
+ * images. A region is its first datacenter that takes new resources: San
+ * Francisco is sfo3, as sfo1 is a legacy datacenter DigitalOcean has closed
+ * to them (docs.digitalocean.com/platform/regional-availability); it is still
+ * there by its own name, SAN_FRANCISCO_1.
+ */
 export const DIGITALOCEAN_ENUMS: EnumTranslations = Object.freeze({
     regions: {
         [REGION_TYPES.TORONTO]: 'tor1',
@@ -36,7 +42,7 @@ export const DIGITALOCEAN_ENUMS: EnumTranslations = Object.freeze({
         [REGION_TYPES.NYC_1]: 'nyc1',
         [REGION_TYPES.NYC_2]: 'nyc2',
         [REGION_TYPES.NYC_3]: 'nyc3',
-        [REGION_TYPES.SAN_FRANCISCO]: 'sfo1',
+        [REGION_TYPES.SAN_FRANCISCO]: 'sfo3',
         [REGION_TYPES.SAN_FRANCISCO_1]: 'sfo1',
         [REGION_TYPES.SAN_FRANCISCO_2]: 'sfo2',
         [REGION_TYPES.SAN_FRANCISCO_3]: 'sfo3',

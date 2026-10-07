@@ -73,6 +73,15 @@ describe('DigitalOcean API facts', () => {
     };
     const running = async (p: DigitalOcean, id: string) => p.waitUntilRunning(id, { intervalMs: 0, timeoutMs: 2000 });
 
+    it('San Francisco is sfo3, the datacenter that takes new droplets; the legacy sfo1 only by its own name', async () => {
+        const { p, fake } = make();
+        fake.state.sizes.find((x) => x.slug === 's-8vcpu-16gb')!.regions.push('sfo3', 'sfo1');
+        const regions = async (region: REGION_TYPES) => (await p.createServer({ name: `in-${region}`.replace(/_/g, '-'), offer: 's-8vcpu-16gb', region })).region;
+        expect(await regions(REGION_TYPES.SAN_FRANCISCO)).toBe('sfo3');
+        expect(await regions(REGION_TYPES.SAN_FRANCISCO_3)).toBe('sfo3');
+        expect(await regions(REGION_TYPES.SAN_FRANCISCO_1)).toBe('sfo1');
+    });
+
     it('a droplet names its GPU as its offer does, a model asap-vps does not know included', async () => {
         const { p, fake } = make();
         fake.state.sizes.push({ slug: 'gpu-zz9x1-64gb', price_hourly: 2.5, available: true, regions: ['tor1'], vcpus: 8, memory: 65536, disk: 500,
