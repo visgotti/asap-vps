@@ -707,16 +707,16 @@ export type ScalewayCreateContainerBody = {
 /** A container's size, what a serverless offer is made from: thousandths of a vCPU, and memory in bytes. */
 export type ScalewayContainerSize = { mvcpu: number, memoryBytes: number };
 
-// ── File Storage API v1alpha1 (https://www.scaleway.com/en/developers/api/file-storage/v1alpha1; paths /file/v1alpha1) ──
+// ── File Storage API v1alpha1 (https://www.scaleway.com/en/developers/api/file-storage; paths /file/v1alpha1) ──
 
-/** https://www.scaleway.com/en/developers/api/file-storage/v1alpha1/filesystem#get-filesystem-details */
+/** https://www.scaleway.com/en/developers/api/file-storage/filesystem#get-filesystem-details */
 export type ScalewayFileSystemStatus = 'unknown_status' | 'available' | 'error' | 'creating' | 'updating';
 
 /**
  * A File Storage filesystem: one region's (Paris for now), attached to
  * Instances of its zones (of a type that can: `max_file_systems`), many at
  * once, each mounting it with virtiofs (its id is the tag).
- * https://www.scaleway.com/en/developers/api/file-storage/v1alpha1/filesystem#get-filesystem-details
+ * https://www.scaleway.com/en/developers/api/file-storage/filesystem#get-filesystem-details
  */
 export type ScalewayFileSystem = {
     id: string,
@@ -734,7 +734,7 @@ export type ScalewayFileSystem = {
     updated_at: string | null,
 };
 
-/** POST .../filesystems: 25 GB to 50 TB, in GB steps. https://www.scaleway.com/en/developers/api/file-storage/v1alpha1/filesystem#create-a-new-filesystem */
+/** POST .../filesystems: 25 GB to 50 TB, in GB steps. https://www.scaleway.com/en/developers/api/file-storage/filesystem#create-a-new-filesystem */
 export type ScalewayCreateFileSystemBody = {
     name: string,
     project_id: string,

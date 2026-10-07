@@ -15,7 +15,7 @@ describe('Scaleway endpoint table', () => {
         expect(entries.length).toBeGreaterThanOrEqual(18);
         for (const [name, e] of entries) {
             expect([name, e.docs]).toEqual([name, expect.stringMatching(
-                /^https:\/\/www\.scaleway\.com\/en\/developers\/api\/(instance\/v1\/[a-z-]+|iam\/ssh-keys|block\/v1\/[a-z-]+|marketplace\/marketplace-[a-z-]+|serverless-containers\/v1\/[a-z-]+|file-storage\/v1alpha1\/[a-z-]+)#[a-z0-9]+(-[a-z0-9]+)*$/)]);
+                /^https:\/\/www\.scaleway\.com\/en\/developers\/api\/(instance\/v1\/[a-z-]+|iam\/ssh-keys|block\/v1\/[a-z-]+|marketplace\/marketplace-[a-z-]+|serverless-containers\/v1\/[a-z-]+|file-storage\/[a-z-]+)#[a-z0-9]+(-[a-z0-9]+)*$/)]);
             expect([name, e.operationId]).toEqual([name, expect.stringMatching(/^[A-Z][A-Za-z]+$/)]);
             expect(['GET', 'POST', 'PATCH', 'DELETE']).toContain(e.method);
         }
@@ -23,7 +23,7 @@ describe('Scaleway endpoint table', () => {
 
     it('puts each endpoint under its API\'s path: zonal for Instance and Block Storage, regional for Serverless Containers, global for IAM and the Marketplace', () => {
         const pages: Record<string, string> = {
-            instance: 'instance/v1', block: 'block/v1', iam: 'iam', marketplace: 'marketplace', containers: 'serverless-containers/v1', file: 'file-storage/v1alpha1',
+            instance: 'instance/v1', block: 'block/v1', iam: 'iam', marketplace: 'marketplace', containers: 'serverless-containers/v1', file: 'file-storage',
         };
         for (const [name, e] of entries) {
             const zonal = /^\/(instance\/v1|block\/v1)\/zones\/\{zone\}\//.test(e.path);

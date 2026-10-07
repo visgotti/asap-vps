@@ -13,7 +13,7 @@
 //   Block Storage v1  https://www.scaleway.com/en/developers/api/block/v1      (spec: .../block/v1/schema.yml)
 //   Marketplace v2    https://www.scaleway.com/en/developers/api/marketplace   (spec: .../marketplace/v2/schema.yml)
 //   Serverless Containers v1  https://www.scaleway.com/en/developers/api/serverless-containers/v1  (spec: .../serverless-containers/v1/schema.yml; paths /containers/v1)
-//   File Storage v1alpha1     https://www.scaleway.com/en/developers/api/file-storage/v1alpha1      (spec: .../file-storage/v1alpha1/schema.yml; paths /file/v1alpha1)
+//   File Storage v1alpha1     https://www.scaleway.com/en/developers/api/file-storage               (spec: .../file-storage/v1alpha1/schema.yml; paths /file/v1alpha1)
 // Every request carries the secret key in the `X-Auth-Token` header, and the
 // Instance and Block Storage paths are zonal: `/zones/{zone}/...`.
 
@@ -205,21 +205,21 @@ export const SCALEWAY_ENDPOINTS = {
 
     listFileSystems: {
         operationId: 'ListFileSystems', method: 'GET', path: '/file/v1alpha1/regions/{region}/filesystems', query: ['page', 'page_size', 'project_id'],
-        docs: `${DOCS}/file-storage/v1alpha1/filesystem#list-all-filesystems`,
+        docs: `${DOCS}/file-storage/filesystem#list-all-filesystems`,
     },
     /** `creating`, then `available`. */
     createFileSystem: {
         operationId: 'CreateFileSystem', method: 'POST', path: '/file/v1alpha1/regions/{region}/filesystems',
-        docs: `${DOCS}/file-storage/v1alpha1/filesystem#create-a-new-filesystem`,
+        docs: `${DOCS}/file-storage/filesystem#create-a-new-filesystem`,
     },
     getFileSystem: {
         operationId: 'GetFileSystem', method: 'GET', path: '/file/v1alpha1/regions/{region}/filesystems/{filesystem_id}',
-        docs: `${DOCS}/file-storage/v1alpha1/filesystem#get-filesystem-details`,
+        docs: `${DOCS}/file-storage/filesystem#get-filesystem-details`,
     },
     /** Only once no Instance has it attached. */
     deleteFileSystem: {
         operationId: 'DeleteFileSystem', method: 'DELETE', path: '/file/v1alpha1/regions/{region}/filesystems/{filesystem_id}',
-        docs: `${DOCS}/file-storage/v1alpha1/filesystem#delete-a-detached-filesystem`,
+        docs: `${DOCS}/file-storage/filesystem#delete-a-detached-filesystem`,
     },
     /** The Instance's `filesystems` list it, `attaching`, then `available`. */
     attachServerFileSystem: {

@@ -5,11 +5,13 @@
 //   npm run scaleway:spec -- --specs DIR  reads instance.yml, iam.yml, block.yml, marketplace.yml, containers.yml, file.yml from DIR
 //   npm run scaleway:spec -- --live       also reads the public catalog answers of the live API
 //   npm run scaleway:spec -- --suggest    names, for a type without one, the reference pages that document it
+//   npm run scaleway:spec -- --no-docs    does not read the reference pages
 //
 // What it checks (src/Providers/Scaleway/endpoints.ts and types.ts):
 //   - every endpoint exists in its spec with that method, path and operationId,
 //     sends only query parameters the operation has, and its `docs` URL is the
-//     one the API reference gives the operation (`<api>/<tag>#<summary>`);
+//     one the API reference gives the operation (`<api>/<tag>#<summary>`): the
+//     page is read, and must be there and have that anchor;
 //   - every enum type has the members of its spec enum, and every enum-valued
 //     field the members of its field's enum;
 //   - every field of every object type is a field of its spec schema, of the
@@ -44,7 +46,8 @@ const APIS: Record<Api, { spec: string, page: string, file: string }> = {
     // Serverless Containers: its paths are /containers/v1/..., its schemas scaleway.containers.v1.*.
     containers: { spec: 'serverless-containers/v1', page: 'serverless-containers/v1', file: 'containers.yml' },
     // File Storage: its paths are /file/v1alpha1/..., its schemas scaleway.file.v1alpha1.*.
-    file: { spec: 'file-storage/v1alpha1', page: 'file-storage/v1alpha1', file: 'file.yml' },
+    // Its pages have no version in their path: /file-storage/<tag>, not /file-storage/v1alpha1/<tag> (a 404).
+    file: { spec: 'file-storage/v1alpha1', page: 'file-storage', file: 'file.yml' },
 };
 
 /** A TypeScript enum type and the spec enum it must have the members of. */
@@ -147,6 +150,28 @@ const fail = (message: string) => {
     console.log(`  FAIL ${message}`);
 };
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+/** Each reference page read once (a network failure tried again, twice): undefined where it is not there. */
+const pages = new Map<string, Promise<string | undefined>>();
+async function read(url: string): Promise<string | undefined> {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            const r = await fetch(url);
+            return r.ok ? await r.text() : undefined;
+        } catch (e) {
+            if (attempt >= 3) return undefined;
+            await new Promise((done) => setTimeout(done, 2000 * attempt));
+        }
+    }
+}
+/** Whether the reference has the page, with the anchor: what a URL derived from the spec cannot say of itself. */
+async function onPage(url: string): Promise<boolean> {
+    if (flag('no-docs')) return true;
+    const [base, anchor] = url.split('#');
+    if (!pages.has(base)) pages.set(base, read(base));
+    const html = await pages.get(base)!;
+    return !!html && (!anchor || html.includes(anchor));
+}
 
 // ── the specs ────────────────────────────────────────────────────────────
 
@@ -435,7 +460,7 @@ class Checker {
     }
 
     /** Every type cites a reference page, and one that documents it. */
-    references(): void {
+    async references(): Promise<void> {
         console.log('== reference pages');
         for (const [alias, [api, name]] of [...Object.entries(ENUMS), ...Object.entries(OBJECTS)]) {
             const spec = this.specs[api];
@@ -449,6 +474,7 @@ class Checker {
                 const hit = spec.operations().find(({ op }) => spec.docs(op) === url);
                 if (!hit) fail(`${alias}: ${url} is not a page of the ${api} reference`);
                 else if (!documenting.some(({ op }) => op === hit.op)) fail(`${alias}: ${url} (${hit.op.summary}) does not take or return ${name}`);
+                else if (!await onPage(url)) fail(`${alias}: ${url} is not on the reference (the page is not there, or has no such anchor)`);
             }
         }
     }
@@ -467,7 +493,7 @@ const apiOf = (p: string): Api => {
 
 // ── the endpoint table ───────────────────────────────────────────────────
 
-function checkEndpoints(specs: Record<Api, Spec>): void {
+async function checkEndpoints(specs: Record<Api, Spec>): Promise<void> {
     console.log('== endpoint table');
     for (const [name, e] of Object.entries(SCALEWAY_ENDPOINTS) as Array<[string, ScalewayEndpoint]>) {
         const spec = specs[apiOf(e.path)];
@@ -479,6 +505,7 @@ function checkEndpoints(specs: Record<Api, Spec>): void {
         }
         if (op.operationId !== e.operationId) fail(`${name}: operationId ${e.operationId}, the spec says ${op.operationId}`);
         if (e.docs !== spec.docs(op)) fail(`${name}: docs ${e.docs}, the reference's page for "${op.summary}" is ${spec.docs(op)}`);
+        else if (!await onPage(e.docs)) fail(`${name}: docs ${e.docs} is not on the reference (the page is not there, or has no such anchor)`);
         const params = new Set<string>((op.parameters ?? []).filter((p: Node) => p.in === 'query').map((p: Node) => p.name));
         for (const q of e.query ?? []) if (!params.has(q)) fail(`${name}: sends query parameter "${q}", which the operation does not have (it has: ${[...params].join(', ')})`);
         const placeholders = [...e.path.matchAll(/\{([a-z_]+)\}/g)].map((m) => m[1]);
@@ -517,11 +544,11 @@ async function main(): Promise<void> {
     const specs = Object.fromEntries(await Promise.all((Object.keys(APIS) as Api[]).map(async (api) => [api, await loadSpec(api)]))) as Record<Api, Spec>;
     const types = new Types(path.join(__dirname, '../src/Providers/Scaleway/types.ts'));
     const checker = new Checker(types, specs);
-    checkEndpoints(specs);
+    await checkEndpoints(specs);
     checkZones(specs);
     checker.enums();
     checker.objects();
-    checker.references();
+    await checker.references();
     if (flag('live')) await checkLive(checker);
     const modeled = Object.entries(checker.unmodeled);
     if (modeled.length) {
