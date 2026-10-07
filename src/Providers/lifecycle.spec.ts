@@ -69,7 +69,6 @@ const target = (subject: (typeof CONTRACT_SUBJECTS)[number], o: { cpu?: boolean 
 
 for (const subject of CONTRACT_SUBJECTS) {
     describeGpuLifecycle(target(subject));
-    // Where a provider's API is the same for a CPU server (Scaleway, DigitalOcean), its whole lifecycle also runs on the
-    // cheapest one: live, that proves every code path but the GPU's own for cents.
-    if (['scaleway', 'digitalocean'].includes(subject.name)) describeGpuLifecycle(target(subject, { cpu: true }));
+    // Where a provider rents machines without GPUs (capabilities.compute.cpu), its whole lifecycle also runs on one.
+    if (subject.make().provider.capabilities.compute.cpu) describeGpuLifecycle(target(subject, { cpu: true }));
 }

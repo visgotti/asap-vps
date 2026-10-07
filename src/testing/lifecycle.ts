@@ -92,22 +92,23 @@ const STATUSES: ServerStatus[] = ['pending', 'running', 'stopping', 'stopped', '
 const IMAGE_STATUSES: ImageStatus[] = ['pending', 'available', 'error', 'unknown'];
 
 /**
- * What a container is started with: it prints its GPU, an environment variable,
- * and a boot mark (a fresh UUID each time it runs, so a restart shows a new
- * one), then idles.
+ * What a container is started with: it prints its GPU (on a host with one), an
+ * environment variable, and a boot mark (a fresh UUID each time it runs, so a
+ * restart shows a new one), then idles.
  */
-function containerOptions(runName: string): Partial<CreateServerOptions> {
+function containerOptions(runName: string, cpu: boolean): Partial<CreateServerOptions> {
     return {
         image: TEST_IMAGE,
-        command: ['bash', '-c', 'nvidia-smi -L; echo "asap-vps-env=$ASAP_VPS_CHECK"; BOOT=$(cat /proc/sys/kernel/random/uuid); echo "asap-vps-boot=$BOOT"; sleep 3600'],
+        command: ['bash', '-c', `${cpu ? '' : 'nvidia-smi -L; '}echo "asap-vps-env=$ASAP_VPS_CHECK"; BOOT=$(cat /proc/sys/kernel/random/uuid); echo "asap-vps-boot=$BOOT"; sleep 3600`],
         env: { ASAP_VPS_CHECK: runName },
-        minCudaVersion: TEST_IMAGE_CUDA,
+        // A host without GPUs has no GPU driver, so no CUDA version to ask of it.
+        ...(cpu ? {} : { minCudaVersion: TEST_IMAGE_CUDA }),
     };
 }
 
-/** What that container's log shows: the GPU it got, the environment it was given, and the boot mark of a run. */
-function containerLog(runName: string): RegExp[] {
-    return [/^GPU \d+: /m, new RegExp(`^asap-vps-env=${runName}$`, 'm'), /^asap-vps-boot=[0-9a-f-]{36}$/m];
+/** What that container's log shows: the GPU it got (if it rented one), the environment it was given, and the boot mark of a run. */
+function containerLog(runName: string, cpu: boolean): RegExp[] {
+    return [...(cpu ? [] : [/^GPU \d+: /m]), new RegExp(`^asap-vps-env=${runName}$`, 'm'), /^asap-vps-boot=[0-9a-f-]{36}$/m];
 }
 
 /** The boot marks a container's log shows: one per run of its command. */
@@ -536,7 +537,7 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
                         s.keys = r.sshKeyData;
                         s.setup = r.setupResults;
                     } else {
-                        made = await p.createServer({ name: runName, offer, ...containerOptions(runName) });
+                        made = await p.createServer({ name: runName, offer, ...containerOptions(runName, !!t.cpu) });
                         expect(made).toMatchObject({ provider: p.id, name: runName });
                         // A marketplace host can fail before the create has even answered.
                         expect(['pending', 'running', ...(t.hostsMayFail ? ['error'] : [])]).toContain(made.status);
@@ -606,7 +607,7 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
             paid('getServerLogs: the container\'s own output, with the environment it was given', async () => {
                 const p = requireCapability(provider(), 'logs');
                 const server = need(s.server, 'no server');
-                const want = containerLog(runName);
+                const want = containerLog(runName, !!t.cpu);
                 const end = Date.now() + (t.wait.timeoutMs ?? 0);
                 let logs = await p.getServerLogs(server.id);
                 while (!want.every((re) => re.test(logs)) && Date.now() < end) {
