@@ -6,9 +6,10 @@
 // and to one of the other region (copyImage: the root snapshot exported as a
 // QCOW2, moved to the other region through this machine, imported, imaged), and
 // booted in the other region for the source's id; an image of a server on local
-// storage (an Instance snapshot) copied to the other region, and its copy booted
-// with the file the server wrote; then the servers and the images (copies with
-// them) deleted, verified. The audit proves no volume, snapshot or temporary
+// storage (an Instance snapshot) copied to another zone of its region (from the
+// region's own bucket: one file through this machine, the first copy's, is
+// enough at this machine's speed), and its copy booted with the file the server wrote;
+// then the servers and the images (copies with them) deleted, verified. The audit proves no volume, snapshot or temporary
 // bucket of the run is left. Billed: minutes of the cheapest Instances, and
 // snapshots and buckets for about an hour (cents). Runs only when asked, with
 // the secret key, its access key and the Project in .env.test (or
@@ -123,8 +124,8 @@ let host: AuditedScaleway | undefined;
         console.log(`scaleway images: ${offer.id}, imported in ${home}, copied to ${near} and ${away}`);
         imported = await p().importImage({ name: `${runName}-noble`, url: UBUNTU_MINIMAL, region: home, ...IMAGE_WAIT });
         expect(imported).toMatchObject({ provider: 'scaleway', name: `${runName}-noble`, status: 'available', regions: [home] });
+        // Its root a Block snapshot (whose size the image's record does not carry).
         expect(imported.raw.root_volume?.volume_type).toBe('sbs_snapshot');
-        expect(imported.sizeGb).toBeGreaterThan(0);
         expect(await p().getImage(imported.id)).toMatchObject({ id: imported.id, status: 'available' });
         expect((await p().listImages()).map((i) => i.id)).toContain(imported.id);
     }, 100 * 60_000);
@@ -157,9 +158,19 @@ let host: AuditedScaleway | undefined;
         expect(await p().deleteServerAndWait(b.server.id, WAIT)).toBe(true);
     }, 150 * 60_000);
 
-    paid('an image of a server on local storage (an Instance snapshot) is copied too: its copy boots in the other region with the file the server wrote', async () => {
-        const local = await provision(`${runName}-local`, home, [`echo ${runName} > ${MARK} && sync && cat ${MARK}`], {
-            providerOptions: { volumes: { 0: { volume_type: 'l_ssd', size: 10e9 } } },
+    paid('an image of a server on local storage (an Instance snapshot) is copied too: its copy boots in another zone of its region with the file the server wrote', async () => {
+        // The cheapest type with 10 GB of local storage in stock in two zones of one region: the server in one, its copy booted in the other.
+        const pair = (o: Offer<ScalewayOfferRaw>): [ScalewayZone, ScalewayZone] | undefined => {
+            const zones = o.regions as ScalewayZone[];
+            const a = zones.find((z) => zones.some((y) => y !== z && regionOfZone(y) === regionOfZone(z)));
+            return a ? [a, zones.find((y) => y !== a && regionOfZone(y) === regionOfZone(a))!] : undefined;
+        };
+        const localOffer = (await p().listOffers({ kind: 'cpu' })).find((o) => o.raw.serverType.volumes_constraint.max_size >= 10e9 && pair(o));
+        if (!localOffer) throw new Error('no CPU type with 10 GB of local storage is in stock in two zones of one region right now');
+        const [from, to] = pair(localOffer)!;
+        console.log(`scaleway images: ${localOffer.id} on local storage in ${from}, its image copied to ${to}`);
+        const local = await provision(`${runName}-local`, from, [`echo ${runName} > ${MARK} && sync && cat ${MARK}`], {
+            offer: localOffer, providerOptions: { volumes: { 0: { volume_type: 'l_ssd', size: 10e9 } } },
         });
         expect(output(local)).toContain(runName);
         expect(Object.values(local.server.raw.volumes).map((v) => v.volume_type)).toEqual(['l_ssd']);
@@ -167,9 +178,9 @@ let host: AuditedScaleway | undefined;
         captured = await p().createImage(local.server.id, { name: `${runName}-local-image`, ...IMAGE_WAIT });
         expect(captured.raw.root_volume?.volume_type).not.toBe('sbs_snapshot');
         expect(await p().deleteServerAndWait(local.server.id, WAIT)).toBe(true);
-        const copied = await p().copyImage(captured.id, [away], IMAGE_WAIT);
-        expect([...copied.regions].sort()).toEqual([home, away].sort());
-        const c = await provision(`${runName}-c`, away, [`cat ${MARK}`, ...BOOTED], { image: captured.id });
+        const copied = await p().copyImage(captured.id, [to], IMAGE_WAIT);
+        expect([...copied.regions].sort()).toEqual([from, to].sort());
+        const c = await provision(`${runName}-c`, to, [`cat ${MARK}`, ...BOOTED], { offer: localOffer, image: captured.id });
         expect(output(c)).toContain(runName);
         expect(output(c)).toContain('os=ubuntu 24.04');
         expect(await p().deleteServerAndWait(c.server.id, WAIT)).toBe(true);

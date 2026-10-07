@@ -115,7 +115,8 @@ export async function sweepPrivateRegistries(o: { secretKey: string, projectId: 
     const apps = (await api.ok('GET', `/iam/v1alpha1/applications?organization_id=${org}&page_size=100`)).applications.filter((a: any) => ours(a.name));
     const left: string[] = [];
     for (const app of apps) {
-        const keys = (await api.ok('GET', `/iam/v1alpha1/api-keys?application_id=${app.id}&page_size=100`)).api_keys;
+        // An application's keys: its bearer's (the list needs the Organization).
+        const keys = (await api.ok('GET', `/iam/v1alpha1/api-keys?organization_id=${org}&bearer_id=${app.id}&bearer_type=application&page_size=100`)).api_keys;
         const policies = (await api.ok('GET', `/iam/v1alpha1/policies?organization_id=${org}&application_ids=${app.id}&page_size=100`)).policies;
         for (const k of keys) left.push(await deleteVerified(api, `API key ${k.access_key}`, `/iam/v1alpha1/api-keys/${k.access_key}`));
         for (const p of policies) left.push(await deleteVerified(api, `policy ${p.id}`, `/iam/v1alpha1/policies/${p.id}`));

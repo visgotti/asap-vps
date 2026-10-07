@@ -27,6 +27,8 @@ describe('teardown and sweep', () => {
     it('a run is its name and <name>-...: not another run that shares a prefix', () => {
         const mine = runMatcher(`${RUN_PREFIX}a`);
         expect([`${RUN_PREFIX}a`, `${RUN_PREFIX}a-image`, `${RUN_PREFIX}ab`, `${RUN_PREFIX}b`].map(mine)).toEqual([true, true, false, false]);
+        // Where a platform takes no hyphens (Vast's volume names), the run's names have underscores.
+        expect([`${RUN_PREFIX}a_vol`.replace(/-/g, '_'), `${RUN_PREFIX}ab_vol`.replace(/-/g, '_'), 'someone_elses_vol'].map(mine)).toEqual([true, false, false]);
     });
 
     it('never reads a failed list as nothing left', async () => {

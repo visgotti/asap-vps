@@ -6,7 +6,7 @@
 // machine, whose driver's CUDA version is read before it is rented.
 
 import { CapacityError, NotSupportedError, ProviderError } from '../../errors';
-import { fakeVast } from '../../testing/fakes/vast';
+import { FAKE_SNAPSHOTS, fakeVast } from '../../testing/fakes/vast';
 import { VastAI } from './VastAI';
 
 const noSleep = async () => {};
@@ -23,7 +23,8 @@ describe('VastAI', () => {
         const { p } = make();
         const offers = await p.listOffers();
         expect(offers.map((o) => o.id)).toEqual(['104', '101', '102', '106']);
-        expect(offers[1]).toMatchObject({ gpu: 'RTX 4000 Ada', vramGb: 20, regions: ['Texas, US'] });
+        // Where it is, and the machine it is (where a volume of it is).
+        expect(offers[1]).toMatchObject({ gpu: 'RTX 4000 Ada', vramGb: 20, regions: ['Texas, US', 'machine:11'] });
         const withBids = await p.listOffers({ includeInterruptible: true });
         expect(withBids.filter((o) => o.interruptible).map((o) => o.pricePerHour)).toEqual([0.05, 0.12, 0.14, 0.3]);
     });
@@ -278,5 +279,217 @@ describe('Vast userData: a script run before the command, each time the containe
         await expect(p.createServer({ name: 'a', offer, image: 'busybox', userData: '#cloud-config\nruncmd: [true]', command: ['true'] })).rejects.toThrow(NotSupportedError);
         await expect(p.createServer({ name: 'a', offer, image: 'busybox', userData: 'echo hi' })).rejects.toThrow(/without "command"/);
         expect(rentals(fake)).toEqual([]);
+    });
+});
+
+describe('Vast volumes: storage on one machine, mounted by an instance rented there (observed 2026-10-06)', () => {
+    const make = (o: Parameters<typeof fakeVast>[0] = {}) => {
+        const fake = fakeVast(o);
+        return { fake, p: new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
+    };
+    const IMAGE = { image: 'nvidia/cuda:12.8.1-base-ubuntu24.04', command: ['sleep', 'infinity'] };
+    const rentals = (fake: ReturnType<typeof fakeVast>) => fake.calls.filter((c) => c.method === 'PUT' && /^\/api\/v0\/asks\/\d+\/$/.test(c.path)).map((c) => c.body);
+
+    it('an offer names its machine among its regions; offersOn finds the offers on a machine, interruptible ones when asked', async () => {
+        const { p } = make();
+        const [offer] = await p.listOffers({ kind: 'gpu' });
+        expect(offer.regions).toEqual(['Ohio, US', 'machine:14']);
+        expect((await p.offersOn('machine:14')).map((o) => o.id)).toEqual(['104']);
+        expect((await p.offersOn('machine:14', { includeInterruptible: true })).map((o) => o.id)).toEqual(['104:bid:0.05', '104']);
+        expect(await p.offersOn('machine:999')).toEqual([]);
+        await expect(p.offersOn('Ohio, US')).rejects.toThrow(/names no machine/);
+    });
+
+    it('createVolume rents the machine\'s storage, named as Vast takes names; read, listed (a withdrawn network volume is not), deleted, idempotently', async () => {
+        const { p, fake } = make();
+        const vol = await p.createVolume({ name: 'weights_1', region: 'machine:14', sizeGb: 20, ...fast });
+        expect(vol).toMatchObject({ provider: 'vast', name: 'weights_1', region: 'machine:14', shared: false, sizeGb: 20, status: 'available', providerStatus: 'created',
+            serverIds: [], mountPath: '/data' });
+        expect(vol.createdAt).toBeGreaterThan(0);
+        expect(vol.raw).toMatchObject({ type: 'machine', machine_id: 14, end_date: expect.any(Number), storage_total_cost: expect.any(Number) });
+        expect(last(fake.calls.filter((c) => c.method === 'PUT' && c.path === '/api/v0/volumes/'))?.body).toEqual({ id: 5014, size: 20, name: 'weights_1' });
+        expect(await p.getVolume(vol.id)).toMatchObject({ id: vol.id });
+        expect((await p.listVolumes()).map((v) => v.name)).toEqual(['weights_1']);
+        await p.deleteVolume(vol.id, fast);
+        expect(await p.getVolume(vol.id)).toBeNull();
+        await expect(p.deleteVolume(vol.id)).resolves.toBeUndefined();
+        // Deleted by someone else between the read and the delete: still no error.
+        const other = await p.createVolume({ name: 'race', region: 'machine:14', sizeGb: 1, ...fast });
+        fake.state.volumes.delete(other.id);
+        await expect(p.deleteVolume(other.id, fast)).resolves.toBeUndefined();
+    });
+
+    it('refuses before anything is made: a name Vast does not take, a size that is not whole GB, a region that is no machine; a machine with no room is a CapacityError', async () => {
+        const { p, fake } = make();
+        for (const name of ['asap-vps-vol', 'a b', 'x'.repeat(65), '']) {
+            await expect(p.createVolume({ name, region: 'machine:14', sizeGb: 1 })).rejects.toThrow(/letters, digits and underscores only, at most 64/);
+        }
+        for (const sizeGb of [0, 1.5, -2]) await expect(p.createVolume({ name: 'v', region: 'machine:14', sizeGb })).rejects.toThrow(/whole GB, 1 GB or more/);
+        await expect(p.createVolume({ name: 'v', region: 'Ohio, US', sizeGb: 1 })).rejects.toThrow(/on one machine: region "Ohio, US" names none/);
+        expect(fake.calls).toEqual([]);
+        await expect(p.createVolume({ name: 'v', region: 'machine:14', sizeGb: 401 })).rejects.toBeInstanceOf(CapacityError);
+        expect(fake.state.volumes.size).toBe(1);
+    });
+
+    it('takes the id from the volume\'s name where the answer has no volume_id, and says so where it has neither', async () => {
+        const { fake } = make();
+        const real = fake.fetchImpl;
+        let answer: unknown = { success: true, volume_name: 'V.%ID%' };
+        const wrapped = (async (url: string, init?: RequestInit) => {
+            const r = await real(url, init);
+            if (init?.method !== 'PUT' || !String(url).endsWith('/api/v0/volumes/')) return r;
+            const id = ((await r.json()) as { volume_id: number }).volume_id;
+            return new Response(JSON.stringify(answer).replace('%ID%', String(id)), { status: 200, headers: { 'content-type': 'application/json' } });
+        }) as unknown as typeof fetch;
+        const q = new VastAI({ apiKey: 'vast-test', fetchImpl: wrapped, sleep: noSleep });
+        expect((await q.createVolume({ name: 'by_name', region: 'machine:14', sizeGb: 1, ...fast })).name).toBe('by_name');
+        answer = { success: true };
+        await expect(q.createVolume({ name: 'no_id', region: 'machine:14', sizeGb: 1, ...fast })).rejects.toThrow(/returned no volume id/);
+    });
+
+    it('an instance rented on its machine mounts it, at /data or the mount\'s path; it is attached till the instance is gone, then free again', async () => {
+        const { p, fake } = make({ volumeReleaseReads: 2 });
+        const [offer] = await p.listOffers({ kind: 'gpu' });
+        const vol = await p.createVolume({ name: 'data', region: 'machine:14', sizeGb: 10, ...fast });
+        const s = await p.createServer({ name: 'with-volume', offer, ...IMAGE, mounts: [{ volume: vol }] });
+        expect(last(rentals(fake))?.volume_info).toEqual({ create_new: false, volume_id: Number(vol.id), mount_path: '/data' });
+        const running = await p.waitUntilRunning(s.id, fast);
+        expect(running.mounts).toEqual([{ volumeId: vol.id, path: '/data' }]);
+        expect(await p.getVolume(vol.id)).toMatchObject({ status: 'attached', serverIds: [s.id] });
+        await expect(p.deleteVolume(vol.id)).rejects.toThrow(`volume ${vol.id} is attached to instance ${s.id}: delete the instance first`);
+        // Deleted: verified gone, and the volume no longer lists it (Vast lets go a read or two later).
+        expect(await p.deleteServerAndWait(s.id, fast)).toBe(true);
+        expect(await p.getVolume(vol.id)).toMatchObject({ status: 'available', serverIds: [] });
+        // Mounted again, by id, at a path of its own, by an offer given as its id (its machine read from Vast).
+        fake.state.asks.find((a) => a.id === 104)!.rentable = true;
+        const again = await p.createServer({ name: 'again', offer: '104', ...IMAGE, mounts: [{ volume: vol.id, path: '/models' }] });
+        expect((await p.waitUntilRunning(again.id, fast)).mounts).toEqual([{ volumeId: vol.id, path: '/models' }]);
+        expect(await p.deleteServerAndWait(again.id, fast)).toBe(true);
+        await p.deleteVolume(vol.id, fast);
+    });
+
+    it('refuses before anything is rented: two volumes, a relative path, a volume that is not there, one on another machine, one another instance mounts, a disk of its own', async () => {
+        const { p, fake } = make();
+        const [offer] = await p.listOffers({ kind: 'gpu' });
+        const vol = await p.createVolume({ name: 'here', region: 'machine:14', sizeGb: 10, ...fast });
+        const far = await p.createVolume({ name: 'far', region: 'machine:11', sizeGb: 10, ...fast });
+        const base = { name: 'x', offer, ...IMAGE };
+        await expect(p.createServer({ ...base, mounts: [{ volume: vol }, { volume: far }] })).rejects.toBeInstanceOf(NotSupportedError);
+        await expect(p.createServer({ ...base, mounts: [{ volume: vol, path: 'data' }] })).rejects.toThrow(/mount path "data" is not absolute/);
+        await expect(p.createServer({ ...base, mounts: [{ volume: '424242' }] })).rejects.toThrow(/no volume 424242/);
+        await expect(p.createServer({ ...base, mounts: [{ volume: far.id }] })).rejects.toThrow(`volume ${far.id} is on machine:11: only an instance rented there mounts it, and offer 104 is on machine:14`);
+        await expect(p.createServer({ ...base, offer: '104', mounts: [{ volume: far.id }] })).rejects.toThrow(/is on machine:11/);
+        expect(rentals(fake)).toEqual([]);
+        const holder = await p.createServer({ ...base, name: 'holder', mounts: [{ volume: vol.id }] });
+        const other = (await p.listOffers({ kind: 'gpu' }))[0];
+        fake.state.asks.find((a) => a.id === Number(other.id))!.machine_id = 14;
+        await expect(p.createServer({ ...base, offer: other.id, mounts: [{ volume: vol.id }] })).rejects.toThrow(`volume ${vol.id} is attached to instance ${holder.id}: one instance mounts it at a time`);
+        await expect(p.createServer({ ...base, volume: { sizeGb: 10, path: '/x' } } as never)).rejects.toBeInstanceOf(NotSupportedError);
+        expect(rentals(fake)).toHaveLength(1);
+    });
+
+    it('reads an instance\'s volumes from its volume_info, each at the path its env\'s docker flag gives the volume\'s name; a volume in use is attached', async () => {
+        const { instanceMounts, toVolume } = jest.requireActual('./mappers') as typeof import('./mappers');
+        // As Vast's instance list has them (observed 2026-10-06): the env as pairs, the mount's flag among them.
+        expect(instanceMounts({ id: 1, extra_env: [['-v data_1:/models/x', '1'], ['CONTAINER_RUNTIME', 'gvisor']],
+            volume_info: [{ id: 7, label: 'data_1', type: 'machine' }, { id: 8, label: 'unflagged' }, { label: 'no_id' }] })).toEqual([{ volumeId: '7', path: '/models/x' }, { volumeId: '8' }]);
+        // The env as an object (as a rental sends it), a volume without a name, no volumes.
+        expect(instanceMounts({ id: 1, extra_env: { '-v data_1:/d': '1' }, volume_info: [{ id: 7, label: 'data_1' }] })).toEqual([{ volumeId: '7', path: '/d' }]);
+        expect(instanceMounts({ id: 1, volume_info: [{ id: 7, label: null }] })).toEqual([{ volumeId: '7' }]);
+        expect(instanceMounts({ id: 1 })).toEqual([]);
+        expect(toVolume({ id: 5, machine_id: 3, instances: [{ id: 9 }, { id: null }], status: 'in-use' })).toMatchObject({
+            name: '', status: 'attached', providerStatus: 'in-use', serverIds: ['9'], region: 'machine:3',
+        });
+        // In use a moment after its instance is gone, then created again; a status Vast has not shown is unknown.
+        expect(toVolume({ id: 5, machine_id: 3, instances: [], status: 'in-use' }).status).toBe('attached');
+        expect(toVolume({ id: 5, machine_id: 3, status: 'weird' })).toMatchObject({ status: 'unknown', serverIds: [] });
+        expect(toVolume({ id: 5, machine_id: 3 }).sizeGb).toBeUndefined();
+    });
+});
+
+describe('Vast images: snapshots an instance pushes to a registry of yours (observed 2026-10-06)', () => {
+    const make = (o: Parameters<typeof fakeVast>[0] = {}, snapshots: typeof FAKE_SNAPSHOTS | undefined = FAKE_SNAPSHOTS) => {
+        const fake = fakeVast(o);
+        return { fake, p: new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep, snapshots }) };
+    };
+    const IMAGE = { image: 'nvidia/cuda:12.8.1-base-ubuntu24.04', command: ['sleep', 'infinity'] };
+    const rentals = (fake: ReturnType<typeof fakeVast>) => fake.calls.filter((c) => c.method === 'PUT' && /^\/api\/v0\/asks\/\d+\/$/.test(c.path)).map((c) => c.body);
+    const running = async (p: VastAI, offer = '104') => p.waitUntilRunning((await p.createServer({ name: 'source', offer, ...IMAGE })).id, fast);
+
+    it('createImage has Vast push a snapshot (the repository with its registry and no tag, the instance in the URL only), waits for its tag, and names it', async () => {
+        const { p, fake } = make();
+        const s = await running(p);
+        const image = await p.createImage(s.id, { name: 'trained-v1', ...fast });
+        expect(last(fake.calls.filter((c) => c.path.startsWith('/api/v0/instances/take_snapshot/')))).toMatchObject({
+            method: 'POST', path: `/api/v0/instances/take_snapshot/${s.id}/`,
+            body: { container_registry: 'registry.fake', personal_repo: 'registry.fake/acme/snapshots', docker_login_user: 'pusher', docker_login_pass: 'push-secret', pause: 'true' },
+        });
+        expect(image).toMatchObject({ provider: 'vast', id: 'registry.fake/acme/snapshots:trained-v1', name: 'trained-v1', status: 'available', providerStatus: 'pushed', regions: [] });
+        expect(image.raw).toMatchObject({ reference: image.id, tag: 'trained-v1', digest: expect.stringMatching(/^sha256:/) });
+        expect(image.sizeGb).toBeGreaterThan(0);
+        // Vast's own tag and the name are one image: listed once, under its name.
+        const tags = fake.registry.tags.get('acme/snapshots')!;
+        expect([...tags.keys()].sort()).toEqual([expect.stringMatching(new RegExp(`^instance_${s.id}_at_October_6th_2026_at_\\d+-\\d\\d-\\d\\d_[AP]M_UTC$`)), 'trained-v1'].sort());
+        expect(new Set(tags.values()).size).toBe(1);
+        expect((await p.listImages()).map((i) => [i.name, i.raw.digest])).toEqual([['trained-v1', image.raw.digest]]);
+        expect(await p.getImage(image.id)).toMatchObject({ id: image.id, name: 'trained-v1', raw: { digest: image.raw.digest } });
+        // A snapshot taken elsewhere (no name): listed under Vast's tag; a stopped instance can be snapshotted too.
+        await p.stopServer(s.id);
+        const again = await p.createImage(s.id, { name: 'stopped-v2', ...fast });
+        expect(again.name).toBe('stopped-v2');
+        fake.registry.push('acme/snapshots', 'instance_1_at_October_1st_2026_at_1-00-00_AM_UTC', 'console');
+        expect((await p.listImages()).map((i) => i.name).sort()).toEqual(['instance_1_at_October_1st_2026_at_1-00-00_AM_UTC', 'stopped-v2', 'trained-v1']);
+    });
+
+    it('boots on any machine, pulled with the snapshot login unless the create gives one; deleted with every tag of it, idempotently', async () => {
+        const { p, fake } = make();
+        const image = await p.createImage((await running(p)).id, { name: 'boot-me', ...fast });
+        await p.createServer({ name: 'from-snapshot', offer: '101', image: image.id, command: ['nvidia-smi'] });
+        expect(last(rentals(fake))).toMatchObject({ image: image.id, image_login: '-u pusher -p push-secret registry.fake' });
+        await p.createServer({ name: 'own-login', offer: '102', image: image.id, command: ['nvidia-smi'], registryAuth: { username: 'other', password: 'pw' } });
+        expect(last(rentals(fake))?.image_login).toBe('-u other -p pw registry.fake');
+        // Another repository's image (or Docker Hub's) goes with no login.
+        await p.createServer({ name: 'public', offer: '106', image: 'registry.fake/acme/other:1', command: ['nvidia-smi'] });
+        expect(last(rentals(fake))?.image_login).toBeUndefined();
+        await p.deleteImage(image.id);
+        expect(await p.getImage(image.id)).toBeNull();
+        expect(fake.registry.tags.get('acme/snapshots')!.size).toBe(0);
+        await expect(p.deleteImage(image.id)).resolves.toBeUndefined();
+    });
+
+    it('refuses before anything is asked: no snapshot repository, a name that is no tag, a name the repository has; another repository\'s image is none of its', async () => {
+        const { p, fake } = make();
+        const s = await running(p);
+        const bare = new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
+        await expect(bare.createImage(s.id, { name: 'x' })).rejects.toThrow(/Vast keeps no images: createImage pushes a snapshot to a registry of yours, so pass `snapshots`/);
+        expect(await bare.listImages()).toEqual([]);
+        expect(await bare.getImage('registry.fake/acme/snapshots:x')).toBeNull();
+        await expect(bare.deleteImage('registry.fake/acme/snapshots:x')).resolves.toBeUndefined();
+        for (const name of ['-starts-with-dash', 'has space', 'x'.repeat(129), '']) await expect(p.createImage(s.id, { name })).rejects.toThrow(/it is the image's tag/);
+        fake.registry.push('acme/snapshots', 'taken');
+        await expect(p.createImage(s.id, { name: 'taken' })).rejects.toThrow('image registry.fake/acme/snapshots:taken exists already: delete it, or pick another name');
+        expect(fake.calls.filter((c) => c.path.startsWith('/api/v0/instances/take_snapshot/'))).toEqual([]);
+        // Not its repository: no image of its, nothing deleted.
+        fake.registry.push('acme/other', 'v1');
+        expect(await p.getImage('registry.fake/acme/other:v1')).toBeNull();
+        await p.deleteImage('registry.fake/acme/other:v1');
+        expect(fake.registry.tags.get('acme/other')!.size).toBe(1);
+        expect(await p.getImage('ubuntu:24.04')).toBeNull();
+    });
+
+    it('a snapshot that never comes times out saying so; another instance\'s snapshot is not taken for it', async () => {
+        const { p, fake } = make({ snapshotReads: 1e9 });
+        const s = await running(p);
+        fake.registry.push('acme/snapshots', 'instance_999_at_October_6th_2026_at_1-00-00_AM_UTC', 'another');
+        await expect(p.createImage(s.id, { name: 'never', intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/timed out after 0 s waiting for the snapshot of instance \d+ in registry.fake\/acme\/snapshots: not pushed yet/);
+        expect(fake.registry.tags.get('acme/snapshots')!.has('never')).toBe(false);
+    });
+
+    it('a Docker Hub repository is read as Docker Hub names it: its short names are its images too', async () => {
+        const { p, fake } = make({}, { server: 'docker.io', repository: 'acme/snaps', username: 'hubber', password: 'hub-token' });
+        await p.createServer({ name: 'short', offer: '104', image: 'acme/snaps:v1', command: ['nvidia-smi'] });
+        expect(last(rentals(fake))?.image_login).toBe('-u hubber -p hub-token docker.io');
+        await p.createServer({ name: 'library', offer: '101', image: 'ubuntu:24.04', command: ['nvidia-smi'] });
+        expect(last(rentals(fake))?.image_login).toBeUndefined();
     });
 });

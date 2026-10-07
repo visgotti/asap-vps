@@ -15,8 +15,9 @@ import type { RunPod } from './RunPod/RunPod';
 import type { RunPodNetworkVolume } from './RunPod/types';
 import type { Scaleway } from './Scaleway/Scaleway';
 import type { ScalewayBlockVolume, ScalewayFileSystem } from './Scaleway/types';
+import type { VastImage, VastVolume } from './VastAI/types';
 import type { VastAI } from './VastAI/VastAI';
-import type { CreateServerOptions, Volume } from '../types';
+import type { CreateServerOptions, ServerImage, Volume } from '../types';
 
 type ServerOptions<P extends { createServer(o: never): unknown }> = Parameters<P['createServer']>[0];
 type VolumeOptions<P extends { createVolume(o: never): unknown }> = Parameters<P['createVolume']>[0];
@@ -77,6 +78,16 @@ describe('types: each provider offers what its platform honors', () => {
         isTrue<Create<VastAI> extends never ? true : false>();
     });
 
+    it('images: each platform\'s own record, Vast\'s a snapshot in a registry of yours', () => {
+        isTrue<Equal<Awaited<ReturnType<VastAI['createImage']>>, ServerImage<VastImage>>>();
+        isTrue<Equal<Awaited<ReturnType<VastAI['listImages']>>, ServerImage<VastImage>[]>>();
+        // Where snapshots go is the provider's to know: a repository and a login that can push.
+        type Params = ConstructorParameters<typeof VastAI>[0];
+        accepts<Params>({ apiKey: 'k', snapshots: { server: 'ghcr.io', repository: 'acme/snaps', username: 'u', password: 'p' } });
+        // @ts-expect-error the repository is part of where snapshots go
+        accepts<Params>({ apiKey: 'k', snapshots: { server: 'ghcr.io', username: 'u', password: 'p' } });
+    });
+
     it('importImage: only where the platform imports a file, its own fields typed', () => {
         type Import<P> = P extends { importImage(o: infer O): unknown } ? O : never;
         accepts<Import<DigitalOcean>>({ name: 'n', url: 'https://x/disk.qcow2', region: 'tor1', providerOptions: { distribution: 'Ubuntu' } });
@@ -97,11 +108,13 @@ describe('types: each provider offers what its platform honors', () => {
 
         // A path for a shared volume (a File Storage filesystem); a Block Storage disk's is refused at run time.
         accepts<ServerOptions<Scaleway>>({ ...base, mounts: [{ volume: 'fr-par/uuid', path: '/models' }] });
-        // @ts-expect-error Vast has no volumes capability
-        accepts<ServerOptions<VastAI>>({ ...base, mounts: [{ volume: 'v' }] });
+        // A volume of the offer's machine, at a path (default /data).
+        accepts<ServerOptions<VastAI>>({ ...base, mounts: [{ volume: '54535314', path: '/models' }] });
+        // @ts-expect-error a mount's path is a path
+        accepts<ServerOptions<VastAI>>({ ...base, mounts: [{ volume: '54535314', path: 5 }] });
     });
 
-    it('createVolume: a size where the platform sizes volumes, none where it grows as it fills; none at all on Vast', () => {
+    it('createVolume: a size where the platform sizes volumes, none where it grows as it fills', () => {
         accepts<VolumeOptions<RunPod>>({ name: 'v', region: 'US-TX-3', sizeGb: 50 });
         accepts<VolumeOptions<DigitalOcean>>({ name: 'v', region: 'tor1', sizeGb: 50, providerOptions: { filesystem_type: 'xfs' } });
         // Where a platform makes both kinds, `shared` picks, and the kind's own request fields come with it.
@@ -122,13 +135,18 @@ describe('types: each provider offers what its platform honors', () => {
         accepts<VolumeOptions<LambdaCloud>>({ name: 'v', region: 'us-east-1', sizeGb: 50 });
         // @ts-expect-error providerOptions are the platform's own request fields, typed
         accepts<VolumeOptions<DigitalOcean>>({ name: 'v', region: 'tor1', sizeGb: 50, providerOptions: { filesystem_type: 'zfs' } });
-        // @ts-expect-error Vast has no createVolume
-        accepts<VastAI['createVolume']>(undefined);
+        // A Vast volume is on one machine (the region an offer names it by), sized when made, of one kind.
+        accepts<VolumeOptions<VastAI>>({ name: 'weights', region: 'machine:18060', sizeGb: 20 });
+        // @ts-expect-error a Vast volume is sized when it is made
+        accepts<VolumeOptions<VastAI>>({ name: 'weights', region: 'machine:18060' });
+        // @ts-expect-error Vast makes one kind of volume: no `shared`
+        accepts<VolumeOptions<VastAI>>({ name: 'weights', region: 'machine:18060', sizeGb: 20, shared: false });
     });
 
     it('records: `raw` is the platform\'s own volume, with no cast', () => {
         isTrue<Equal<Awaited<ReturnType<RunPod['createVolume']>>, Volume<RunPodNetworkVolume>>>();
         isTrue<Equal<Awaited<ReturnType<LambdaCloud['getVolume']>>, Volume<LambdaFilesystem> | null>>();
+        isTrue<Equal<Awaited<ReturnType<VastAI['createVolume']>>, Volume<VastVolume>>>();
         isTrue<Equal<Awaited<ReturnType<DigitalOcean['listVolumes']>>, Volume<DigitalOceanVolumeData | DigitalOceanNfsShare>[]>>();
         // Where a platform makes both kinds, the kind asked for is the record's: inferred at the call.
         const p = {} as DigitalOcean;

@@ -35,14 +35,14 @@ describe('provider registry', () => {
     });
 
     it('finds the providers that have every capability asked for, from their descriptors', () => {
-        expect(providersWith('images').sort()).toEqual(['digitalocean', 'scaleway']);
+        expect(providersWith('images').sort()).toEqual(['digitalocean', 'scaleway', 'vast']);
         expect(providersWith('images', 'imageCopy').sort()).toEqual(['digitalocean', 'scaleway']);
         expect(providersWith('logs').sort()).toEqual(['runpod', 'vast']);
         expect(providersWith('power').sort()).toEqual(['digitalocean', 'runpod', 'scaleway', 'vast']);
         expect(providersWith('compute', 'sshKeys', 'restart')).toHaveLength(5);
-        // Every platform with storage that outlives its servers; Vast's live on one machine.
-        expect(providersWith('volumes')).toEqual(['digitalocean', 'runpod', 'lambda', 'scaleway']);
-        expect(providersWith('volumes', 'images').sort()).toEqual(['digitalocean', 'scaleway']);
+        // Every platform with storage that outlives its servers (Vast's on one machine).
+        expect(providersWith('volumes')).toEqual(['digitalocean', 'runpod', 'vast', 'lambda', 'scaleway']);
+        expect(providersWith('volumes', 'images').sort()).toEqual(['digitalocean', 'scaleway', 'vast']);
     });
 
     it('refuses an id it does not know, naming the ones it does', () => {

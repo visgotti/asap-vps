@@ -54,9 +54,20 @@ export function newRunName(now = Date.now()): string {
     return `${RUN_PREFIX}${stamp}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-/** The run's own resources: named `runName`, or `runName-<anything>`. */
+/**
+ * A name as a run's name reads it: where a platform takes no hyphens (Vast's
+ * volumes: letters, digits and underscores), the run names with underscores, read back as hyphens.
+ */
+export function asRunName(name: string): string {
+    return name.replace(/_/g, '-');
+}
+
+/** The run's own resources: named `runName`, or `runName-<anything>` (with underscores for hyphens where a platform takes no hyphens). */
 export function runMatcher(runName: string): (name: string) => boolean {
-    return (name) => name === runName || name.startsWith(`${runName}-`);
+    return (name) => {
+        const n = asRunName(name);
+        return n === runName || n.startsWith(`${runName}-`);
+    };
 }
 
 /**
@@ -269,7 +280,7 @@ export async function deleteRunEndpoints(p: ComputeSubject, matches: (name: stri
  * may lag their writes).
  */
 export async function sweepLeftovers(p: ComputeSubject, o: { log?: Log, sleep?: Sleep, intervalMs?: number, keyRounds?: number } = {}): Promise<string[]> {
-    const ours = (n: string) => n.startsWith(RUN_PREFIX);
+    const ours = (n: string) => asRunName(n).startsWith(RUN_PREFIX);
     const left = await teardown(p, ours, o);
     const reads = { log: o.log, sleep: o.sleep, intervalMs: o.intervalMs, rounds: o.keyRounds };
     const keys = await deleteRunKeys(p, ours, reads);

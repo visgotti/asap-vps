@@ -665,7 +665,8 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
             }, t.timeouts.server);
         }
 
-        if (caps.images) {
+        // A VM's disk, booted again with a key: a container platform's images (Vast's snapshots, pushed to a registry) have their own suite.
+        if (caps.images && caps.compute?.kind === 'vm') {
             (t.images ? paid : it.skip)(`images: capture the stopped server, read and list it, ${caps.imageCopy ? 'copy it to another region, ' : ''}boot a new server from it, delete it`, async () => {
                 // The image phase stops the server, and boots the image with a key of the account.
                 const p = requireCapability(requireCapability(requireCapability(provider(), 'images'), 'power'), 'sshKeys');

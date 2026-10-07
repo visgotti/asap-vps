@@ -23,6 +23,8 @@ export type S3Options = {
     region: string,
     credentials: S3Credentials,
     fetchImpl?: FetchImpl,
+    /** How a retry waits (default: a timer). */
+    sleep?: (ms: number) => Promise<unknown>,
 };
 
 export type S3Object = { key: string, size: number, etag?: string };
@@ -90,12 +92,19 @@ export class S3Error extends Error {
 
 export class S3Client {
     private readonly fetchImpl: FetchImpl;
+    private readonly sleep: (ms: number) => Promise<unknown>;
 
     constructor(private readonly o: S3Options) {
         this.fetchImpl = o.fetchImpl ?? fetch;
+        this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     }
 
-    /** One signed request to `/<bucket>[/<key>]`. */
+    /**
+     * One signed request to `/<bucket>[/<key>]`. One that fails on the way (a
+     * reset, a connect timeout) or that S3 fails (5xx, 429) is sent again
+     * (retried) when its body can be: none, or bytes. A stream goes once:
+     * putFile sends its file again itself.
+     */
     async request(method: string, bucket: string, key?: string, r: {
         query?: Record<string, string>, headers?: Record<string, string>, body?: Uint8Array | ReadableStream<Uint8Array>, size?: number, payloadHash?: string,
     } = {}): Promise<Response> {
@@ -109,12 +118,35 @@ export class S3Client {
             ...(r.body !== undefined ? { 'content-length': String(stream ? r.size : (r.body as Uint8Array).byteLength) } : {}),
         };
         const auth = signS3({ method, url, headers, payloadHash, region: this.o.region, credentials: this.o.credentials });
-        return this.fetchImpl(url, {
+        const send = () => this.fetchImpl(url, {
             method,
             headers: { ...headers, ...auth },
             ...(r.body !== undefined ? { body: stream ? r.body : Buffer.from(r.body as Uint8Array) } : {}),
             ...(stream ? { duplex: 'half' } : {}),
         } as RequestInit);
+        return stream ? send() : this.retried(`${method} ${url.pathname}`, send);
+    }
+
+    /**
+     * `send` again where the network fails it or S3 answers 5xx or 429: up to
+     * 4 times in all, 1, 2 and 4 s apart. The last answer, or the last failure,
+     * with what the network said (`fetch failed` alone names nothing).
+     */
+    private async retried<T>(what: string, send: () => Promise<T>, failed: (r: T) => boolean = (r) => (r as Response).status >= 500 || (r as Response).status === 429): Promise<T> {
+        for (let attempt = 1; ; attempt++) {
+            try {
+                const r = await send();
+                if (!failed(r) || attempt === 4) return r;
+                await (r as Response).body?.cancel().catch(() => undefined);
+            } catch (e) {
+                const retriable = !(e instanceof S3Error) || e.status >= 500 || e.status === 429;
+                if (!retriable || attempt === 4) {
+                    const cause = (e as { cause?: { code?: string, message?: string } }).cause;
+                    throw e instanceof S3Error || !cause ? e : new Error(`${this.o.endpoint} ${what}: ${(e as Error).message} (${cause.code ?? cause.message})`);
+                }
+            }
+            await this.sleep(1000 * 2 ** (attempt - 1));
+        }
     }
 
     private static async fail(r: Response, what: string): Promise<never> {
@@ -208,16 +240,19 @@ export class S3Client {
         await this.deleteBucket(bucket);
     }
 
-    /** An object, downloaded to a temporary file and hashed (stageBody): what a put to another bucket signs. */
+    /** An object, downloaded to a temporary file and hashed (stageBody): what a put to another bucket signs. A download the network breaks is made again. */
     async stageObject(bucket: string, key: string): Promise<StagedFile> {
-        const r = await this.getObject(bucket, key);
-        if (!r) throw new S3Error(404, 'NoSuchKey', `${bucket}/${key}: no such object`);
-        return stageBody(r, `${bucket}/${key}`);
+        return this.retried(`GET /${bucket}/${key}`, async () => {
+            const r = await this.getObject(bucket, key);
+            if (!r) throw new S3Error(404, 'NoSuchKey', `${bucket}/${key}: no such object`);
+            return stageBody(r, `${bucket}/${key}`);
+        }, () => false);
     }
 
-    /** Puts a file staged on disk (stageDownload), streamed and signed with its hash. Its ETag. */
+    /** Puts a file staged on disk (stageDownload), streamed and signed with its hash; sent again, from its start, where the network or S3 fails it. Its ETag. */
     async putFile(bucket: string, key: string, file: StagedFile): Promise<string | undefined> {
-        return this.putObject(bucket, key, Readable.toWeb(createReadStream(file.path)) as ReadableStream<Uint8Array>, file.size, 'application/octet-stream', file.sha256);
+        return this.retried(`PUT /${bucket}/${key}`, () => this.putObject(bucket, key, Readable.toWeb(createReadStream(file.path)) as ReadableStream<Uint8Array>,
+            file.size, 'application/octet-stream', file.sha256), () => false);
     }
 }
 

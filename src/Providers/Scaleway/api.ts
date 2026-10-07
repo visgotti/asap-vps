@@ -390,7 +390,7 @@ export class ScalewayApi extends ApiClient {
     objectStorage(region: ScalewayRegion, why: string): S3Client {
         if (!this.accessKey) throw new ProviderError(this.id, `${why} goes through Object Storage, which needs the API key's access key: pass accessKey (SCW_ACCESS_KEY)`);
         return new S3Client({
-            endpoint: `https://s3.${region}.scw.cloud`, region, fetchImpl: this.fetchImpl,
+            endpoint: `https://s3.${region}.scw.cloud`, region, fetchImpl: this.fetchImpl, sleep: this.sleep,
             credentials: { accessKey: this.projectId ? `${this.accessKey}@${this.projectId}` : this.accessKey, secretKey: this.apiKey },
         });
     }

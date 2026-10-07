@@ -1,5 +1,5 @@
-import { createHash } from 'crypto';
-import { copyRegistryImage, DOCKER_HUB, parseImageRef, RegistryClient, registryAuthName, registryHost, registryOf } from './registry';
+import { fakeRegistry } from '../../testing/fakes/registry';
+import { copyRegistryImage, deleteRegistryImage, DOCKER_HUB, parseImageRef, RegistryClient, registryAuthName, registryHost, registryOf } from './registry';
 
 describe('registryHost: the registry an image reference names', () => {
     it.each([
@@ -51,94 +51,6 @@ describe('registryAuthName: the name a stored login is kept under', () => {
 
 // ── the registry HTTP API, against a fake registry ──────────────────────────
 
-/**
- * A registry as Docker Hub, ghcr.io and Scaleway's answer: a 401 with a Bearer
- * challenge, a token for a repository and scope (anonymous pulls where
- * `publicRepos` says so, basic credentials for the rest), blobs uploaded in a
- * POST then a PUT with their digest (checked), manifests by tag or digest.
- */
-function fakeRegistry(host: string, o: { users?: Record<string, string>, publicRepos?: string[] } = {}) {
-    const sha = (b: Uint8Array | string) => `sha256:${createHash('sha256').update(b).digest('hex')}`;
-    const blobs = new Map<string, Map<string, Uint8Array>>();
-    const manifests = new Map<string, Map<string, { type: string, bytes: Uint8Array }>>();
-    const tags = new Map<string, Map<string, string>>();
-    const tokens = new Map<string, { repo: string, actions: string[] }>();
-    const calls: Array<{ method: string, path: string }> = [];
-    const repoOf = <T>(m: Map<string, Map<string, T>>, r: string) => m.get(r) ?? m.set(r, new Map()).get(r)!;
-    const fetchImpl = (async (input: string | URL | Request, init: RequestInit = {}) => {
-        const u = new URL(String(input));
-        const method = init.method ?? 'GET';
-        const headers = (init.headers ?? {}) as Record<string, string>;
-        calls.push({ method, path: u.pathname });
-        if (u.host === `auth.${host}`) {
-            const [, repo, scope] = /^repository:(.+):([^:]+)$/.exec(u.searchParams.get('scope') ?? '') ?? [];
-            const basic = /^Basic (.+)$/.exec(headers.authorization ?? '')?.[1];
-            const [user, pass] = basic ? Buffer.from(basic, 'base64').toString().split(':') : [];
-            const known = user !== undefined && o.users?.[user] === pass;
-            if (basic && !known) return new Response('{"errors":[{"code":"UNAUTHORIZED"}]}', { status: 401 });
-            const actions = known ? scope.split(',') : (o.publicRepos ?? []).includes(repo) ? ['pull'] : [];
-            const token = `t${tokens.size}`;
-            tokens.set(token, { repo, actions });
-            return Response.json({ token });
-        }
-        const m = /^\/v2\/(.+?)\/(manifests|blobs|tags)\/(.*)$/.exec(u.pathname);
-        if (!m) return new Response(null, { status: 404 });
-        const [, repo, kind, rest] = m;
-        const need = method === 'GET' || method === 'HEAD' ? 'pull' : method === 'DELETE' ? '*' : 'push';
-        const t = tokens.get(/^Bearer (.+)$/.exec(headers.authorization ?? '')?.[1] ?? '');
-        if (!t || t.repo !== repo || !(t.actions.includes(need) || t.actions.includes('*'))) {
-            return new Response(null, { status: 401, headers: { 'www-authenticate': `Bearer realm="https://auth.${host}/token",service="${host}",scope="repository:${repo}:${need}"` } });
-        }
-        if (kind === 'tags') return Response.json({ name: repo, tags: [...repoOf(tags, repo).keys()] });
-        if (kind === 'blobs' && rest === 'uploads/' && method === 'POST') return new Response(null, { status: 202, headers: { location: `/v2/${repo}/blobs/uploads/u1?_state=s` } });
-        if (kind === 'blobs' && rest.startsWith('uploads/') && method === 'PUT') {
-            const body = new Uint8Array(init.body as Buffer);
-            if (sha(body) !== u.searchParams.get('digest')) return new Response('{"errors":[{"code":"DIGEST_INVALID"}]}', { status: 400 });
-            repoOf(blobs, repo).set(sha(body), body);
-            return new Response(null, { status: 201 });
-        }
-        if (kind === 'blobs') {
-            const b = repoOf(blobs, repo).get(rest);
-            if (!b) return new Response(null, { status: 404 });
-            return new Response(method === 'HEAD' ? null : Buffer.from(b), { status: 200 });
-        }
-        // manifests
-        if (method === 'PUT') {
-            const bytes = new Uint8Array(init.body as Buffer);
-            repoOf(manifests, repo).set(sha(bytes), { type: headers['content-type'], bytes });
-            repoOf(tags, repo).set(rest, sha(bytes));
-            return new Response(null, { status: 201, headers: { 'docker-content-digest': sha(bytes) } });
-        }
-        const digest = rest.startsWith('sha256:') ? rest : repoOf(tags, repo).get(rest);
-        const found = digest ? repoOf(manifests, repo).get(digest) : undefined;
-        if (method === 'DELETE') {
-            if (!found) return new Response(null, { status: 404 });
-            repoOf(manifests, repo).delete(digest!);
-            for (const [tag, d] of repoOf(tags, repo)) if (d === digest) repoOf(tags, repo).delete(tag);
-            return new Response(null, { status: 202 });
-        }
-        if (!found) return new Response(null, { status: 404 });
-        return new Response(Buffer.from(found.bytes), { status: 200, headers: { 'content-type': found.type, 'docker-content-digest': digest! } });
-    }) as typeof fetch;
-    /** Seeds an image: its config, one layer, its manifest, and an index that lists it for linux/amd64 (and arm64). */
-    const seed = (repo: string, tag: string) => {
-        const config = Buffer.from('{"architecture":"amd64","os":"linux"}');
-        const layer = Buffer.from('layer bytes');
-        for (const b of [config, layer]) repoOf(blobs, repo).set(sha(b), new Uint8Array(b));
-        const manifest = Buffer.from(JSON.stringify({ schemaVersion: 2, mediaType: 'application/vnd.oci.image.manifest.v1+json',
-            config: { mediaType: 'application/vnd.oci.image.config.v1+json', digest: sha(config), size: config.length },
-            layers: [{ mediaType: 'application/vnd.oci.image.layer.v1.tar+gzip', digest: sha(layer), size: layer.length }] }));
-        repoOf(manifests, repo).set(sha(manifest), { type: 'application/vnd.oci.image.manifest.v1+json', bytes: new Uint8Array(manifest) });
-        const index = Buffer.from(JSON.stringify({ schemaVersion: 2, mediaType: 'application/vnd.oci.image.index.v1+json', manifests: [
-            { mediaType: 'application/vnd.oci.image.manifest.v1+json', digest: 'sha256:' + 'a'.repeat(64), size: 1, platform: { os: 'linux', architecture: 'arm64' } },
-            { mediaType: 'application/vnd.oci.image.manifest.v1+json', digest: sha(manifest), size: manifest.length, platform: { os: 'linux', architecture: 'amd64' } },
-        ] }));
-        repoOf(manifests, repo).set(sha(index), { type: 'application/vnd.oci.image.index.v1+json', bytes: new Uint8Array(index) });
-        repoOf(tags, repo).set(tag, sha(index));
-        return { manifestDigest: sha(manifest), blobDigests: [sha(config), sha(layer)] };
-    };
-    return { fetchImpl, seed, calls, blobs, tags };
-}
 
 /** One fetch for two registries: each request to the registry its host names. */
 const both = (...registries: Array<{ host: string, r: ReturnType<typeof fakeRegistry> }>) =>
@@ -242,5 +154,73 @@ describe('RegistryClient and copyRegistryImage', () => {
         // A registry that keeps failing: its last answer is what the caller sees.
         const failing = (async () => new Response('busy', { status: 502 })) as typeof fetch;
         await expect(new RegistryClient(DST, push, failing, sleep).tags('ns/app')).rejects.toThrow(/tags of dst\.example\/ns\/app: 502 busy/);
+    });
+});
+
+describe('deleteRegistryImage: an image, every tag of it, through the Registry API or Scaleway\'s own', () => {
+    const auth = { username: 'pusher', password: 'secret' };
+
+    it('reads a digest with a HEAD, deletes the manifest (its tags go with it), and finds nothing the second time', async () => {
+        const r = fakeRegistry('reg.example', { users: { pusher: 'secret' } });
+        const digest = r.push('acme/snaps', 'v1');
+        r.tags.get('acme/snaps')!.set('alias', digest);
+        expect(await new RegistryClient('reg.example', auth, r.fetchImpl).digest('acme/snaps', 'v1')).toBe(digest);
+        expect(await new RegistryClient('reg.example', auth, r.fetchImpl).digest('acme/snaps', 'none')).toBeNull();
+        expect(r.calls.filter((c) => c.path.includes('/manifests/')).map((c) => c.method)).toEqual(['HEAD', 'HEAD', 'HEAD', 'HEAD']);
+        expect(await deleteRegistryImage('reg.example/acme/snaps:v1', auth, { fetchImpl: r.fetchImpl })).toBe(true);
+        expect([...r.tags.get('acme/snaps')!.keys()]).toEqual([]);
+        expect(await deleteRegistryImage('reg.example/acme/snaps:v1', auth, { fetchImpl: r.fetchImpl })).toBe(false);
+    });
+
+    it('a registry that deletes nothing through the Registry API is an error that says where to delete it', async () => {
+        const r = fakeRegistry('hub.example', { users: { pusher: 'secret' } });
+        r.push('acme/snaps', 'v1');
+        const refusing = (async (input: string | URL | Request, init?: RequestInit) => (init?.method === 'DELETE'
+            ? new Response('{"errors":[{"code":"UNSUPPORTED"}]}', { status: 405 }) : r.fetchImpl(input, init))) as typeof fetch;
+        await expect(deleteRegistryImage('hub.example/acme/snaps:v1', auth, { fetchImpl: refusing, sleep: async () => {} }))
+            .rejects.toThrow(/^hub\.example deletes no image through the Registry API \(405 .*UNSUPPORTED.*\): delete hub\.example\/acme\/snaps:v1 with its own tools$/);
+        const broken = (async (input: string | URL | Request, init?: RequestInit) => (init?.method === 'DELETE' ? new Response('nope', { status: 400 }) : r.fetchImpl(input, init))) as typeof fetch;
+        await expect(deleteRegistryImage('hub.example/acme/snaps:v1', auth, { fetchImpl: broken, sleep: async () => {} })).rejects.toThrow(/: 400 nope/);
+    });
+
+    it('a Scaleway registry\'s image goes through Scaleway\'s API, with the key the login holds: every tag of its digest', async () => {
+        const calls: Array<{ method: string, path: string, token: string | null }> = [];
+        const tags = [{ id: 't1', name: 'v1', digest: 'sha256:a' }, { id: 't2', name: 'instance_9_at_x', digest: 'sha256:a' }, { id: 't3', name: 'v2', digest: 'sha256:b' }];
+        const scw = (async (input: string | URL | Request, init?: RequestInit) => {
+            const u = new URL(String(input));
+            calls.push({ method: init?.method ?? 'GET', path: `${u.pathname}${u.search}`, token: new Headers(init?.headers).get('x-auth-token') });
+            const p = u.pathname.replace('/registry/v1/regions/nl-ams', '');
+            if (p === '/namespaces') return Response.json({ namespaces: [{ id: 'ns-other', name: 'teamx' }, { id: 'ns-1', name: 'team' }] });
+            if (p === '/images') return Response.json({ images: u.searchParams.get('namespace_id') === 'ns-1' ? [{ id: 'img-1', name: 'snaps' }] : [] });
+            if (p === '/images/img-1/tags') return Response.json({ tags });
+            if (init?.method === 'DELETE' && /^\/tags\/t\d$/.test(p)) return new Response(null, { status: 204 });
+            return new Response('{"message":"no route"}', { status: 404 });
+        }) as typeof fetch;
+        expect(await deleteRegistryImage('rg.nl-ams.scw.cloud/team/snaps:v1', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: scw })).toBe(true);
+        expect(calls.filter((c) => c.method === 'DELETE').map((c) => c.path)).toEqual(['/registry/v1/regions/nl-ams/tags/t1?force=true', '/registry/v1/regions/nl-ams/tags/t2?force=true']);
+        expect(calls.every((c) => c.token === 'scw-secret')).toBe(true);
+        // Not there: a tag, an image or a namespace it does not have.
+        expect(await deleteRegistryImage('rg.nl-ams.scw.cloud/team/snaps:none', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: scw })).toBe(false);
+        expect(await deleteRegistryImage('rg.nl-ams.scw.cloud/team/other:v1', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: scw })).toBe(false);
+        expect(await deleteRegistryImage('rg.nl-ams.scw.cloud/nobody/snaps:v1', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: scw })).toBe(false);
+        // Scaleway refusing says what it said.
+        const denied = (async () => new Response('{"message":"permission denied"}', { status: 403 })) as typeof fetch;
+        await expect(deleteRegistryImage('rg.nl-ams.scw.cloud/team/snaps:v1', { username: 'nologin', password: 'bad' }, { fetchImpl: denied }))
+            .rejects.toThrow('Scaleway registry GET /namespaces: 403 {"message":"permission denied"}');
+    });
+});
+
+describe('a read that finds nothing', () => {
+    it('is a 404, or a 401 to a login the registry took (Scaleway\'s answer for a repository that is not there); without a login a 401 is an error', async () => {
+        const r = fakeRegistry('rg.example', { users: { pusher: 'secret' }, missingIsUnauthorized: true });
+        const c = new RegistryClient('rg.example', { username: 'pusher', password: 'secret' }, r.fetchImpl);
+        expect(await c.tags('team/gone')).toEqual([]);
+        expect(await c.manifest('team/gone', 'v1')).toBeNull();
+        expect(await c.digest('team/gone', 'v1')).toBeNull();
+        r.push('team/here', 'v1');
+        expect(await c.tags('team/here')).toEqual(['v1']);
+        await expect(new RegistryClient('rg.example', undefined, r.fetchImpl).manifest('team/here', 'v1')).rejects.toThrow(/manifest rg\.example\/team\/here:v1: 401/);
+        // A login the registry refuses fails at its token, not as nothing.
+        await expect(new RegistryClient('rg.example', { username: 'pusher', password: 'wrong' }, r.fetchImpl).tags('team/here')).rejects.toThrow(/the token for team\/here \(pull\) was refused/);
     });
 });

@@ -96,3 +96,73 @@ describe('S3Client, against a fake S3 that checks every signature', () => {
         await expect(wrongKey.createBucket('b')).rejects.toMatchObject({ status: 403, code: 'SignatureDoesNotMatch' });
     });
 });
+
+describe('S3Client retries what the network or S3 fails', () => {
+    const endpoint = 'https://s3.fr-par.scw.cloud';
+    const credentials = { accessKey: 'SCWKEY', secretKey: 'secret' };
+    /** What the network does to the next requests: 'drop' (a reset), a status S3 answers, or 'pass'; then every request passes. */
+    const flaky = (plan: Array<'drop' | number | 'pass'>) => {
+        const s3 = fakeS3({ region: 'fr-par', credentials });
+        const slept: number[] = [];
+        let sent = 0;
+        const fetchImpl = (async (url: string, init: RequestInit) => {
+            const step = plan[sent++] ?? 'pass';
+            if (step === 'drop') {
+                // A stream body is read before the connection drops: the next attempt must send it all again.
+                if (init.body instanceof ReadableStream) await new Response(init.body).arrayBuffer();
+                throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+            }
+            if (typeof step === 'number') return new Response(`<Error><Code>SlowDown</Code></Error>`, { status: step });
+            return s3.fetchImpl(url, init);
+        }) as unknown as typeof fetch;
+        const c = new S3Client({ endpoint, region: 'fr-par', credentials, fetchImpl, sleep: async (ms) => { slept.push(ms); } });
+        return { s3, c, slept, sent: () => sent };
+    };
+
+    it('a request the network drops, or S3 answers 5xx or 429, is sent again, 1, 2 and 4 s apart; a 4xx is not', async () => {
+        const { c, slept, sent } = flaky(['drop', 503, 'drop']);
+        await c.createBucket('b');
+        expect([sent(), slept]).toEqual([4, [1000, 2000, 4000]]);
+        const once = flaky([429, 'pass']);
+        await once.c.createBucket('b');
+        expect(once.sent()).toBe(2);
+        // Not there is an answer, not a failure.
+        const missing = flaky([]);
+        expect(await missing.c.headBucket('nope')).toBe(false);
+        expect(missing.sent()).toBe(1);
+    });
+
+    it('four failures in a row: the last, with what the network said; S3\'s own answer stays an S3Error', async () => {
+        await expect(flaky(['drop', 'drop', 'drop', 'drop']).c.createBucket('b')).rejects.toThrow('https://s3.fr-par.scw.cloud PUT /b: fetch failed (ECONNRESET)');
+        await expect(flaky([500, 500, 500, 500]).c.createBucket('b')).rejects.toMatchObject({ status: 500, code: 'SlowDown' });
+    });
+
+    it('a staged file is uploaded again from its start, and a download made again, where the network breaks it', async () => {
+        const { s3, c } = flaky([]);
+        await c.createBucket('b');
+        await c.putObject('b', 'image.qcow2', new Uint8Array(2048).fill(7));
+        const { c: c2, sent: sent2 } = (() => {
+            // The same S3, reached through a network that drops the next upload and the next download once.
+            let n = 0;
+            const plan: Array<'drop' | 'pass'> = ['drop', 'pass', 'drop'];
+            const fetchImpl = (async (url: string, init: RequestInit) => {
+                if (plan[n++] === 'drop') {
+                    if (init.body instanceof ReadableStream) await new Response(init.body).arrayBuffer();
+                    throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ETIMEDOUT' } });
+                }
+                return s3.fetchImpl(url, init);
+            }) as unknown as typeof fetch;
+            return { c: new S3Client({ endpoint, region: 'fr-par', credentials, fetchImpl, sleep: async () => {} }), sent: () => n };
+        })();
+        const staged = await c.stageObject('b', 'image.qcow2');
+        try {
+            await c2.putFile('b', 'copy.qcow2', staged);
+            expect(sent2()).toBe(2);
+            const again = await c2.stageObject('b', 'copy.qcow2');
+            expect([sent2(), again.size, again.sha256]).toEqual([4, 2048, staged.sha256]);
+            await again.remove();
+        } finally {
+            await staged.remove();
+        }
+    });
+});

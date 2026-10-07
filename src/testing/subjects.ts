@@ -16,7 +16,7 @@ import { fakeLambda } from './fakes/lambda';
 import { fakeRunPod } from './fakes/runpod';
 import { FAKE_SCALEWAY_PROJECT, fakeScaleway } from './fakes/scaleway';
 import type { FakeApi } from './fakes/util';
-import { fakeVast } from './fakes/vast';
+import { FAKE_SNAPSHOTS, fakeVast } from './fakes/vast';
 
 /** The body of the last request `fake` was sent for `method` `path` (a pattern). */
 const lastBody = (fake: FakeApi, method: string, path: RegExp) => [...fake.calls].reverse().find((c) => c.method === method && path.test(c.path))?.body;
@@ -38,6 +38,8 @@ export type ContractSubject = {
     elsewhere?: (region: string, kind: 'block' | 'shared') => string | undefined,
     /** Where the servers that mount a volume of `kind` go, where the cheapest GPU offer is no place for it (default: that offer, in its first region). */
     volumePlace?: (provider: AnyProvider, kind: 'block' | 'shared') => Promise<{ offer: Offer, region: string } | undefined>,
+    /** A volume's name as the platform takes it, where it takes fewer characters than a test name has (default: as it is). */
+    volumeName?: (name: string) => string,
     /** The registry login the platform was given with its last server create (container providers): what it will pull with. */
     loginOf?: (fake: FakeApi) => Partial<RegistryAuth> | undefined,
     /** The user data the platform was given with its last server create (VM providers): what cloud-init runs. */
@@ -90,7 +92,8 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         name: 'vast',
         make(o = {}) {
             const fake = fakeVast();
-            return { fake, provider: new VastAI({ apiKey: o.apiKey ?? 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
+            // Snapshots go to a registry of the account's.
+            return { fake, provider: new VastAI({ apiKey: o.apiKey ?? 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep, snapshots: FAKE_SNAPSHOTS }) };
         },
         extra: async () => ({ image: CUDA_IMAGE, env: { MODE: 'probe' }, ports: ['8080/tcp'], command: ['nvidia-smi', '-L'] }),
         anyRegion: 'Sweden, SE',
@@ -98,6 +101,14 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         // An instance has no tags (its userData is a script run before its command).
         refused: { tags: ['contract'] },
         logLine: /hello from gpu-contract/,
+        // A volume is on one machine: its servers are rented there (the cheapest GPU offer's machine); another machine is elsewhere.
+        volumePlace: async (p) => {
+            const [offer] = await p.listOffers({ kind: 'gpu' });
+            return { offer, region: offer.regions.find((r) => r.startsWith('machine:'))! };
+        },
+        elsewhere: (region) => (region === 'machine:11' ? 'machine:12' : 'machine:11'),
+        // Vast names a volume with letters, digits and underscores only.
+        volumeName: (name) => name.replace(/-/g, '_'),
         // The rental carries the login as docker login arguments.
         loginOf: (fake) => {
             const m = /^-u (\S+) -p (\S+) (\S+)$/.exec(lastBody(fake, 'PUT', /^\/api\/v0\/asks\/\d+\/$/)?.image_login ?? '');

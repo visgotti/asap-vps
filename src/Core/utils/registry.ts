@@ -141,10 +141,20 @@ export class RegistryClient {
         throw new Error(`${what}: ${r.status} ${(await r.text().catch(() => '')).slice(0, 300)}`);
     }
 
+    /**
+     * Whether a read found nothing: a 404, or, with a login the registry took
+     * (a bad one fails at its token), a 401: a registry answers so for a
+     * repository that is not there (Scaleway's, once its last tag is deleted,
+     * observed 2026-10-07; Docker Hub's).
+     */
+    private nothing(r: Response): boolean {
+        return r.status === 404 || (r.status === 401 && !!this.auth);
+    }
+
     /** The manifest `reference` names (a tag or a digest), as it is stored; null when there is none. */
     async manifest(repository: string, reference: string): Promise<Manifest | null> {
         const r = await this.request(repository, 'pull', `/manifests/${reference}`, { headers: { accept: MANIFEST_TYPES.join(', ') } });
-        if (r.status === 404) return null;
+        if (this.nothing(r)) return null;
         if (!r.ok) return RegistryClient.fail(r, `manifest ${this.host}/${repository}:${reference}`);
         const bytes = new Uint8Array(await r.arrayBuffer());
         const json = JSON.parse(Buffer.from(bytes).toString('utf8'));
@@ -198,9 +208,17 @@ export class RegistryClient {
     /** The repository's tags; [] when it has none (or does not exist). */
     async tags(repository: string): Promise<string[]> {
         const r = await this.request(repository, 'pull', '/tags/list');
-        if (r.status === 404) return [];
+        if (this.nothing(r)) return [];
         if (!r.ok) return RegistryClient.fail(r, `tags of ${this.host}/${repository}`);
-        return ((await r.json()) as { tags?: string[] | null }).tags ?? [];
+        return (JSON.parse(await r.text()) as { tags?: string[] | null }).tags ?? [];
+    }
+
+    /** The digest of the manifest `reference` names (a HEAD: on Docker Hub, no pull is counted); null when there is none. */
+    async digest(repository: string, reference: string): Promise<string | null> {
+        const r = await this.request(repository, 'pull', `/manifests/${reference}`, { method: 'HEAD', headers: { accept: MANIFEST_TYPES.join(', ') } });
+        if (this.nothing(r)) return null;
+        if (!r.ok) return RegistryClient.fail(r, `manifest ${this.host}/${repository}:${reference}`);
+        return r.headers.get('docker-content-digest') ?? (await this.manifest(repository, reference))?.digest ?? null;
     }
 
     /** Deletes the manifest a digest names (its tags go with it); false when it was not there. */
@@ -228,4 +246,49 @@ export async function copyRegistryImage(from: string, to: string, o: { fromAuth?
         await writer.putBlob(dst.repository, d, await reader.blob(src.repository, d));
     }
     return writer.putManifest(dst.repository, dst.reference, m);
+}
+
+/** A Scaleway registry's host: its region (rg.fr-par.scw.cloud -> fr-par). */
+const SCALEWAY_REGISTRY = /^rg\.([a-z]+-[a-z]+)\.scw\.cloud$/;
+
+/**
+ * Deletes the image a reference names, every tag of it with it: false when
+ * it was not there. Through the Registry API (a DELETE of its manifest), or,
+ * for a Scaleway registry (rg.<region>.scw.cloud, whose login is an API key),
+ * through Scaleway's registry API: its Registry API refuses a DELETE whatever
+ * the key and the scope (checked 2026-10-07). A registry that deletes nothing
+ * through its API (Docker Hub, ghcr.io) is an error saying where to delete it.
+ */
+export async function deleteRegistryImage(reference: string, auth: RegistryAuth, o: { fetchImpl?: FetchImpl, sleep?: (ms: number) => Promise<unknown> } = {}): Promise<boolean> {
+    const ref = parseImageRef(reference);
+    const scaleway = SCALEWAY_REGISTRY.exec(ref.host);
+    if (scaleway) return deleteScalewayTags(scaleway[1], ref, auth.password, o.fetchImpl ?? fetch);
+    const registry = new RegistryClient(ref.host, auth, o.fetchImpl, o.sleep);
+    const digest = await registry.digest(ref.repository, ref.reference);
+    if (!digest) return false;
+    try {
+        return await registry.deleteManifest(ref.repository, digest);
+    } catch (e) {
+        if (/: (401|403|405) /.test((e as Error).message)) throw new Error(`${ref.host} deletes no image through the Registry API (${(e as Error).message.split(': ').pop()}): delete ${reference} with its own tools`);
+        throw e;
+    }
+}
+
+/** The tags of `ref`'s image (every tag of the same digest) deleted through Scaleway's registry API, with the secret key the login holds. */
+async function deleteScalewayTags(region: string, ref: ImageRef, secretKey: string, fetchImpl: FetchImpl): Promise<boolean> {
+    const api = async (method: string, path: string): Promise<any> => {
+        const r = await fetchImpl(`https://api.scaleway.com/registry/v1/regions/${region}${path}`, { method, headers: { 'x-auth-token': secretKey } });
+        if (!r.ok) throw new Error(`Scaleway registry ${method} ${path.replace(/\?.*$/, '')}: ${r.status} ${(await r.text().catch(() => '')).slice(0, 200)}`);
+        return r.status === 204 ? null : r.json();
+    };
+    const [namespace, ...rest] = ref.repository.split('/');
+    const name = rest.join('/');
+    const ns = ((await api('GET', `/namespaces?name=${encodeURIComponent(namespace)}&page_size=100`)).namespaces as Array<{ id: string, name: string }>).find((n) => n.name === namespace);
+    const image = ns && ((await api('GET', `/images?namespace_id=${ns.id}&name=${encodeURIComponent(name)}&page_size=100`)).images as Array<{ id: string, name: string }>).find((i) => i.name === name);
+    if (!image) return false;
+    const tags = (await api('GET', `/images/${image.id}/tags?page_size=100`)).tags as Array<{ id: string, name: string, digest: string }>;
+    const tag = tags.find((t) => t.name === ref.reference);
+    if (!tag) return false;
+    for (const t of tags.filter((x) => x.digest === tag.digest)) await api('DELETE', `/tags/${t.id}?force=true`);
+    return true;
 }

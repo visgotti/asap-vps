@@ -356,6 +356,8 @@ describe('volumes where the platform has them, each kind it makes', () => {
                 ...(traits.size === 'fixed' ? { sizeGb: Math.max(10, traits.minGb ?? 0) } : {}),
                 ...(both ? { shared } : {}),
             };
+            /** A test volume's name, as the platform takes names. */
+            const named = (name: string) => subject.volumeName?.(name) ?? name;
 
             it(`${label}: made, read and listed; mounted by a new server; outlives it; deleted, idempotently`, async () => {
                 const { provider: made, fake } = subject.make();
@@ -364,8 +366,8 @@ describe('volumes where the platform has them, each kind it makes', () => {
                 const before = fake.liveServers();
                 await expect(provider.getVolume(UNKNOWN_VOLUME)).resolves.toBeNull();
 
-                const vol = await provider.createVolume({ name: 'gpu-contract-vol', region, ...options });
-                expect(vol).toMatchObject({ provider: provider.id, name: 'gpu-contract-vol', shared, status: 'available' });
+                const vol = await provider.createVolume({ name: named('gpu-contract-vol'), region, ...options });
+                expect(vol).toMatchObject({ provider: provider.id, name: named('gpu-contract-vol'), shared, status: 'available' });
                 // Where the server is: its region, or the region its zone is in (a regional volume).
                 expect(region === vol.region || region.startsWith(`${vol.region}-`)).toBe(true);
                 expect(vol.sizeGb).toBe(traits.size === 'fixed' ? options.sizeGb : undefined);
@@ -397,7 +399,7 @@ describe('volumes where the platform has them, each kind it makes', () => {
                 const elsewhere = subject.elsewhere!(region, kind);
                 // A kind made in one region only has nowhere else to be.
                 if (elsewhere === undefined) return;
-                const far = await provider.createVolume({ name: 'gpu-contract-far', region: elsewhere, ...options });
+                const far = await provider.createVolume({ name: named('gpu-contract-far'), region: elsewhere, ...options });
                 expect(far.region).not.toBe(region);
                 const before = fake.liveServers();
                 // By id: the provider reads where it is.
@@ -413,7 +415,7 @@ describe('volumes where the platform has them, each kind it makes', () => {
                 const { offer, region } = await place(provider);
                 const extra = await subject.extra(provider);
                 const before = fake.liveServers();
-                const vol = await provider.createVolume({ name: 'gpu-contract-shared', region, ...options });
+                const vol = await provider.createVolume({ name: named('gpu-contract-shared'), region, ...options });
                 const first = await provider.createServer({ name: 'gpu-contract-a', offer, region, ...extra, mounts: [{ volume: vol.id }] });
                 await provider.waitUntilRunning(first.id, fast);
                 if (shared) {
@@ -434,8 +436,8 @@ describe('volumes where the platform has them, each kind it makes', () => {
                     const { provider: made } = subject.make();
                     const provider = requireCapability(made, 'volumes');
                     const { region } = await place(provider);
-                    await expect(provider.createVolume({ name: 'gpu-contract-tiny', region, ...options, sizeGb: traits.minGb! - 1 })).rejects.toThrow(/GB/);
-                    expect((await provider.listVolumes()).map((v) => v.name)).not.toContain('gpu-contract-tiny');
+                    await expect(provider.createVolume({ name: named('gpu-contract-tiny'), region, ...options, sizeGb: traits.minGb! - 1 })).rejects.toThrow(/GB/);
+                    expect((await provider.listVolumes()).map((v) => v.name)).not.toContain(named('gpu-contract-tiny'));
                 });
             }
         }

@@ -3,9 +3,9 @@ Servers on any cloud, through one set of typed primitives: rent a VPS or a GPU s
 | Provider | Class | Servers | Power (stop / start) | Restart | Logs | SSH keys | Images | Volumes | Serverless |
 |---|---|---|---|---|---|---|---|---|---|
 | DigitalOcean | `DigitalOcean` | VMs, with or without GPUs | yes (a stopped droplet bills in full) | yes | | yes | yes, per region, with copy and import from a URL | block, and shared (NFS) | |
-| Scaleway | `Scaleway` | VMs, with or without GPUs | yes (`poweroff` frees the slot: only volumes and IPs bill) | yes | | yes (the Project's, applied at every boot) | yes, per zone | block, and shared (File Storage, Paris) | CPU containers |
+| Scaleway | `Scaleway` | VMs, with or without GPUs | yes (`poweroff` frees the slot: only volumes and IPs bill) | yes | | yes (the Project's, applied at every boot) | yes, per zone, with copy and import of a QCOW2 (both through Object Storage) | block, and shared (File Storage, Paris) | CPU containers |
 | RunPod | `RunPod` | GPU and CPU containers | yes (only the volume bills) | yes | yes | yes | | shared (network volumes) | GPU and CPU, plain HTTP |
-| Vast.ai | `VastAI` | GPU containers, a marketplace | yes (only storage bills) | yes | yes | yes | | | |
+| Vast.ai | `VastAI` | GPU containers, a marketplace | yes (only storage bills) | yes | yes | yes | snapshots, pushed to a registry of yours | block, on one machine | |
 | Lambda Cloud | `LambdaCloud` | GPU VMs | | yes | | yes | | shared (filesystems) | |
 
 # Quick start
@@ -229,7 +229,19 @@ await digitalOcean.copyImage(image.id, ["nyc2"]);                               
 const next = await digitalOcean.createServer({ name: "my-gpu-2", offer, region: "nyc2", image: image.id });
 ```
 
-`listImages()` returns every image of the account, not just yours: pick yours by name before booting or deleting one. Scaleway's images stay in their zone, so `Scaleway` has `images` but not `imageCopy`.
+`listImages()` returns every image of the account, not just yours: pick yours by name before booting or deleting one.
+
+Scaleway's images stay in their zone, and Scaleway has no copy of its own: `copyImage` exports the image's root snapshot as a QCOW2 to a bucket of its region, imports it in each zone asked for, and images it there. For a zone of another region the file goes through this machine, down and back up (Object Storage copies nothing across regions), so this machine's connection bounds it: 600 MB took half an hour on a home connection. A copy is an image of its zone, with the same name and a tag that names the source. `createServer` boots the copy when given the source's id and the copy's zone, and `deleteImage` deletes the copies with the source. Only the root disk is copied: an image with more volumes is refused. Object Storage needs the API key's access key (`accessKey`, SCW_ACCESS_KEY).
+
+Vast keeps no images. Its snapshot commits an instance's container and pushes it to a registry of yours, so a `VastAI` given `snapshots` (a repository and a login that can push to it) has images: the repository's tags.
+
+```typescript
+const vast = new VastAI({ apiKey, snapshots: { server: "ghcr.io", repository: "acme/snapshots", username: "bot", password: process.env.GHCR_TOKEN! } });
+const image = await vast.createImage(instance.id, { name: "trained-v1" }); // ghcr.io/acme/snapshots:trained-v1
+await vast.createServer({ name: "next", offer, image: image.id, command });  // any machine; pulled with the snapshot login
+```
+
+Vast pushes the snapshot, of a running or a stopped instance, under a tag of its own that names the instance (`instance_<id>_at_<time>`). It reports no progress, so `createImage` waits until the tag is in the repository (a 90 MB image took under a minute), then names the same image. `listImages` lists each image once, under its name. `deleteImage` deletes the image with every tag of it: through the registry's API where it deletes (Docker Hub and ghcr.io do not), and through Scaleway's own API for a Scaleway registry (`rg.<region>.scw.cloud`, whose login is a Scaleway API key).
 
 An image built elsewhere (Packer, a distribution's cloud image) comes in with `importImage` (`imageImport`), and is then one of the account's images like any other:
 
@@ -241,6 +253,8 @@ const noble = await digitalOcean.importImage({
 ```
 
 DigitalOcean fetches the file itself: raw, qcow2, vhdx, vdi or vmdk, gzip or bzip2 too, under 100 GB, from a host that answers HEAD; the image needs cloud-init and BIOS boot, and a droplet made from it an SSH key. An import DigitalOcean cannot read, or one that outlasts the wait, is deleted, and its failure thrown.
+
+Scaleway takes a QCOW2 (unencrypted, no backing file, at most 1 TB): this machine downloads it and puts it in a bucket made for it in the zone's region (`accessKey` again). Scaleway imports it as a Block snapshot and images it, and the bucket is then deleted. The image boots with UEFI and needs cloud-init. An Ubuntu cloud image lets no key log in as root, so boot it with user data `#cloud-config\ndisable_root: false`. A file Scaleway cannot read is an error and leaves nothing behind.
 
 # Volumes
 
@@ -264,8 +278,19 @@ A volume is in one region (a zone, a data center): a server elsewhere cannot mou
 | Scaleway | a Block Storage volume (5000 IOPS) | `block`: one server | `device`: a disk the server formats and mounts itself | `fixed`, from 1 GB |
 | DigitalOcean | a Network File Storage share (nyc2, ams3, atl1, ric1, mkc1, mem1), in the region's default VPC | `shared`: droplets of its VPC | `path` (default `/mnt/<name>`): the library mounts it over NFS (cloud-init, fstab) | `fixed`, 50-32768 GB |
 | Scaleway | a File Storage filesystem (Paris) | `shared`: Instances of a type that attaches one (`max_file_systems`: POP2, L4, L40S, H100...) | `path` (default `/mnt/<name>`): attached before it boots, mounted with virtiofs by the library | `fixed`, 25-50000 GB |
+| Vast | storage on one machine: its region is the machine, `machine:<id>`, which an offer's `regions` name too | `block`: one instance at a time, rented on that machine | `path` (default `/data`), one volume per instance | `fixed`, from 1 GB, as much as the machine has free |
 
-Vast has no `volumes`: its volumes live on one machine, and an instance mounts one only if it is rented on that machine. `listVolumes()` returns every volume of the account: pick yours by name.
+`listVolumes()` returns every volume of the account: pick yours by name.
+
+A Vast volume is on one machine, so make it where you will rent, and rent there again to mount it later:
+
+```typescript
+const [offer] = await vast.listOffers({ gpus: ["RTX 4090"] });
+const data = await vast.createVolume({ name: "weights_v1", region: offer.regions.find((r) => r.startsWith("machine:"))!, sizeGb: 50 });
+const a = await vast.createServer({ name: "a", offer, image, command, mounts: [{ volume: data, path: "/models" }] });
+await vast.deleteServerAndWait(a.id);                     // its volume is free again some 30 s after it is gone
+const [again] = await vast.offersOn(data.region);         // [] while someone else rents that machine
+```
 
 # Providers by id
 
@@ -311,7 +336,20 @@ These are the behaviours that shape the primitives, checked against each provide
   - Images are zone-bound snapshots, and `deleteImage` deletes its snapshots too.
   - Volumes are Block Storage, named `zone/<uuid>` too. A server is created with them attached after its image's own volumes (`'1'..'n'` are an account image's extra volumes), and carries an `asap-vps-volume:<uuid>` tag for each: `deleteServer` deletes every Block Storage volume of the server but those, and `createImage` leaves them out of the image. A zoned volume id fixes the zone of a create that names none.
   - A GPU quota starts at 0: `QuotaError` until the account's identity is verified, or support lifts it.
-- **Vast** returns at most 64 offers per search, so `listOffers` asks Vast itself for the vendor and the models' compute capability, then pages by price. Each offer is one machine. An interruptible offer's id carries its bid, and each port is mapped to a random public port (read it from the server's `ports`). `env` values cannot hold spaces or quotes, nor can a `registryAuth`'s parts (Vast takes the login as one string of `docker login` arguments). A bad key is answered 404, not 401 (observed).
+- **Vast** snapshots go to a registry of yours (`snapshots`):
+  - The snapshot call takes the instance in its URL only (an `id` in the body as well is a 400).
+  - It takes a repository with its registry's host (without the host, Vast pushes to Docker Hub) and no tag: Vast appends its own.
+  - The image keeps the instance's command.
+  - Scaleway's registry refuses every manifest DELETE through the Registry API, whatever the key and the scope (checked 2026-10-07).
+- **Vast** volumes are storage on one machine:
+  - Each is rented from that machine's storage offer.
+  - Its name may hold only letters, digits and underscores (at most 64; anything else is a 422).
+  - It lives until it is deleted, or until its host's listing ends (`raw.end_date`).
+  - An instance mounts one volume, set when it is rented, so a volume on another machine, or one another instance holds, is refused before anything is rented.
+  - Vast's single read of an instance does not show the volume it mounts, but its instance list does. So `getServer` reads the instance from that list, and its `mounts` give each volume's path.
+  - A deleted instance keeps its volume `in-use` for about 30 s (observed), and `deleteServerAndWait` waits for it to be let go.
+  - Vast withdrew its network volumes in July 2026: `listVolumes` leaves them out.
+- **Vast** returns at most 64 offers per search, so `listOffers` asks Vast itself for the vendor and the models' compute capability, then pages by price. Each offer is one machine, which its `regions` name after its location (`machine:<id>`). An interruptible offer's id carries its bid, and each port is mapped to a random public port (read it from the server's `ports`). `env` values cannot hold spaces or quotes, nor can a `registryAuth`'s parts (Vast takes the login as one string of `docker login` arguments). A bad key is answered 404, not 401 (observed).
 - **RunPod** lists MIG slices as GPU types of their own, named card and profile (`RTX PRO 6000 MIG 1g.24gb`), so asking for a card never rents a slice. Pods take no UDP. RunPod's own SSH setup would authorize every key on the account, so `sshKeyIds` sends exactly the keys named (as `PUBLIC_KEY`) and exposes `22/tcp` for sshd's direct endpoint. A stopped pod can resume without its GPU: `startServer` then stops it again and throws `CapacityError`. A pod mounts at most one network volume, or a disk of its own (`volume`), never both. RunPod keeps a registry login's username and password write-only and has no update for one: a new password is stored as a new login.
 
 # Layout, and adding to it
