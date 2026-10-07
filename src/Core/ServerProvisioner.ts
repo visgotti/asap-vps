@@ -1,4 +1,6 @@
+import { randomBytes } from 'crypto';
 import type { NodeSSH } from 'node-ssh';
+import { posix } from 'path';
 import type { Capable, ComputeTraits, ICompute, ISSHKeys, SSHKeyTraits } from '../capabilities';
 import { PLATFORM } from '../constants';
 import { NotSupportedError, ProviderError } from '../errors';
@@ -168,20 +170,52 @@ export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
 }
 
 /**
- * The steps' commands as root: through passwordless sudo when the login is not
- * root (as on Lambda's images).
+ * The connection the steps are given, as root. A root login is used as it is.
+ * Any other login (Lambda's `ubuntu`) acts through passwordless sudo:
+ * - `execCommand` runs its command under `sudo -n bash -c`, and enters `cwd`
+ *   as root too;
+ * - `exec` and `mkdir` go the same way (a directory is made as root, never
+ *   over SFTP as the login);
+ * - `putFile`, `putFiles` and `putDirectory` upload over SFTP as the login
+ *   must, beside its home, then move each file into place and make it root's,
+ *   as root.
+ * What cannot be root's stays the login's, and fails as it would for the
+ * login: downloads (`getFile`, `getDirectory`) and the raw channels (a shell,
+ * SFTP, forwards).
  */
 export function asRoot(ssh: NodeSSH, username: string): NodeSSH {
     if (username === 'root') return ssh;
-    return new Proxy(ssh, {
-        get(target, prop) {
-            if (prop === 'execCommand') {
-                return (command: string, opts?: Parameters<NodeSSH['execCommand']>[1]) => (opts === undefined
-                    ? target.execCommand(`sudo -n bash -c ${shellQuote(command)}`)
-                    : target.execCommand(`sudo -n bash -c ${shellQuote(command)}`, opts));
-            }
-            const v = Reflect.get(target, prop, target);
-            return typeof v === 'function' ? v.bind(target) : v;
+    type ExecOptions = Parameters<NodeSSH['execCommand']>[1];
+    const sudo = (command: string, opts?: ExecOptions) => {
+        if (opts === undefined) return ssh.execCommand(`sudo -n bash -c ${shellQuote(command)}`);
+        // The directory is entered as root: before sudo it is the login that changes to it, and the command runs on where the login could not.
+        const { cwd, ...rest } = opts;
+        return ssh.execCommand(`sudo -n bash -c ${shellQuote(cwd ? `cd ${shellQuote(cwd)} && ${command}` : command)}`, rest);
+    };
+    const unix = (path: string) => path.split('\\').join('/');
+    const overrides: Partial<NodeSSH> = {
+        execCommand: sudo as NodeSSH['execCommand'],
+        async mkdir(path) {
+            await as.exec('mkdir', ['-p', unix(path)]);
+        },
+        async putFile(localFile, remoteFile, sftp, transferOptions) {
+            const staged = `.asap-vps-upload-${randomBytes(8).toString('hex')}`;
+            await ssh.putFile(localFile, staged, sftp, transferOptions);
+            const remote = unix(remoteFile);
+            const moved = await sudo(`mkdir -p -- ${shellQuote(posix.dirname(remote))} && mv -f -- ${shellQuote(staged)} ${shellQuote(remote)} && chown root:root -- ${shellQuote(remote)}`);
+            if (moved.code === 0) return;
+            // Not left in the login's home; removed as root, which may own it by now.
+            await sudo(`rm -f -- ${shellQuote(staged)}`).catch(() => undefined);
+            throw new Error(`putFile ${remote}: ${moved.stderr || `exit ${moved.code}`}`);
+        },
+    };
+    // Every method runs on the wrapper: node-ssh's own calls from one to another (exec to execCommand, putDirectory to putFile and mkdir) then go through sudo too.
+    const as: NodeSSH = new Proxy(ssh, {
+        get(target, prop, receiver) {
+            if (Object.prototype.hasOwnProperty.call(overrides, prop)) return overrides[prop as keyof NodeSSH];
+            const v = Reflect.get(target, prop, receiver);
+            return typeof v === 'function' ? v.bind(receiver) : v;
         },
     });
+    return as;
 }

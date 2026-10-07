@@ -1,7 +1,10 @@
 // One provisioner for every provider that can rent a VM and register a key:
 // a VPS and a GPU server set up the same way, against each provider's fake.
 
-import type { NodeSSH } from 'node-ssh';
+import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { NodeSSH } from 'node-ssh';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { PLATFORM } from '../constants';
 import { NotSupportedError, ProviderError } from '../errors';
 import { DigitalOcean } from '../Providers/DigitalOcean/DigitalOcean';
@@ -13,7 +16,7 @@ import { fakeRunPod } from '../testing/fakes/runpod';
 import { FAKE_SCALEWAY_PROJECT, fakeScaleway } from '../testing/fakes/scaleway';
 import { Scaleway } from '../Providers/Scaleway/Scaleway';
 import { testPublicKey } from '../testing/fakes/util';
-import { ProvisionError, ProvisionTarget, ServerProvisioner } from './ServerProvisioner';
+import { asRoot, ProvisionError, ProvisionTarget, ServerProvisioner } from './ServerProvisioner';
 import { SetupPipeline } from './SetupPipeline';
 import { SSHService } from './SSHService';
 import { RunCommandStep } from './steps';
@@ -251,5 +254,103 @@ describe('ServerProvisioner', () => {
             await new ServerProvisioner(p).provision({ serverOptions: { name: 'x', offer }, wait: fast, sshRetry: retry }, () => {});
             expect(SSHService.connect).toHaveBeenCalledWith(expect.objectContaining({ retry }));
         });
+    });
+});
+
+describe('asRoot: the steps\' connection on a login that is not root', () => {
+    /**
+     * A real node-ssh client, so its own exec, mkdir, putFiles and putDirectory
+     * run, with the server behind it stubbed: the commands it is sent and the
+     * paths written over SFTP are recorded.
+     */
+    const client = (o: { refuse?: RegExp } = {}) => {
+        const commands: Array<[string, unknown?]> = [];
+        const written: string[] = [];
+        const ssh = new NodeSSH();
+        ssh.execCommand = (async (command: string, options?: unknown) => {
+            commands.push(options === undefined ? [command] : [command, options]);
+            return o.refuse?.test(command) ? { stdout: '', stderr: 'mv: cannot move', code: 1, signal: null } : { stdout: '', stderr: '', code: 0, signal: null };
+        }) as NodeSSH['execCommand'];
+        const sftp = {
+            fastPut: (_local: string, remote: string, _options: unknown, done: (e: Error | null) => void) => {
+                written.push(remote);
+                done(null);
+            },
+            mkdir: (remote: string, done: (e: Error | null) => void) => {
+                written.push(remote);
+                done(null);
+            },
+            end: () => undefined,
+        };
+        ssh.requestSFTP = (async () => sftp) as unknown as NodeSSH['requestSFTP'];
+        return { ssh, commands, written, sent: () => commands.map(([c]) => c) };
+    };
+    const local = join(tmpdir(), `asap-vps-as-root-${process.pid}`);
+    const STAGED = /^\.asap-vps-upload-[0-9a-f]{16}$/;
+    /** A path as it stands in a command quoted for `bash -c '...'`. */
+    const q = (x: string) => `'\\''${x}'\\''`;
+
+    beforeAll(() => {
+        mkdirSync(join(local, 'conf.d'), { recursive: true });
+        writeFileSync(join(local, 'app.conf'), 'a');
+        writeFileSync(join(local, 'conf.d', 'b.conf'), 'b');
+    });
+    afterAll(() => rmSync(local, { recursive: true, force: true }));
+
+    it('a root login is used as it is', () => {
+        const { ssh } = client();
+        expect(asRoot(ssh, 'root')).toBe(ssh);
+    });
+
+    it('execCommand runs under sudo, and enters its cwd as root', async () => {
+        const { ssh, commands } = client();
+        const root = asRoot(ssh, 'ubuntu');
+        await root.execCommand('systemctl restart app');
+        await root.execCommand('ls', { cwd: '/root/app dir', stdin: 'x' });
+        expect(commands).toEqual([
+            [`sudo -n bash -c 'systemctl restart app'`],
+            [`sudo -n bash -c 'cd ${q('/root/app dir')} && ls'`, { stdin: 'x' }],
+        ]);
+    });
+
+    it('exec and mkdir go through sudo too: a directory is made as root, never over SFTP as the login', async () => {
+        const { ssh, sent, written } = client();
+        const root = asRoot(ssh, 'ubuntu');
+        await root.exec('systemctl', ['restart', 'my app']);
+        await root.mkdir('/etc/app/conf.d');
+        await root.mkdir('/etc/app/other', 'sftp');
+        expect(sent()).toEqual([
+            `sudo -n bash -c 'systemctl restart ${q('my app')}'`,
+            // node-ssh quotes an argument with a dot in it.
+            `sudo -n bash -c 'mkdir -p ${q('/etc/app/conf.d')}'`,
+            `sudo -n bash -c 'mkdir -p /etc/app/other'`,
+        ]);
+        expect(written).toEqual([]);
+    });
+
+    it('putFile uploads as the login, beside its home, then moves the file into place and makes it root\'s, as root', async () => {
+        const { ssh, sent, written } = client();
+        await asRoot(ssh, 'ubuntu').putFile(join(local, 'app.conf'), '/etc/app/app.conf');
+        expect(written).toEqual([expect.stringMatching(STAGED)]);
+        expect(sent()).toEqual([`sudo -n bash -c 'mkdir -p -- ${q('/etc/app')} && mv -f -- ${q(written[0])} ${q('/etc/app/app.conf')} && chown root:root -- ${q('/etc/app/app.conf')}'`]);
+    });
+
+    it('putFiles and putDirectory place every file and directory as root: nothing is written outside the login\'s home over SFTP', async () => {
+        const { ssh, sent, written } = client();
+        const root = asRoot(ssh, 'ubuntu');
+        await root.putFiles([{ local: join(local, 'app.conf'), remote: '/etc/a.conf' }, { local: join(local, 'conf.d', 'b.conf'), remote: '/etc/b.conf' }]);
+        expect(await root.putDirectory(local, '/opt/app')).toBe(true);
+        expect(written).toHaveLength(4);
+        for (const w of written) expect(w).toMatch(STAGED);
+        const ran = sent().join('\n');
+        expect(ran).toContain(`mkdir -p ${q('/opt/app/conf.d')}`);
+        for (const placed of ['/etc/a.conf', '/etc/b.conf', '/opt/app/app.conf', '/opt/app/conf.d/b.conf']) expect(ran).toContain(`chown root:root -- ${q(placed)}`);
+        for (const c of sent()) expect(c).toMatch(/^sudo -n bash -c '/);
+    });
+
+    it('a file that cannot be moved into place is an error, and is not left in the login\'s home', async () => {
+        const { ssh, sent, written } = client({ refuse: /mv -f/ });
+        await expect(asRoot(ssh, 'ubuntu').putFile(join(local, 'app.conf'), '/etc/app/app.conf')).rejects.toThrow('putFile /etc/app/app.conf: mv: cannot move');
+        expect(sent().pop()).toBe(`sudo -n bash -c 'rm -f -- ${q(written[0])}'`);
     });
 });
