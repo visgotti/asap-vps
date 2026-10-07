@@ -1,6 +1,6 @@
 // DigitalOcean against the fake of DigitalOcean's API v2
 // (src/testing/fakes/digitalocean.ts): what is particular to GPU droplets beyond
-// the shared contract (../gpuContract.spec.ts). From the API spec
+// the shared contract (../contract.spec.ts). From the API spec
 // (DigitalOcean-public.v2.yaml, checked 2026-09-29): GPU droplets are listed only
 // with ?type=gpus; an action locks the droplet until it completes; stop is a
 // clean shutdown first; 8-GPU sizes take the 8-GPU image; "no stock" has more

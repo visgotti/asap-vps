@@ -1,5 +1,5 @@
 // RunPod against the fake of its REST v2 API (src/testing/fakes/runpod.ts): what
-// is particular to it beyond the shared contract (../gpuContract.spec.ts). From
+// is particular to it beyond the shared contract (../contract.spec.ts). From
 // api.runpod.io/v2/openapi.json and docs.runpod.io (checked 2026-09-29): MIG
 // slices are GPU types of their own, the catalog's secure/community flags say
 // where a type is sold, pods take no UDP, sshd's direct endpoint needs 22/tcp, a

@@ -4,7 +4,7 @@
 // server taken through create, read and list, its logs (a container) or its
 // shell (a VM: the GPU, cloud-init user data, sudo), restart, stop and start,
 // images, and a verified delete. The same suite runs against each provider's
-// fake (src/Providers/gpuLifecycle.spec.ts) and, when asked, against the
+// fake (src/Providers/lifecycle.spec.ts) and, when asked, against the
 // real API with the keys in .env.test (src/Providers/<Platform>/*.live.spec.ts).
 
 import { writeFileSync } from 'fs';

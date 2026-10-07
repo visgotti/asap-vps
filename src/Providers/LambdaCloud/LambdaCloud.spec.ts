@@ -1,5 +1,5 @@
 // LambdaCloud against the fake of Lambda Cloud's API (src/testing/fakes/lambda.ts):
-// what is particular to it beyond the shared contract (../gpuContract.spec.ts),
+// what is particular to it beyond the shared contract (../contract.spec.ts),
 // and Lambda's launch limits (spec 1.10.0, cloud.lambda.ai/api/v1/openapi.json):
 // exactly one SSH key, names up to 64 characters, tag keys in Lambda's format,
 // each refused before anything is sent; and filesystems (its volumes): no size,
