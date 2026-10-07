@@ -267,7 +267,14 @@ export class ScalewayApi extends ApiClient {
             }
             await this.serverAction(zone, created.id, { action: 'poweron' }, true);
         } catch (e) {
-            await this.deleteServer(zone, created.id).catch(() => false);
+            // Deleted again, the start's failure is the error (a CapacityError: the next zone or offer). Not deleted, the
+            // server is left billing its volume, and the error says so: nothing else would find it.
+            try {
+                await this.deleteServer(zone, created.id);
+            } catch (cleanup) {
+                throw new ProviderError(this.id, `${(e as Error).message}; and server ${zonedId(zone, created.id)}, made but not started, is not deleted (${(cleanup as Error).message}): it bills until deleted`,
+                    { code: 'left_behind', cause: e });
+            }
             throw e;
         }
         return (await this.getServer(zone, created.id).catch(() => null)) ?? { ...created, state: 'starting' };

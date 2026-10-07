@@ -386,17 +386,20 @@ describe('servers', () => {
         expect(fake.liveVolumes()).toBe(before);
     });
 
-    it('a server that cannot be started is deleted again, and the error is the start\'s, whatever becomes of the delete', async () => {
+    it('a server that cannot be started is deleted again, and the error is the start\'s; one that cannot be deleted either is named', async () => {
         const { fake, api } = await made();
         const before = { servers: fake.liveServers(), volumes: fake.liveVolumes() };
         fake.intercept((r) => r.body?.action === 'poweron', { answer: () => json(500, { message: 'no power' }) });
         await expect(api.launchServer('pl-waw-2', launching('stillborn'))).rejects.toThrow(/no power/);
         expect({ servers: fake.liveServers(), volumes: fake.liveVolumes() }).toEqual(before);
-        // The delete fails too: the start's failure is the one reported, and the server it could not delete is there to be deleted by hand.
+        // The delete fails too: the error names the server left billing, with the start's failure as its cause.
         // The server was never started: it is deleted as a stopped one is (a plain DELETE).
         fake.intercept((r) => r.method === 'DELETE' && /\/servers\/[0-9a-f-]{36}$/.test(r.path), { answer: () => json(500, { message: 'no delete' }) });
-        await expect(api.launchServer('pl-waw-2', launching('stuck'))).rejects.toThrow(/no power/);
+        const e = await api.launchServer('pl-waw-2', launching('stuck')).catch((x) => x);
+        expect(e).toMatchObject({ code: 'left_behind', cause: expect.objectContaining({ message: expect.stringMatching(/no power/) }) });
         expect(fake.liveServers()).toBe(before.servers + 1);
+        const left = [...fake.state.servers.values()].find((s) => s.name === 'stuck');
+        expect(e.message).toMatch(new RegExp(`no power.*server pl-waw-2/${left.id}, made but not started, is not deleted \\(.*no delete\\)`));
     });
 
     it('a server that is started but cannot be read is reported as starting', async () => {

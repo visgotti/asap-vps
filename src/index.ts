@@ -14,7 +14,7 @@ export type { EnumTranslations, ResolvedMount, ResolvedOffer } from './Core/Comp
 
 // Setting a server up over SSH
 export { SetupPipeline } from './Core/SetupPipeline';
-export { ServerProvisioner, asRoot } from './Core/ServerProvisioner';
+export { ProvisionError, ServerProvisioner, asRoot } from './Core/ServerProvisioner';
 export type { ProvisionOptions, ProvisionResult, ProvisionTarget } from './Core/ServerProvisioner';
 export {
     InstallDockerStep,

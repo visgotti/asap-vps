@@ -3,7 +3,7 @@
 
 import type { NodeSSH } from 'node-ssh';
 import { PLATFORM } from '../constants';
-import { NotSupportedError } from '../errors';
+import { NotSupportedError, ProviderError } from '../errors';
 import { DigitalOcean } from '../Providers/DigitalOcean/DigitalOcean';
 import { LambdaCloud } from '../Providers/LambdaCloud/LambdaCloud';
 import { RunPod } from '../Providers/RunPod/RunPod';
@@ -13,7 +13,7 @@ import { fakeRunPod } from '../testing/fakes/runpod';
 import { FAKE_SCALEWAY_PROJECT, fakeScaleway } from '../testing/fakes/scaleway';
 import { Scaleway } from '../Providers/Scaleway/Scaleway';
 import { testPublicKey } from '../testing/fakes/util';
-import { ProvisionTarget, ServerProvisioner } from './ServerProvisioner';
+import { ProvisionError, ProvisionTarget, ServerProvisioner } from './ServerProvisioner';
 import { SetupPipeline } from './SetupPipeline';
 import { SSHService } from './SSHService';
 import { RunCommandStep } from './steps';
@@ -94,6 +94,46 @@ describe('ServerProvisioner', () => {
         expect(await p.listSSHKeys()).toEqual([]);
     });
 
+    it('a server its cleanup could not delete is reported, not left billing unseen: a ProvisionError names it, with the key that logs in', async () => {
+        const fake = fakeDigitalOcean();
+        // The droplet's DELETE fails for as long as the provision tries.
+        const failing = (async (url: string, init?: RequestInit) => ((init?.method === 'DELETE' && /\/v2\/droplets\/\d+$/.test(new URL(url).pathname))
+            ? new Response(JSON.stringify({ id: 'server_error', message: 'cannot delete now' }), { status: 500, headers: { 'content-type': 'application/json' } })
+            : fake.fetchImpl(url, init))) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: failing, sleep: noSleep });
+        const before = fake.liveServers();
+        const [offer] = await p.listOffers({ kind: 'cpu' });
+        const e = await new ServerProvisioner(p).provision({ serverOptions: { name: 'web-1', offer }, ...quick, wait: { intervalMs: 0, timeoutMs: 50 } },
+            (pipeline) => void pipeline.addStep({ name: 'bad', execute: async () => ({ step: 'bad', success: false, message: 'no' }) })).catch((x) => x);
+        expect(e).toBeInstanceOf(ProvisionError);
+        expect(e).toMatchObject({ kept: false, sshKeyData: { privateKey: 'PRIVATE' }, cause: expect.objectContaining({ message: expect.stringMatching(/setup step "bad" failed/) }) });
+        expect(e.message).toMatch(new RegExp(`server ${e.server.id} is not verified deleted .*it may still bill`));
+        expect(fake.liveServers()).toBe(before + 1);
+        expect((await p.getServer(e.server.id))?.status).toBe('running');
+    });
+
+    it('a failed setup that keeps its server (deleteOnFailure false) says so, with the server and the key pair to log in with', async () => {
+        const { p, fake } = digitalOcean();
+        const [offer] = await p.listOffers({ kind: 'cpu' });
+        (SSHService.connect as jest.Mock).mockRejectedValueOnce(new Error('connection refused'));
+        const e = await new ServerProvisioner(p).provision({ serverOptions: { name: 'kept', offer }, deleteOnFailure: false, ...quick }, () => {}).catch((x) => x);
+        expect(e).toBeInstanceOf(ProvisionError);
+        expect(e).toMatchObject({ kept: true, sshKeyData: { privateKey: 'PRIVATE' }, cause: expect.objectContaining({ message: 'connection refused' }) });
+        expect(e.message).toMatch(/connection refused \(server .* is kept, as deleteOnFailure is false/);
+        expect((await p.getServer(e.server.id))?.status).toBe('running');
+        expect(fake.liveServers()).toBeGreaterThan(0);
+        // DigitalOcean applies a key at creation only: the provider key goes, the server keeps it.
+        expect(e.providerSshKeyId).toBeUndefined();
+        expect(await p.listSSHKeys()).toEqual([]);
+    });
+
+    it('a failure that leaves nothing is thrown as it is: a CapacityError stays one, for the next offer to be tried', async () => {
+        const { p } = digitalOcean();
+        const e = await new ServerProvisioner(p).provision({ serverOptions: { name: 'x', offer: 's-1vcpu-1gb' }, ...quick }, () => {}).catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e).not.toBeInstanceOf(ProvisionError);
+    });
+
     it('a server it cannot reach is deleted too; with deleteOnFailure false a failed setup keeps it', async () => {
         let { p, fake } = digitalOcean();
         const before = fake.liveServers();
@@ -135,6 +175,14 @@ describe('ServerProvisioner', () => {
             expect(await keys(p)).toEqual([]);
             const kept = await new ServerProvisioner(p).provision({ serverOptions: { name: 'b', offer: 'L4-1-24G', region: 'pl-waw-2' }, sshKeyName: 'provisioned', cleanupProviderKey: false, ...quick }, () => {});
             expect(kept.providerSshKeyId).toBeDefined();
+        });
+
+        it('a server kept after a failure keeps its key too, as one it boots with: the error says which key to delete later', async () => {
+            const { p } = scaleway();
+            (SSHService.connect as jest.Mock).mockRejectedValueOnce(new Error('connection refused'));
+            const e = await new ServerProvisioner(p).provision({ serverOptions: { name: 'kept', offer: 'L4-1-24G', region: 'pl-waw-2' }, sshKeyName: 'provisioned', deleteOnFailure: false, ...quick }, () => {}).catch((x) => x);
+            expect(e).toBeInstanceOf(ProvisionError);
+            expect(e.providerSshKeyId).toBe((await keys(p))[0].id);
         });
 
         it('a provision that throws returns no key id, so its key goes with its server', async () => {

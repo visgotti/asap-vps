@@ -17,6 +17,40 @@ export type ProvisionTarget<T extends PlatformTypes = PlatformTypes> = ICompute<
     readonly capabilities: { readonly compute: Readonly<ComputeTraits>, readonly sshKeys: Readonly<SSHKeyTraits> },
 };
 
+/**
+ * A provision that failed after it made a server, and left that server: kept
+ * (deleteOnFailure false) or not verified deleted (its delete failed, or the
+ * server outlasted the wait). It may bill. `server` says which it is,
+ * `sshKeyData` logs in to it, and `cause` is what failed. A provision that
+ * failed and left nothing (no server made, or it is verified gone) throws its
+ * failure as it is: a CapacityError stays one, for the next offer to be tried.
+ */
+export class ProvisionError extends Error {
+    readonly server: Server;
+    readonly sshKeyData: SSHKeyData;
+    /** The key at the provider, when it is kept for the server (cleanupProviderKey false, as on success). */
+    readonly providerSshKeyId?: string | number;
+    /** true: kept on purpose (deleteOnFailure false); false: its delete did not verify it gone. */
+    readonly kept: boolean;
+    /** Why the delete did not verify it gone; undefined when kept, or when it outlasted the wait. */
+    readonly cleanupError?: unknown;
+    readonly cause: unknown;
+
+    constructor(cause: unknown, o: { server: Server, sshKeyData: SSHKeyData, kept: boolean, cleanupError?: unknown, providerSshKeyId?: string | number }) {
+        const why = (cause as Error)?.message ?? String(cause);
+        super(o.kept
+            ? `${why} (server ${o.server.id} is kept, as deleteOnFailure is false: the error's sshKeyData logs in to it)`
+            : `${why}; and server ${o.server.id} is not verified deleted (${o.cleanupError !== undefined ? (o.cleanupError as Error).message ?? String(o.cleanupError) : 'still there when the wait ended'}): it may still bill`);
+        this.name = 'ProvisionError';
+        this.server = o.server;
+        this.sshKeyData = o.sshKeyData;
+        this.kept = o.kept;
+        this.cause = cause;
+        if (o.cleanupError !== undefined) this.cleanupError = o.cleanupError;
+        if (o.providerSshKeyId !== undefined) this.providerSshKeyId = o.providerSshKeyId;
+    }
+}
+
 /** What a provision made: the server (running, with its ssh endpoint), its key pair and the setup's results. */
 export type ProvisionResult<S = Server> = {
     server: S,
@@ -46,11 +80,16 @@ export type ProvisionOptions<T extends PlatformTypes = PlatformTypes> = {
      */
     cleanupProviderKey?: boolean,
     sshRetry?: SSHRetryOptions,
-    /** How long the server may take to run (waitUntilRunning's default otherwise). */
+    /**
+     * How long the server may take to run, and to be deleted again when the
+     * provision fails (waitUntilRunning's and deleteServerAndWait's defaults otherwise).
+     */
     wait?: WaitOptions,
     /**
      * Delete the server, verified gone, when anything after its create fails,
-     * a setup step included (default true: nothing a failed provision made goes on billing).
+     * a setup step included (default true: nothing a failed provision made goes
+     * on billing). A server it could not verify gone, or one kept as this is
+     * false, comes back in a ProvisionError: nothing is left unreported.
      */
     deleteOnFailure?: boolean,
 }
@@ -87,7 +126,8 @@ export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
         const key = await p.addSSHKey(sshKeyData.publicKey, sshKeyName);
         let server: Server<T['server']> | undefined;
         let ssh: NodeSSH | undefined;
-        let done = false;
+        // The key goes, unless a server it logs in to is left for the caller (made, or kept), where cleanupProviderKey says.
+        let keepKey = false;
         try {
             server = await p.createServer({ ...options.serverOptions, sshKeyIds: [key.id] } as CreateServerOptions<T>);
             server = await p.waitUntilRunning(server.id, options.wait);
@@ -104,15 +144,25 @@ export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
             if (failed && deleteOnFailure) {
                 throw new ProviderError(p.id, `setup step "${failed.step}" failed${failed.message ? `: ${failed.message}` : ''}`);
             }
-            done = true;
-            return { server, sshKeyData, setupResults, ...(cleanupProviderKey ? {} : { providerSshKeyId: key.id }) };
+            keepKey = !cleanupProviderKey;
+            return { server, sshKeyData, setupResults, ...(keepKey ? { providerSshKeyId: key.id } : {}) };
         } catch (e) {
-            if (server && deleteOnFailure) await p.deleteServerAndWait(server.id).catch(() => false);
-            throw e;
+            if (!server) throw e;
+            const made = server;
+            let cleanupError: unknown;
+            if (deleteOnFailure) {
+                const gone = await p.deleteServerAndWait(made.id, options.wait).catch((x) => {
+                    cleanupError = x;
+                    return false;
+                });
+                // Verified gone: nothing is left of this provision but its failure.
+                if (gone) throw e;
+            }
+            keepKey = !cleanupProviderKey;
+            throw new ProvisionError(e, { server: made, sshKeyData, kept: !deleteOnFailure, cleanupError, ...(keepKey ? { providerSshKeyId: key.id } : {}) });
         } finally {
             ssh?.dispose();
-            // A key that is kept is kept for the caller to delete (providerSshKeyId): a provision that threw returns no id, so it goes.
-            if (cleanupProviderKey || !done) await p.deleteSSHKey(key.id).catch(() => false);
+            if (!keepKey) await p.deleteSSHKey(key.id).catch(() => false);
         }
     }
 }
