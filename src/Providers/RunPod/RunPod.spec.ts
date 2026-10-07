@@ -140,6 +140,66 @@ describe('RunPod', () => {
         expect(fake.state.keys).toHaveLength(1);
     });
 
+    it('changes to the key list made at once each take: none writes back a list without another\'s change', async () => {
+        const { p, fake } = make();
+        const old = await p.addSSHKey(testPublicKey('old'), 'old');
+        const names = ['a', 'b', 'c', 'd'];
+        // Four adds and a delete, all asked for before any has answered.
+        const [gone, ...added] = await Promise.all([p.deleteSSHKey(old.id), ...names.map((n) => p.addSSHKey(testPublicKey(n), n))]);
+        expect(gone).toBe(true);
+        const listed = await p.listSSHKeys();
+        expect(listed.map((k) => k.name).sort()).toEqual(names);
+        expect(listed.map((k) => k.id).sort()).toEqual(added.map((k) => (k as { id: string }).id).sort());
+        expect(fake.state.keys).toHaveLength(4);
+    });
+
+    it('a write whose answer is lost is not sent again as it was: the list is read anew, and what another client added meanwhile is kept', async () => {
+        const fake = fakeRunPod();
+        const theirs = testPublicKey('theirs');
+        // The next write takes, `meanwhile` happens, and then the write's answer is lost on the way back.
+        let meanwhile: (() => void) | undefined;
+        const losing = (async (url: string | URL | Request, init?: RequestInit) => {
+            const r = await fake.fetchImpl(url, init);
+            if (init?.method !== 'PUT' || !meanwhile) return r;
+            meanwhile();
+            meanwhile = undefined;
+            throw new TypeError('fetch failed');
+        }) as typeof fetch;
+        const p = new RunPod({ apiKey: 'rp-test', fetchImpl: losing, sleep: noSleep });
+        const writes = () => fake.calls.filter((c) => c.method === 'PUT').length;
+
+        meanwhile = () => fake.state.keys.push(theirs);
+        const mine = await p.addSSHKey(testPublicKey('mine'), 'mine');
+        expect(mine.name).toBe('mine');
+        expect((await p.listSSHKeys()).map((k) => k.name).sort()).toEqual(['mine', 'theirs']);
+        // The list was written once: the copy without the other client's key was never sent again.
+        expect(writes()).toBe(1);
+
+        // A delete whose answer is lost is a delete that took, and says so.
+        meanwhile = () => undefined;
+        expect(await p.deleteSSHKey(mine.id)).toBe(true);
+        expect((await p.listSSHKeys()).map((k) => k.name)).toEqual(['theirs']);
+        expect(writes()).toBe(2);
+    });
+
+    it('a write that keeps failing is given up on, with the provider\'s error', async () => {
+        const fake = fakeRunPod();
+        let writes = 0;
+        const down = (async (url: string | URL | Request, init?: RequestInit) =>
+            init?.method === 'PUT' && ++writes ? new Response('{"error":"upstream"}', { status: 503 }) : fake.fetchImpl(url, init)) as typeof fetch;
+        const waits: number[] = [];
+        const p = new RunPod({ apiKey: 'rp-test', fetchImpl: down, sleep: async (ms) => void waits.push(ms) });
+        await expect(p.addSSHKey(testPublicKey('k'), 'k')).rejects.toMatchObject({ status: 503 });
+        // Three tries, each from a fresh read, with a pause before the second and the third.
+        expect(writes).toBe(3);
+        expect(waits).toEqual([1000, 2000]);
+        expect(fake.calls.filter((c) => c.method === 'GET' && c.path === '/v2/account/ssh-keys')).toHaveLength(3);
+        // The next change is not held up by the one that failed.
+        const q = new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
+        expect((await q.addSSHKey(testPublicKey('k'), 'k')).name).toBe('k');
+        await expect(p.deleteSSHKey('nope')).resolves.toBe(false);
+    });
+
     it('reads log lines from the event stream, dropping a partial event', () => {
         const sse = 'id: 1\ndata: {"ts":"t","source":"container","line":"ready"}\n\nid: 2\ndata: {"line":"hal';
         expect(sseLogLines(sse)).toEqual(['ready']);

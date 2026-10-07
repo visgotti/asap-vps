@@ -12,7 +12,7 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider } from '../../Core/ComputeProvider';
 import { asksForGpu, cudaVersion, filterOffers, findSSHKey, isKind, parseSSHPublicKey, pickSSHKeys, registryAuthName, registryOf } from '../../Core/utils';
-import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
+import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, TransportError } from '../../errors';
 import type {
     CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, InitializedSSHKeyData, LogOptions, Offer, OfferQuery, RegistryAuth,
     Server, ServerListOptions, Volume,
@@ -49,6 +49,8 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
     readonly id = RUNPOD_ID;
     readonly capabilities: Caps = RUNPOD_CAPABILITIES;
     readonly cloud: RunPodCloud;
+    /** The changes to the account's key list this client has under way: each waits for the one before (changeKeys). */
+    private keyChanges: Promise<unknown> = Promise.resolve();
 
     /** The log endpoint's backfill limit (spec: `tail` maximum). */
     static readonly MAX_LOG_TAIL = 5000;
@@ -349,20 +351,55 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
 
     /** RunPod replaces the whole key list: read it, add, write it back (with every line it had). */
     public async addSSHKey(publicKey: string, keyName: string): Promise<InitializedSSHKeyData> {
-        const existing = findSSHKey(await this.listSSHKeys(), publicKey);
-        if (existing) return existing;
         const k = parseSSHPublicKey(publicKey);
         const line = `${k.type} ${k.blob}${keyName ? ` ${keyName}` : ''}`;
-        await this.api.setKeyLines([...await this.api.keyLines(), line]);
-        return toSSHKey(line) as InitializedSSHKeyData;
+        let existing: InitializedSSHKeyData | undefined;
+        await this.changeKeys((lines) => {
+            existing = findSSHKey(lines.map(toSSHKey).filter((x): x is InitializedSSHKeyData => x !== null), publicKey);
+            return existing ? null : [...lines, line];
+        });
+        return existing ?? (toSSHKey(line) as InitializedSSHKeyData);
     }
 
     public async deleteSSHKey(id: string | number): Promise<boolean> {
-        const keys = await this.api.keyLines();
-        const rest = keys.filter((x) => toSSHKey(x)?.id !== String(id));
-        if (rest.length === keys.length) return false;
-        await this.api.setKeyLines(rest);
-        return true;
+        return this.changeKeys((lines) => {
+            const rest = lines.filter((x) => toSSHKey(x)?.id !== String(id));
+            return rest.length === lines.length ? null : rest;
+        });
+    }
+
+    /**
+     * One change to the account's key list: read, changed by `change` (null:
+     * nothing to change), written back. Whether it wrote.
+     *
+     * RunPod replaces the whole list, so two changes that read it together would
+     * each write back a list without the other's: this client makes one at a
+     * time. And a write whose answer was lost, or was a server error, is not
+     * sent again as it was: after a pause the list is read again and changed
+     * anew (three tries in all), which finds a write that did take, and keeps
+     * what another client changed meanwhile. Another client or process can
+     * still write between a read and its write: RunPod's API has no way to rule
+     * that out.
+     */
+    private changeKeys(change: (lines: string[]) => string[] | null): Promise<boolean> {
+        const run = async (): Promise<boolean> => {
+            let wrote = false;
+            for (let attempt = 1; ; attempt++) {
+                const next = change(await this.api.keyLines());
+                if (!next) return wrote;
+                wrote = true;
+                try {
+                    await this.api.setKeyLines(next);
+                    return true;
+                } catch (e) {
+                    const unsure = e instanceof TransportError || (e instanceof ProviderError && (e.status ?? 0) >= 500);
+                    if (!unsure || attempt >= 3) throw e;
+                    await this.api.sleep(1000 * 2 ** (attempt - 1));
+                }
+            }
+        };
+        // After the one before, whether that took or failed.
+        return (this.keyChanges = this.keyChanges.then(run, run));
     }
 
     // ── helpers ──────────────────────────────────────────────────────────

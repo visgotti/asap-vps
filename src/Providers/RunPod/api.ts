@@ -17,9 +17,9 @@ export class RunPodApi extends ApiClient {
         super(params, RunPodApi.BASE_URL, RUNPOD_ID);
     }
 
-    /** A call whose failure throws its typed error. */
-    call<T = any>(method: string, path: string, json?: unknown): Promise<T> {
-        return this.send<T>(method, path, { json });
+    /** A call whose failure throws its typed error; `idempotent` overrides the method's retry rule (the key list's PUT is not to be sent twice). */
+    call<T = any>(method: string, path: string, json?: unknown, idempotent?: boolean): Promise<T> {
+        return this.send<T>(method, path, { json, idempotent });
     }
 
     /** null when RunPod has no such pod. */
@@ -46,9 +46,15 @@ export class RunPodApi extends ApiClient {
         return keys;
     }
 
-    /** Replaces the account's whole key list (RunPod has no call for one key). */
+    /**
+     * Replaces the account's whole key list (RunPod has no call for one key).
+     * Not sent again as it is when its answer is lost or is a server error: it
+     * may have taken, and the list may have changed since, which this one would
+     * undo. That is for the caller to redo from a fresh read. Only a rate limit,
+     * which did nothing, is waited out here.
+     */
     async setKeyLines(keys: string[]): Promise<void> {
-        await this.call('PUT', '/v2/account/ssh-keys', { keys });
+        await this.call('PUT', '/v2/account/ssh-keys', { keys }, false);
     }
 
     /**
