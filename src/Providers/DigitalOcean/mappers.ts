@@ -200,7 +200,8 @@ export function toImage(i: DigitalOceanImageData): ServerImage<DigitalOceanImage
         status,
         providerStatus: word,
         regions: [...(i.regions ?? [])],
-        sizeGb: i.size_gigabytes,
+        // The spec has it nullable: no size known is no size, never null.
+        sizeGb: i.size_gigabytes ?? undefined,
         createdAt: Date.parse(i.created_at) || undefined,
         raw: i,
     };

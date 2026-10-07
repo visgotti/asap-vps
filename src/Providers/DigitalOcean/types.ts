@@ -118,17 +118,18 @@ export type DigitalOceanImageData = {
   id: number,
   name:string,
   distribution: string,
-  slug: string,
+  /** A public image's; null for the account's own. */
+  slug: string | null,
   public: boolean,
   /** Where it can boot: snapshots are region-bound. */
   regions: string[],
   created_at: string,
-  min_disk_size: number,
+  min_disk_size: number | null,
   /** 'base' | 'snapshot' | 'backup' | 'custom' | ... */
   type: string,
-  size_gigabytes: number,
+  size_gigabytes: number | null,
   description: string,
-  tags: [],
+  tags: string[] | null,
   /** 'NEW' | 'available' | 'pending' | 'deleted' | 'retired' (an import that failed ends 'deleted', with its error_message). */
   status?:  string,
   error_message?: string,
@@ -180,12 +181,13 @@ export type DigitalOceanDropletData = {
   disk: number,
   locked: boolean,
   status: DigitalOceanDropletStatus,
-  kernel: string | null,
+  kernel: { id: number, name: string, version: string } | null,
   created_at: string,
   features: string[],
-  backup_ids: string[],
-  next_backup_window: string | null,
-  snapshot_ids: string[],
+  backup_ids: number[],
+  /** null where the droplet has no backups. */
+  next_backup_window: { start: string, end: string } | null,
+  snapshot_ids: number[],
   image: DigitalOceanImageData
   volume_ids: string[],
   size: DigitalOceanSizeData,

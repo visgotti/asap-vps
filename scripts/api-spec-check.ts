@@ -21,6 +21,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as ts from 'typescript';
 import * as yaml from 'js-yaml';
 import type { ApiEndpoint } from '../src/Core/utils';
 import { DIGITALOCEAN_ENDPOINTS } from '../src/Providers/DigitalOcean/endpoints';
@@ -40,6 +41,12 @@ type Platform = {
     docs(op: Op): string | undefined,
     /** Whether the reference page at `url` documents `op` (its text read once per page). */
     documents(url: string, op: Op | undefined, page: (u: string) => Promise<string | undefined>): Promise<boolean>,
+    /**
+     * The wire types held to the spec: each type of `file` and the spec schema it is. Each field
+     * must be one of the schema's, of its kind (an array's elements too), and allow null where the
+     * spec does. Required-ness is not compared: the platform marks few answer fields required.
+     */
+    types?: { file: string, schemas: Readonly<Record<string, string>> },
 };
 
 /** "List registered SSH public keys" -> "list-registered-ssh-public-keys". */
@@ -50,6 +57,14 @@ const PLATFORMS: Record<string, Platform> = {
         spec: 'https://api-engineering.nyc3.cdn.digitaloceanspaces.com/spec-ci/DigitalOcean-public.v2.yaml',
         file: 'digitalocean.yaml',
         table: DIGITALOCEAN_ENDPOINTS,
+        types: {
+            file: 'src/Providers/DigitalOcean/types.ts',
+            schemas: {
+                DigitalOceanDropletData: 'droplet', DigitalOceanSizeData: 'size', DigitalOceanGpuInfo: 'gpu_info', DigitalOceanImageData: 'image',
+                DigitalOceanNetworkData: 'network_v4', DigitalOceanVolumeData: 'volume_full', DigitalOceanSSHData: 'sshKeys', DigitalOceanAction: 'action',
+                DigitalOceanNfsShare: 'nfs_response', DigitalOceanVpc: 'vpc',
+            },
+        },
         // A page per tag; an operation at #<operationId> (the page's markdown links each so).
         docs: (op) => (op.tags[0] && op.operationId ? `https://docs.digitalocean.com/reference/api/reference/${slug(op.tags[0])}/#${op.operationId}` : undefined),
         documents: async (url, op, page) => {
@@ -149,12 +164,14 @@ async function check(name: string, p: Platform, dir: string | undefined, readDoc
     const failures: string[] = [];
     const spec = await load(p, dir);
     const ops = operations(spec);
+
     const pages = new Map<string, Promise<string | undefined>>();
     const page = (u: string) => {
         if (!pages.has(u)) pages.set(u, get(u).catch(() => undefined));
         return pages.get(u)!;
     };
-    console.log(`\n${name}: ${Object.keys(p.table).length} endpoints, against ${dir ? path.join(dir, p.file) : p.spec} (${spec.info?.title} ${spec.info?.version})`);
+    console.log(`\n${name}: ${Object.keys(p.table).length} endpoints${p.types ? ` and ${Object.keys(p.types.schemas).length} wire types` : ''}, against ${dir ? path.join(dir, p.file) : p.spec} (${spec.info?.title} ${spec.info?.version})`);
+    failures.push(...checkTypes(name, p, spec));
     for (const [key, e] of Object.entries(p.table)) {
         const fail = (why: string) => failures.push(`${name}.${key}: ${why}`);
         const departs = e.unspecified;
@@ -185,6 +202,83 @@ async function check(name: string, p: Platform, dir: string | undefined, readDoc
         }
         const documented = op ? await p.documents(e.docs, op, page) : await sourceHas(e.docs, e.path, page);
         if (readDocs && !documented) fail(`docs ${e.docs} does not document it (the page is missing, or does not have it)`);
+    }
+    return failures;
+}
+
+/** Each wire type's fields against its spec schema: there, of its kind, and nullable where the spec is. */
+function checkTypes(name: string, p: Platform, spec: any): string[] {
+    if (!p.types) return [];
+    const failures: string[] = [];
+    const deref = (n: any): any => (n?.$ref ? deref(n.$ref.split('/').slice(1).reduce((o: any, k: string) => o?.[k], spec)) : n);
+    /** A schema's fields, its allOf parts' included. */
+    const fields = (n: any): Record<string, any> => {
+        n = deref(n);
+        return Object.assign({}, n?.properties ?? {}, ...(n?.allOf ?? []).map(fields));
+    };
+    const nullable = (n: any): boolean => {
+        n = deref(n);
+        return !!(n?.nullable || (Array.isArray(n?.type) && n.type.includes('null')) || (n?.allOf ?? []).some(nullable));
+    };
+    const specKind = (n: any): string | undefined => {
+        n = deref(n);
+        if (!n) return undefined;
+        if (n.allOf) return n.allOf.map(specKind).find(Boolean);
+        if (n.oneOf || n.anyOf) return undefined;
+        const t = Array.isArray(n.type) ? n.type.find((x: string) => x !== 'null') : n.type;
+        if (t === 'integer') return 'number';
+        return t ?? (n.properties ? 'object' : n.enum ? 'string' : undefined);
+    };
+    const program = ts.createProgram([p.types.file], { strict: true, skipLibCheck: true, noEmit: true });
+    const checker = program.getTypeChecker();
+    const decls = new Map<string, ts.TypeAliasDeclaration>();
+    program.getSourceFile(p.types.file)!.forEachChild((n) => {
+        if (ts.isTypeAliasDeclaration(n)) decls.set(n.name.text, n);
+    });
+    const tsKind = (t: ts.Type): string | undefined => {
+        const rest = t.isUnion() ? t.types.filter((x) => !(x.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined))) : [t];
+        if (rest.length && rest.every((x) => x.flags & ts.TypeFlags.StringLike)) return 'string';
+        if (rest.length && rest.every((x) => x.flags & ts.TypeFlags.NumberLike)) return 'number';
+        if (rest.length && rest.every((x) => x.flags & ts.TypeFlags.BooleanLike)) return 'boolean';
+        if (rest.length !== 1) return undefined;
+        if (checker.isArrayType(rest[0]) || checker.isTupleType(rest[0])) return 'array';
+        return rest[0].flags & ts.TypeFlags.Object ? 'object' : undefined;
+    };
+    const element = (t: ts.Type): ts.Type | undefined => {
+        const rest = t.isUnion() ? t.types.filter((x) => !(x.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined))) : [t];
+        return rest[0] && checker.isArrayType(rest[0]) ? checker.getTypeArguments(rest[0] as ts.TypeReference)[0] : undefined;
+    };
+    for (const [alias, schema] of Object.entries(p.types.schemas)) {
+        const fail = (why: string) => failures.push(`${name} types: ${alias}${why}`);
+        const decl = decls.get(alias);
+        if (!decl) {
+            fail(`: not declared in ${p.types.file}`);
+            continue;
+        }
+        if (!spec.components?.schemas?.[schema]) {
+            fail(`: the spec has no schema ${schema}`);
+            continue;
+        }
+        const specFields = fields(spec.components.schemas[schema]);
+        for (const prop of checker.getPropertiesOfType(checker.getTypeAtLocation(decl))) {
+            const t = checker.getTypeOfSymbolAtLocation(prop, decl);
+            const s = specFields[prop.name];
+            if (!s) {
+                fail(`.${prop.name}: not a field of the spec's ${schema}`);
+                continue;
+            }
+            const tk = tsKind(t);
+            const sk = specKind(s);
+            if (tk && sk && tk !== sk) fail(`.${prop.name}: typed ${tk} (${checker.typeToString(t)}), the spec's is ${sk}`);
+            if (tk === 'array' && sk === 'array') {
+                const te = element(t);
+                const ek = te && tsKind(te);
+                const sek = specKind(deref(s).items ?? deref(s).allOf?.map(deref).find((x: any) => x?.items)?.items);
+                if (ek && sek && ek !== sek) fail(`.${prop.name}[]: typed ${ek}, the spec's is ${sek}`);
+            }
+            const tsNull = t.isUnion() && t.types.some((x) => x.flags & ts.TypeFlags.Null);
+            if (nullable(s) && !tsNull) fail(`.${prop.name}: the spec allows null, and the type (${checker.typeToString(t)}) does not`);
+        }
     }
     return failures;
 }

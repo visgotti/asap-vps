@@ -198,6 +198,16 @@ describe('DigitalOcean images (droplet snapshots)', () => {
         await expect(p.copyImage(img.id, ['nyc2'], fast)).rejects.toBeInstanceOf(NotFoundError);
     });
 
+    it('an image whose nullable fields are null (as the spec allows) reads with no size, never a null one', async () => {
+        const { fake, p } = make();
+        fake.state.images.set('777', { id: 777, name: 'bare', distribution: 'Ubuntu', slug: null, public: false, regions: ['nyc1'], created_at: '2026-09-01T00:00:00Z',
+            min_disk_size: null, type: 'snapshot', size_gigabytes: null, description: '', tags: null, status: 'available' });
+        const img = await p.getImage('777');
+        expect(img).toMatchObject({ id: '777', name: 'bare', status: 'available', regions: ['nyc1'] });
+        expect(img?.sizeGb).toBeUndefined();
+        expect((await p.listImages()).find((i) => i.id === '777')?.sizeGb).toBeUndefined();
+    });
+
     it('a snapshot that never completes times out instead of waiting forever', async () => {
         const { p } = make({ actionReads: 1_000_000 });
         const s = await p.createServer({ name: 'slow', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
