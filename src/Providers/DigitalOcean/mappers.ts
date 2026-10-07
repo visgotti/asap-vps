@@ -8,7 +8,7 @@ import type { EnumTranslations } from '../../Core/ComputeProvider';
 import { canonicalGpu, gpuName, sshKeyFingerprint } from '../../Core/utils';
 import { MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import type { Billing, ImageStatus, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerImage, ServerStatus, Volume, VolumeStatus } from '../../types';
-import type { DigitalOceanDropletData, DigitalOceanDropletStatus, DigitalOceanImageData, DigitalOceanNetworkData, DigitalOceanNfsShare, DigitalOceanSizeData, DigitalOceanSSHData, DigitalOceanVolumeData } from './types';
+import type { DigitalOceanDropletData, DigitalOceanDropletStatus, DigitalOceanGpuInfo, DigitalOceanImageData, DigitalOceanNetworkData, DigitalOceanNfsShare, DigitalOceanSizeData, DigitalOceanSSHData, DigitalOceanVolumeData } from './types';
 
 export const DIGITALOCEAN_ID = 'digitalocean';
 
@@ -53,6 +53,15 @@ function modelOf(model: string, slug?: string) {
     return canonicalGpu(model.replace(/^(nvidia|amd)_/i, '').replace(/_/g, ' ')) ?? canonicalGpu(slug);
 }
 
+/** A size's GPU as DigitalOcean says it: its `gpu_info` model, else its slug. */
+const rawModel = (info: DigitalOceanGpuInfo, slug: string | undefined) => String(info.model ?? slug ?? '');
+
+/** The name a size's GPU goes by, on its offer and on its droplets alike: the canonical one, else DigitalOcean's own for a model asap-vps does not know. */
+function gpuOf(info: DigitalOceanGpuInfo, slug: string | undefined): string {
+    const model = rawModel(info, slug);
+    return modelOf(model, slug)?.name ?? gpuName(model);
+}
+
 /** A size: its GPUs where it has `gpu_info`, else a machine without GPUs. */
 export function toOffer(s: DigitalOceanSizeData): Offer<DigitalOceanSizeData> {
     const base = {
@@ -68,12 +77,12 @@ export function toOffer(s: DigitalOceanSizeData): Offer<DigitalOceanSizeData> {
     };
     const info = s.gpu_info;
     if (!info) return { ...base, gpu: '', vendor: null, gpuCount: 0, vramGb: 0 };
-    const model = String(info.model ?? s.slug);
+    const model = rawModel(info, s.slug);
     const canon = modelOf(model, s.slug);
     const count = Number(info.count) || 1;
     return {
         ...base,
-        gpu: canon?.name ?? gpuName(model),
+        gpu: gpuOf(info, s.slug),
         vendor: /^amd/i.test(model) || canon?.vendor === 'amd' ? 'amd' : 'nvidia',
         gpuCount: count,
         vramGb: info.vram?.amount ? Number(info.vram.amount) / count : canon?.vramGb ?? 0,
@@ -92,7 +101,7 @@ export function toServer(d: DigitalOceanDropletData): Server<DigitalOceanDroplet
         status: DROPLET_STATUS[d.status] ?? 'unknown',
         providerStatus: d.status,
         offerId: d.size_slug ?? d.size?.slug,
-        gpu: info ? modelOf(String(info.model ?? d.size_slug ?? ''), d.size_slug)?.name : undefined,
+        gpu: info ? gpuOf(info, d.size_slug ?? d.size?.slug) || undefined : undefined,
         gpuCount: info?.count,
         region: d.region?.slug,
         ip: publicIp,

@@ -73,6 +73,21 @@ describe('DigitalOcean API facts', () => {
     };
     const running = async (p: DigitalOcean, id: string) => p.waitUntilRunning(id, { intervalMs: 0, timeoutMs: 2000 });
 
+    it('a droplet names its GPU as its offer does, a model asap-vps does not know included', async () => {
+        const { p, fake } = make();
+        fake.state.sizes.push({ slug: 'gpu-zz9x1-64gb', price_hourly: 2.5, available: true, regions: ['tor1'], vcpus: 8, memory: 65536, disk: 500,
+            gpu_info: { count: 1, vram: { amount: 64, unit: 'gib' }, model: 'nvidia_zz9' } });
+        const offers = await p.listOffers({ kind: 'gpu' });
+        for (const id of ['gpu-zz9x1-64gb', 'gpu-4000adax1-20gb']) {
+            const offer = offers.find((o) => o.id === id)!;
+            const s = await running(p, (await p.createServer({ name: `as-${id}`, offer })).id);
+            expect([id, s.gpu, s.gpuCount]).toEqual([id, offer.gpu, offer.gpuCount]);
+        }
+        // DigitalOcean's own name for the model no table has; the canonical one for the other.
+        expect(offers.find((o) => o.id === 'gpu-zz9x1-64gb')?.gpu).toBe('nvidia_zz9');
+        expect(offers.find((o) => o.id === 'gpu-4000adax1-20gb')?.gpu).toBe('RTX 4000 Ada');
+    });
+
     it('finds GPU droplets through ?type=gpus: the plain list never holds them', async () => {
         const { p, fake } = make();
         const s = await p.createServer({ name: 'gpu-1', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
