@@ -205,6 +205,51 @@ describe('DigitalOcean images (droplet snapshots)', () => {
     });
 });
 
+describe('DigitalOcean droplet actions: one at a time, its create the first', () => {
+    const make = (o: Parameters<typeof fakeDigitalOcean>[0] = {}) => {
+        const fake = fakeDigitalOcean(o);
+        return { fake, p: new DigitalOcean({ apiKey: 'do-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
+    };
+    const server = { offer: 'gpu-4000adax1-20gb', region: 'tor1' };
+
+    it('an action asked for while the droplet is being created waits for the create to end (DigitalOcean refuses it meanwhile, and starts nothing)', async () => {
+        const { fake, p } = make({ bootReads: 3 });
+        const asks = (id: string) => fake.calls.filter((c) => c.method === 'POST' && c.path === `/v2/droplets/${id}/actions`).length;
+        const a = await p.createServer({ name: 'a', ...server });
+        await p.restartServer(a.id);
+        expect(asks(a.id)).toBeGreaterThan(1);
+        // Its first boot, then the reboot.
+        expect(fake.state.droplets.get(a.id).boots).toBe(2);
+        const b = await p.createServer({ name: 'b', ...server });
+        await expect(p.createImage(b.id, { name: 'early', ...fast })).resolves.toMatchObject({ name: 'early', status: 'available' });
+        const vol = await p.createVolume({ name: 'scratch', region: 'tor1', sizeGb: 10 });
+        const c = await p.createServer({ name: 'c', ...server });
+        await p.attachVolume(vol.id, c.id, fast);
+        expect((await p.getVolume(vol.id))?.serverIds).toEqual([c.id]);
+    });
+
+    it('a pending event that outlasts the wait is a timeout, and the action is never started', async () => {
+        const { fake, p } = make({ bootReads: 1e9 });
+        const s = await p.createServer({ name: 'stuck', ...server });
+        await expect(p.createImage(s.id, { name: 'never', intervalMs: 0, timeoutMs: 30 })).rejects.toThrow(/timed out .* waiting for the droplet's pending event to end/);
+        expect([...fake.state.actions.values()].filter((x) => x.type === 'snapshot')).toEqual([]);
+    });
+
+    it('any other refusal of an action is thrown at once, asked once', async () => {
+        const fake = fakeDigitalOcean();
+        let asked = 0;
+        const refuse = (async (url: string, init?: RequestInit) => {
+            if (init?.method !== 'POST' || !/\/v2\/droplets\/\d+\/actions$/.test(new URL(url).pathname)) return fake.fetchImpl(url, init);
+            asked++;
+            return new Response(JSON.stringify({ id: 'unprocessable_entity', message: 'Droplet is in a state that does not allow this action.' }), { status: 422, headers: { 'content-type': 'application/json' } });
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: refuse, sleep: noSleep });
+        const s = await p.waitUntilRunning((await p.createServer({ name: 'x', ...server })).id, fast);
+        await expect(p.createImage(s.id, { name: 'x', intervalMs: 0, timeoutMs: 1000 })).rejects.toThrow(/does not allow this action/);
+        expect(asked).toBe(1);
+    });
+});
+
 describe('DigitalOcean image import (a custom image from a URL)', () => {
     const make = (o: Parameters<typeof fakeDigitalOcean>[0] = {}) => {
         const fake = fakeDigitalOcean(o);

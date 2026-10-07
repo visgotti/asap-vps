@@ -14,7 +14,7 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider } from '../../Core/ComputeProvider';
-import { filterOffers, findSSHKey, pickSSHKeys, sshKeyFingerprint, timeLeft } from '../../Core/utils';
+import { filterOffers, findSSHKey, pickSSHKeys, pollUntil, sshKeyFingerprint, timeLeft } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, QuotaError } from '../../errors';
 import type {
     CreateServerOptions, CreateVolumeOptions, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerImage, ServerListOptions, Volume,
@@ -289,8 +289,7 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
      */
     public async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<DigitalOceanImageData>> {
         const path = `/v2/droplets/${encodeURIComponent(serverId)}`;
-        const { action } = await this.api.call<{ action: DigitalOceanAction }>('POST', `${path}/actions`, { type: 'snapshot', name: o.name });
-        await this.waitForAction(action.id, o);
+        await this.act(`${path}/actions`, { type: 'snapshot', name: o.name }, { timeoutMs: 30 * 60_000, ...o });
         // The action names no image: the droplet's newest snapshot of that name is it.
         const snaps = (await this.api.all<DigitalOceanImageData>(`${path}/snapshots`, 'snapshots'))
             .filter((s) => s.name === o.name)
@@ -530,15 +529,31 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
 
     /** A volume action on a droplet, waited for (actions of a volume are actions like a droplet's). */
     private async volumeAction(v: DigitalOceanVolumeData, type: 'attach' | 'detach', serverId: string, o: WaitOptions): Promise<void> {
-        const { action } = await this.api.call<{ action: DigitalOceanAction }>('POST', `/v2/volumes/${encodeURIComponent(v.id)}/actions`,
-            { type, droplet_id: Number(serverId), region: v.region.slug });
-        await this.waitForAction(action.id, { timeoutMs: 10 * 60_000, ...o });
+        await this.act(`/v2/volumes/${encodeURIComponent(v.id)}/actions`, { type, droplet_id: Number(serverId), region: v.region.slug }, { timeoutMs: 10 * 60_000, ...o });
     }
 
     /** A droplet action, waited for: the droplet takes no other action until it completes. */
     private async action(id: string, type: string, o: WaitOptions = {}): Promise<void> {
-        const { action } = await this.api.call<{ action: DigitalOceanAction }>('POST', `/v2/droplets/${encodeURIComponent(id)}/actions`, { type });
-        await this.waitForAction(action.id, { timeoutMs: 10 * 60_000, ...o });
+        await this.act(`/v2/droplets/${encodeURIComponent(id)}/actions`, { type }, { timeoutMs: 10 * 60_000, ...o });
+    }
+
+    /**
+     * Asks for an action on a droplet (its own, or a volume's on it) and waits
+     * until it is done, all within `o.timeoutMs`. A droplet takes one action at
+     * a time: while one is in progress (its create too, until it is active)
+     * DigitalOcean refuses another with a 422 "Droplet already has a pending
+     * event", and starts nothing, so it is asked again until the wait ends.
+     */
+    private async act(path: string, body: object, o: WaitOptions & { timeoutMs: number }): Promise<void> {
+        const left = timeLeft(o);
+        const { action } = await pollUntil(() => this.api.call<{ action: DigitalOceanAction }>('POST', path, body), () => true, {
+            timeoutMs: o.timeoutMs,
+            intervalMs: o.intervalMs ?? 5000,
+            sleep: this.sleep,
+            retryOn: (e) => e instanceof ProviderError && e.status === 422 && /pending event/i.test(e.message),
+            timeoutError: () => new ProviderError(this.id, `timed out after ${Math.round(o.timeoutMs / 1000)} s waiting for the droplet's pending event to end, to ask for ${JSON.stringify(body)}`, { code: 'timeout' }),
+        });
+        await this.waitForAction(action.id, left());
     }
 
     /** Poll an action until it completes; an errored action throws. */

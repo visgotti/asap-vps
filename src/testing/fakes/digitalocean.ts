@@ -1,8 +1,10 @@
-// A fetch() that answers like api.digitalocean.com for the calls both
-// DigitalOcean initializers make (DigitalOcean and DigitalOcean), from
-// documented (and, for the error wording, observed) behaviour: 422 "Size is not
-// available in this region." when a size has no stock there, 422 on the droplet
-// limit, `new` -> `active` after a few reads, power actions, account keys (with
+// A fetch() that answers like api.digitalocean.com for the calls the
+// DigitalOcean provider makes, from documented (and, for the error wording,
+// observed) behaviour: 422 "Size is not available in this region." when a size
+// has no stock there, 422 on the droplet limit, `new` -> `active` after a few
+// reads, power actions, one at a time (an action asked for while another is in
+// progress, the droplet's create included until it is active, is a 422
+// "Droplet already has a pending event."), account keys (with
 // DigitalOcean's MD5 fingerprints), and images: the public distribution images,
 // a snapshot action that completes after a few reads of /v2/actions/{id}, the
 // account's private images (a production backup is seeded: callers pick theirs
@@ -163,11 +165,49 @@ export function fakeDigitalOcean(o: {
         return err(405, 'method_not_allowed', method);
     }
 
-    /** An action that completes after `actionReads` reads, then runs `done`. */
+    /**
+     * An action that completes after `actionReads` reads, then runs `done`; a
+     * droplet's create completes when the droplet is active instead. One on a
+     * droplet is its pending event until then: the droplet takes no other.
+     */
     const startAction = (type: string, done: () => void, dropletId?: number) => {
         const a = { id: state.nextId++, type, status: 'in-progress', reads: 0, done, dropletId };
         state.actions.set(String(a.id), a);
         return { id: a.id, type, status: a.status };
+    };
+    /** A droplet that is new becomes active after `bootReads` reads: its first boot, and the end of its create. */
+    const advance = (d: any) => {
+        if (d.status !== 'new' || ++d.reads < state.bootReads) return;
+        d.status = 'active';
+        // Its first boot: cloud-init runs its user data.
+        d.boots = 1;
+        Object.assign(d.files, userDataFiles(d.user_data));
+        d.networks = { v4: [{ ip_address: `203.0.113.${d.id % 250}`, type: 'public' }, { ip_address: '10.10.0.2', type: 'private' }], v6: [] };
+        for (const a of state.actions.values()) if (a.dropletId === d.id && a.type === 'create') a.status = 'completed';
+    };
+    /** Time passes for an action: a read of it, or a request it held up. */
+    const progress = (a: any) => {
+        if (a.status !== 'in-progress') return;
+        if (a.type === 'create') {
+            const d = state.droplets.get(String(a.dropletId));
+            if (d) advance(d);
+            else a.status = 'completed';
+            return;
+        }
+        if (++a.reads < state.actionReads) return;
+        // A shutdown the guest ignores errors out (the case power_off exists for).
+        if (a.type === 'shutdown' && o.failShutdown) a.status = 'errored';
+        else {
+            a.status = 'completed';
+            a.done();
+        }
+    };
+    /** The droplet's pending event, if it has one: an action on it then is refused (and time passes for that event). */
+    const pendingEvent = (d: any): Response | undefined => {
+        const pending = [...state.actions.values()].filter((a) => a.dropletId === d.id && a.status === 'in-progress');
+        if (!pending.length) return undefined;
+        for (const a of pending) progress(a);
+        return err(422, 'unprocessable_entity', 'Droplet already has a pending event.');
     };
 
     /** The account's keys DigitalOcean knows by now (keyLag). */
@@ -216,7 +256,9 @@ export function fakeDigitalOcean(o: {
                 authKeys, files: { ...carried }, boots: 0 };
             for (const v of volumes) v.droplet_ids = [id];
             state.droplets.set(String(id), d);
-            return json(202, { droplet: view(d), links: { actions: [{ id: state.nextId++, rel: 'create' }] } });
+            // Its create is its pending event until it is active.
+            const create = startAction('create', () => undefined, id);
+            return json(202, { droplet: view(d), links: { actions: [{ id: create.id, rel: 'create', href: `https://api.digitalocean.com/v2/actions/${create.id}` }] } });
         }
         if (method === 'GET' && path === '/v2/droplets') {
             // "By default, only non-GPU Droplets are returned. To list only GPU Droplets, set the type query parameter to gpus."
@@ -228,13 +270,7 @@ export function fakeDigitalOcean(o: {
             const d = state.droplets.get(m[1]);
             if (!d) return err(404, 'not_found', 'The resource you were accessing could not be found.');
             if (method === 'GET') {
-                if (d.status === 'new' && ++d.reads >= state.bootReads) {
-                    d.status = 'active';
-                    // Its first boot: cloud-init runs its user data.
-                    d.boots = 1;
-                    Object.assign(d.files, userDataFiles(d.user_data));
-                    d.networks = { v4: [{ ip_address: `203.0.113.${d.id % 250}`, type: 'public' }, { ip_address: '10.10.0.2', type: 'private' }], v6: [] };
-                }
+                advance(d);
                 return json(200, { droplet: view(d) });
             }
             if (method === 'DELETE') {
@@ -282,11 +318,14 @@ export function fakeDigitalOcean(o: {
             const d = state.droplets.get(String(body?.droplet_id));
             if (!d) return err(422, 'unprocessable_entity', 'droplet_id is not a droplet of the account.');
             if (body.region !== undefined && body.region !== v.region.slug) return err(422, 'unprocessable_entity', 'region is not the volume\'s region.');
+            // An attach or a detach is an event of the droplet's: it waits for none, and holds up any other.
+            const busy = pendingEvent(d);
+            if (busy) return busy;
             if (body.type === 'attach') {
                 if (d.region.slug !== v.region.slug) return err(422, 'unprocessable_entity', 'Volumes must be in the same region as the Droplet.');
                 if (v.droplet_ids.length) return err(422, 'unprocessable_entity', 'The volume is already attached to a Droplet.');
                 v.droplet_ids = [d.id];
-                const action = startAction('attach_volume', () => { d.volume_ids = [...(d.volume_ids ?? []), v.id]; });
+                const action = startAction('attach_volume', () => { d.volume_ids = [...(d.volume_ids ?? []), v.id]; }, d.id);
                 return json(202, { action });
             }
             if (body.type === 'detach') {
@@ -294,7 +333,7 @@ export function fakeDigitalOcean(o: {
                 const action = startAction('detach_volume', () => {
                     v.droplet_ids = [];
                     d.volume_ids = (d.volume_ids ?? []).filter((x: string) => x !== v.id);
-                });
+                }, d.id);
                 return json(202, { action });
             }
             return err(422, 'unprocessable_entity', `unsupported volume action ${body?.type}`);
@@ -302,9 +341,8 @@ export function fakeDigitalOcean(o: {
         if (method === 'POST' && (m = /^\/v2\/droplets\/(\d+)\/actions$/.exec(path))) {
             const d = state.droplets.get(m[1]);
             if (!d) return err(404, 'not_found', 'The resource you were accessing could not be found.');
-            if ([...state.actions.values()].some((a) => a.dropletId === d.id && a.status === 'in-progress')) {
-                return err(422, 'unprocessable_entity', 'Droplet already has a pending event.');
-            }
+            const busy = pendingEvent(d);
+            if (busy) return busy;
             if (body.type === 'snapshot') {
                 if (!body.name) return err(422, 'unprocessable_entity', 'name is required');
                 const dropletId = d.id;
@@ -328,14 +366,7 @@ export function fakeDigitalOcean(o: {
         if (method === 'GET' && (m = /^\/v2\/actions\/(\d+)$/.exec(path))) {
             const a = state.actions.get(m[1]);
             if (!a) return err(404, 'not_found', 'The resource you were accessing could not be found.');
-            if (a.status === 'in-progress' && ++a.reads >= state.actionReads) {
-                // A shutdown the guest ignores errors out (the case power_off exists for).
-                if (a.type === 'shutdown' && o.failShutdown) a.status = 'errored';
-                else {
-                    a.status = 'completed';
-                    a.done();
-                }
-            }
+            progress(a);
             return json(200, { action: { id: a.id, type: a.type, status: a.status } });
         }
         if (method === 'GET' && (m = /^\/v2\/droplets\/(\d+)\/snapshots$/.exec(path))) {
