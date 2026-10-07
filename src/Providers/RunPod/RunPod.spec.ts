@@ -87,6 +87,23 @@ describe('RunPod', () => {
         expect(e).not.toBeInstanceOf(CapacityError);
     });
 
+    it('a create that names something RunPod no longer has is a NotFoundError, not "no capacity": no other offer has it either', async () => {
+        const { p, fake } = make();
+        // A stored login that is gone.
+        const login = await p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: 'img', providerOptions: { registry: 'reg_gone' } }).catch((x) => x);
+        expect([login.constructor.name, login.message]).toEqual(['NotFoundError', expect.stringMatching(/container registry auth reg_gone not found/)]);
+        // A volume deleted after it was read for the create, before the create was sent.
+        const vol = await p.createVolume({ name: 'weights', region: 'US-TX-3', sizeGb: 10 });
+        const racing = new RunPod({ apiKey: 'rp-test', sleep: noSleep, fetchImpl: (async (url: string, init?: RequestInit) => {
+            if (init?.method === 'POST' && new URL(url).pathname === '/v2/pods') fake.state.volumes.delete(vol.id);
+            return fake.fetchImpl(url, init);
+        }) as typeof fetch });
+        const gone = await racing.createServer({ name: 'y', offer: 'NVIDIA RTX A5000', image: 'img', mounts: [{ volume: vol.id }] }).catch((x) => x);
+        expect([gone.constructor.name, gone.message]).toEqual(['NotFoundError', expect.stringMatching(/network volume .* not found/)]);
+        // Where there is no stock, it is still no capacity.
+        await expect(p.createServer({ name: 'z', offer: 'NVIDIA L4', image: 'img' })).rejects.toBeInstanceOf(CapacityError);
+    });
+
     it('a stop or start already done succeeds; an action the pod\'s status does not allow is an error', async () => {
         const { p } = make();
         const s = await p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: 'img' });

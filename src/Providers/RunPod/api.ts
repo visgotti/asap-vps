@@ -117,8 +117,12 @@ export class RunPodApi extends ApiClient {
         if (r.status === 429) return new ProviderError(this.id, msg, { ...o, retriable: true });
         // A create answers 400 both when the GPU / data center could not be placed
         // and when the body breaks a cross-field rule; only the detail tells them
-        // apart. The spec's advice for a 400 is "try your next candidate".
-        if (creating && r.status === 400 && !/invalid|required|must|mutually exclusive|not allowed|unknown/i.test(errorText(r.body))) {
+        // apart. The spec's advice for a 400 is "try your next candidate". Something
+        // the body names that is not there (a volume, a stored login deleted since)
+        // is neither: no candidate has it, so it is not "no capacity".
+        const detail = errorText(r.body);
+        if (creating && r.status === 400 && /not found|does not exist|no such/i.test(detail)) return new NotFoundError(this.id, msg, o);
+        if (creating && r.status === 400 && !/invalid|required|must|mutually exclusive|not allowed|unknown/i.test(detail)) {
             return new CapacityError(this.id, msg, o);
         }
         // A start or restart its host has no GPU free for: "not enough free GPUs on the host machine" (seen live 2026-10-05).
