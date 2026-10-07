@@ -146,9 +146,10 @@ describe('Scaleway billing', () => {
         // Standby bills as running.
         await p.api.serverAction('pl-waw-2', s.id.split('/')[1], { action: 'stop_in_place' });
         expect((await p.getServer(s.id))?.billingStartedAt).toBeDefined();
-        // Powered off, no compute bills: the rate stays, the run is none.
-        await p.api.serverAction('pl-waw-2', s.id.split('/')[1], { action: 'poweroff' });
+        // stopServer powers a server in standby off (it reads as stopped, but holds its slot and bills): no compute bills then.
+        const offs = fake.calls.filter((c) => c.body?.action === 'poweroff').length;
         await p.stopServer(s.id);
+        expect(fake.calls.filter((c) => c.body?.action === 'poweroff')).toHaveLength(offs + 1);
         const stopped = (await p.getServer(s.id))!;
         expect(stopped).toMatchObject({ status: 'stopped', billingStartedAt: undefined });
         expect(stopped.pricePerHour).toBeCloseTo(s.pricePerHour!, 9);

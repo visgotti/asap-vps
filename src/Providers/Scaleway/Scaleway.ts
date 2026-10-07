@@ -33,7 +33,7 @@ import { ScalewayApi } from './api';
 import {
     BILLING_PER_HOUR, BILLING_PER_MINUTE, CONTAINER_SIZES, CONTAINER_TRANSIENT, containerSizeId, copyTag, ENDPOINT_TAG, endpointUrl, epochMs, FILE_REGIONS, fileSystemMountScript,
     fileSystemTag, GB, gpuOf, isCopyOf, isScalewayZone, MOUNT_TAG, mountedVolumeIds, parseContainerSizeId, parseRegionalId, parseZonedId, regionOfZone, SCALEWAY_ENUMS, SCALEWAY_ID,
-    SCALEWAY_REFUSED, SCALEWAY_SSH_USER, STOPPED, TMP_BUCKET_PREFIX, toContainerOffer, toEndpoint, toFileSystemVolume, toImage, toOffer, toServer, toVolume, zonedId,
+    SCALEWAY_REFUSED, SCALEWAY_SSH_USER, TMP_BUCKET_PREFIX, toContainerOffer, toEndpoint, toFileSystemVolume, toImage, toOffer, toServer, toVolume, zonedId,
 } from './mappers';
 import { SCALEWAY_REGIONS } from './types';
 import type {
@@ -219,12 +219,15 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
     /**
      * `poweroff`, and waits until it is stopped: the hypervisor slot (a GPU) is
      * released and only the volumes and IPs bill. startServer needs stock again.
+     * A server in standby (`stopped in place`, which keeps its slot and bills as
+     * running, though it reads as stopped) is powered off too.
      */
     public async stopServer(id: string): Promise<void> {
         const s = await this.need(id);
-        if (STOPPED.includes(s.state)) return;
+        // Standby (`stopped in place`) keeps the slot and bills as running: it is powered off too.
+        if (s.state === 'stopped') return;
         if (s.state !== 'stopping') await this.api.serverAction(s.zone, s.id, { action: 'poweroff' }, true);
-        const stopped = await this.waitFor(s, 'to stop', (x) => STOPPED.includes(x.state) || x.state === 'locked');
+        const stopped = await this.waitFor(s, 'to stop', (x) => x.state === 'stopped' || x.state === 'locked');
         if (!stopped) throw new NotFoundError(this.id, `server ${id} disappeared while it was stopping`);
         if (stopped.state === 'locked') throw new ProviderError(this.id, `server ${id} is locked (${stopped.state_detail || 'no detail'}): it did not stop`);
     }

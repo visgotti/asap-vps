@@ -84,8 +84,6 @@ export const SERVER_STATUS: Readonly<Record<ScalewayServerState, ServerStatus>> 
 
 export const IMAGE_STATUS: Readonly<Record<ScalewayImageState, ImageStatus>> = { available: 'available', creating: 'pending', error: 'error' };
 
-/** The states of a server that is powered off. */
-export const STOPPED: readonly ScalewayServerState[] = ['stopped', 'stopped in place'];
 /** The states a server's compute bills in: standby (`stopped in place`) bills as running, a powered-off (`stopped`) or locked one bills no compute. */
 const BILLED: readonly ScalewayServerState[] = ['running', 'starting', 'stopping', 'stopped in place'];
 
