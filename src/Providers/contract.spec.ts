@@ -137,15 +137,25 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         expect(fake.liveServers()).toBe(before);
     });
 
-    it('takes the offer as the offer says: its GPU count passes, another count or another provider\'s offer does not', async () => {
+    it(`takes the offer as the offer says: its GPU count passes, another count is ${subject.anyGpuCount ? 'rented as asked' : 'refused'}, another provider's offer is refused`, async () => {
         const { provider, fake } = subject.make();
         const [offer] = await provider.listOffers(GPU);
         const extra = await subject.extra(provider);
         const before = fake.liveServers();
-        const s = await provider.createServer({ name: 'gpu-contract-count', offer, gpuCount: offer.gpuCount, ...extra });
-        expect((await provider.waitUntilRunning(s.id, fast)).gpuCount).toBe(offer.gpuCount);
-        expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
-        if (subject.name !== 'runpod') {
+        /** A server of `offer` with `gpuCount` GPUs asked for: running, with that many, then deleted. */
+        const rents = async (o: Offer, gpuCount: number) => {
+            const s = await provider.createServer({ name: 'gpu-contract-count', offer: o, gpuCount, ...extra });
+            expect((await provider.waitUntilRunning(s.id, fast)).gpuCount).toBe(gpuCount);
+            expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
+        };
+        await rents(offer, offer.gpuCount);
+        if (subject.anyGpuCount) {
+            // More than the offer was listed for, and fewer: what is asked is what is rented.
+            await rents(offer, offer.gpuCount + 1);
+            const [two] = await provider.listOffers({ ...GPU, gpuCount: 2 });
+            expect(two.gpuCount).toBe(2);
+            await rents(two, 1);
+        } else {
             await expect(provider.createServer({ name: 'x', offer, gpuCount: offer.gpuCount + 1, ...extra })).rejects.toBeInstanceOf(NotSupportedError);
         }
         await expect(provider.createServer({ name: 'x', offer: { ...offer, provider: 'elsewhere' }, ...extra })).rejects.toThrow(/elsewhere's/);

@@ -32,6 +32,8 @@ export type ContractSubject = {
     unknownId: string,
     /** An option this provider must refuse rather than drop. */
     refused: Partial<CreateServerOptions>,
+    /** createServer rents an offer's GPU type at any GPU count asked (a RunPod pod); elsewhere an offer's count is fixed, and another is refused. */
+    anyGpuCount?: boolean,
     /** What a running server of the fake prints (providers with logs). */
     logLine?: RegExp,
     /** A region other than `region` where a volume of `kind` can be made (providers with volumes): a server in `region` cannot mount it; undefined where the kind is in one region only. */
@@ -75,6 +77,7 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         anyRegion: 'US-TX-3',
         unknownId: 'pod_missing',
         refused: { userData: '#!/bin/bash\ntrue\n' },
+        anyGpuCount: true,
         logLine: /hello from gpu-contract/,
         elsewhere: (region) => (region === 'EU-RO-1' ? 'US-TX-3' : 'EU-RO-1'),
         // The pod names a stored login: what RunPod holds under it (RunPod reads the host from the image).
