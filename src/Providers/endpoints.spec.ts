@@ -9,6 +9,7 @@
 
 import type { ApiEndpoint } from '../Core/utils';
 import { DIGITALOCEAN_ENDPOINTS } from './DigitalOcean/endpoints';
+import { LAMBDA_ENDPOINTS } from './LambdaCloud/endpoints';
 import { RUNPOD_ENDPOINTS } from './RunPod/endpoints';
 
 const TABLES: Array<{ name: string, table: Readonly<Record<string, ApiEndpoint>>, docs: RegExp, operationId: RegExp }> = [
@@ -17,6 +18,7 @@ const TABLES: Array<{ name: string, table: Readonly<Record<string, ApiEndpoint>>
         docs: /^https:\/\/docs\.digitalocean\.com\/reference\/api\/reference\/[a-z0-9-]+\/#[A-Za-z]+_[A-Za-z_]+$/, operationId: /^[A-Za-z]+_[A-Za-z_]+$/,
     },
     { name: 'runpod', table: RUNPOD_ENDPOINTS, docs: /^https:\/\/docs\.runpod\.io\/api-reference-v2\/[a-z0-9-]+\/[a-z0-9-]+$/, operationId: /^[a-z][A-Za-z]+$/ },
+    { name: 'lambda', table: LAMBDA_ENDPOINTS, docs: /^https:\/\/docs\.lambda\.ai\/api\/cloud#[a-z][A-Za-z]+$/, operationId: /^[a-z][A-Za-z]+$/ },
 ];
 
 describe.each(TABLES)('$name endpoint table', ({ table, docs, operationId }) => {

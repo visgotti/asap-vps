@@ -24,6 +24,7 @@ import * as path from 'path';
 import * as yaml from 'js-yaml';
 import type { ApiEndpoint } from '../src/Core/utils';
 import { DIGITALOCEAN_ENDPOINTS } from '../src/Providers/DigitalOcean/endpoints';
+import { LAMBDA_ENDPOINTS } from '../src/Providers/LambdaCloud/endpoints';
 import { RUNPOD_ENDPOINTS } from '../src/Providers/RunPod/endpoints';
 
 type Op = { method: string, path: string, operationId?: string, summary?: string, tags: string[], query: Set<string> };
@@ -62,6 +63,18 @@ const PLATFORMS: Record<string, Platform> = {
         docs: (op) => (op.tags[0] && op.summary ? `https://docs.runpod.io/api-reference-v2/${slug(op.tags[0])}/${slug(op.summary)}` : undefined),
         documents: mintlifyPage,
     },
+    lambda: {
+        spec: 'https://cloud.lambda.ai/api/v1/openapi.json',
+        file: 'lambda.json',
+        table: LAMBDA_ENDPOINTS,
+        // One page; an operation at #<operationId> (the page links each so).
+        docs: (op) => (op.operationId ? `https://docs.lambda.ai/api/cloud#${op.operationId}` : undefined),
+        documents: async (url, op, page) => {
+            const [base, anchor] = url.split('#');
+            const text = await page(base);
+            return !!text && !!anchor && text.includes(`"#${anchor}"`) && (!op?.operationId || anchor === op.operationId);
+        },
+    },
 };
 
 /** A Mintlify reference page: its markdown (at .md) names the operation's method and path. */
@@ -70,13 +83,25 @@ async function mintlifyPage(url: string, op: Op | undefined, page: (u: string) =
     return !!text && (!op || text.includes(`${op.method.toLowerCase()} ${op.path}`) || text.includes(`${op.method} ${op.path}`));
 }
 
-function load(p: Platform, dir: string | undefined): Promise<any> {
+/** A page's text (undefined for an answer that is not a success): a network failure is tried again, twice. */
+async function get(url: string): Promise<string | undefined> {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            const r = await fetch(url);
+            return r.ok ? await r.text() : undefined;
+        } catch (e) {
+            if (attempt >= 3) throw new Error(`${url}: ${(e as Error).message}`);
+            await new Promise((done) => setTimeout(done, 2000 * attempt));
+        }
+    }
+}
+
+async function load(p: Platform, dir: string | undefined): Promise<any> {
     const parse = (text: string, name: string) => (name.endsWith('.json') ? JSON.parse(text) : yaml.load(text));
-    if (dir) return Promise.resolve(parse(fs.readFileSync(path.join(dir, p.file), 'utf8'), p.file));
-    return fetch(p.spec).then(async (r) => {
-        if (!r.ok) throw new Error(`${p.spec} -> ${r.status}`);
-        return parse(await r.text(), p.spec);
-    });
+    if (dir) return parse(fs.readFileSync(path.join(dir, p.file), 'utf8'), p.file);
+    const text = await get(p.spec);
+    if (text === undefined) throw new Error(`${p.spec} could not be read`);
+    return parse(text, p.spec);
 }
 
 /** Every operation of a spec, with the query parameters it declares (its own and its path's, $refs followed). */
@@ -103,7 +128,7 @@ async function check(name: string, p: Platform, dir: string | undefined, readDoc
     const ops = operations(spec);
     const pages = new Map<string, Promise<string | undefined>>();
     const page = (u: string) => {
-        if (!pages.has(u)) pages.set(u, fetch(u).then((r) => (r.ok ? r.text() : undefined), () => undefined));
+        if (!pages.has(u)) pages.set(u, get(u).catch(() => undefined));
         return pages.get(u)!;
     };
     console.log(`\n${name}: ${Object.keys(p.table).length} endpoints, against ${dir ? path.join(dir, p.file) : p.spec} (${spec.info?.title} ${spec.info?.version})`);

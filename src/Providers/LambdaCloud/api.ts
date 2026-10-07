@@ -4,11 +4,13 @@
 import { ApiClient, errorText, HttpResult, RequestInfo } from '../../Core/utils';
 import { AuthError, CapacityError, NotFoundError, ProviderError, QuotaError } from '../../errors';
 import type { ProviderParams } from '../../types';
+import { LAMBDA_ENDPOINTS } from './endpoints';
 import { LAMBDA_ID } from './mappers';
 import type { LambdaErrorBody } from './types';
 
 export class LambdaApi extends ApiClient {
     static readonly BASE_URL = 'https://cloud.lambda.ai';
+    protected readonly endpoints = LAMBDA_ENDPOINTS;
 
     constructor(params: ProviderParams | string) {
         super(params, LambdaApi.BASE_URL, LAMBDA_ID);
