@@ -24,6 +24,9 @@ import { fakeBootId, FakeApi, json, readRequest, userDataFiles } from './util';
  */
 export const DO_NFS_REGIONS: readonly string[] = ['nyc2', 'ams3', 'atl1', 'ric1', 'mkc1', 'mem1'];
 
+/** DigitalOcean's datacenters (its regional availability matrix, 6 Oct 2026), the two legacy ones last: a slug outside them names no region. */
+const REGIONS = ['nyc1', 'nyc2', 'nyc3', 'ams3', 'sfo2', 'sfo3', 'sgp1', 'lon1', 'fra1', 'tor1', 'blr1', 'syd1', 'atl1', 'ric1', 'mkc1', 'mem1', 'ams2', 'sfo1'];
+
 /** Public images: GET /v2/images lists them with the account's own; ?private=true leaves them out. */
 const PUBLIC_IMAGES = [
     { id: 101, name: '24.04 (LTS) x64', distribution: 'Ubuntu', slug: 'ubuntu-24-04-x64', public: true, regions: ['nyc1', 'nyc2', 'tor1', 'sfo3'],
@@ -417,6 +420,7 @@ export function fakeDigitalOcean(o: {
             const img = state.images.get(m[1]);
             if (!img) return err(404, 'not_found', 'The resource you were accessing could not be found.');
             if (body.type !== 'transfer' || !body.region) return err(422, 'unprocessable_entity', `unsupported image action ${body.type}`);
+            if (!REGIONS.includes(body.region)) return err(422, 'unprocessable_entity', `${body.region} is not a valid region.`);
             const action = startAction('transfer', () => {
                 if (!img.regions.includes(body.region)) img.regions.push(body.region);
             });

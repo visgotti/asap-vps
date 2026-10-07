@@ -188,6 +188,12 @@ describe('DigitalOcean images (droplet snapshots)', () => {
         // Already everywhere asked: no transfer at all.
         await p.copyImage(img.id, ['tor1'], fast);
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path === `/v2/images/${img.id}/actions`)).toHaveLength(1);
+        // A region by the library's own name is sent as DigitalOcean's slug; one it is in already (Toronto) is no transfer.
+        const more = await p.copyImage(img.id, [REGION_TYPES.NYC_3, REGION_TYPES.TORONTO], fast);
+        expect([...more.regions].sort()).toEqual(['nyc2', 'nyc3', 'tor1']);
+        expect(fake.calls.filter((c) => c.method === 'POST' && c.path === `/v2/images/${img.id}/actions`).map((c) => c.body.region)).toEqual(['nyc2', 'nyc3']);
+        // A name DigitalOcean has no region by is its refusal, not a copy to nowhere.
+        await expect(p.copyImage(img.id, ['mars1'], fast)).rejects.toThrow(/mars1 is not a valid region/);
     });
 
     it('lists every private image of the account, the ones that are not the caller\'s included', async () => {

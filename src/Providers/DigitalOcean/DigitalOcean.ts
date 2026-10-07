@@ -311,11 +311,11 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         }));
     }
 
-    /** One transfer per missing region, side by side (DigitalOcean charges nothing extra for more regions). */
+    /** One transfer per missing region, side by side (DigitalOcean charges nothing extra for more regions). A region is a slug, or a REGION_TYPES member. */
     public async copyImage(id: string, regions: string[], o: WaitOptions = {}): Promise<ServerImage<DigitalOceanImageData>> {
         const image = await this.getImage(id);
         if (!image) throw new NotFoundError(this.id, `no image ${id}`);
-        const missing = [...new Set(regions)].filter((r) => !image.regions.includes(r));
+        const missing = [...new Set(regions.map((r) => this.regionName(r)))].filter((r) => !image.regions.includes(r));
         const started = await Promise.all(missing.map((region) =>
             this.api.call<{ action: DigitalOceanAction }>('POST', `/v2/images/${encodeURIComponent(id)}/actions`, { type: 'transfer', region })));
         await Promise.all(started.map(({ action }) => this.waitForAction(action.id, o)));
