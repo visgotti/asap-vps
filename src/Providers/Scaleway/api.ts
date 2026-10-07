@@ -54,6 +54,8 @@ export type ScalewayCallOptions = {
 
 export class ScalewayApi extends ApiClient {
     static readonly BASE_URL = 'https://api.scaleway.com';
+    /** Every request is one of these: request() refuses any other, so a path built by hand cannot bypass the table. */
+    protected readonly endpoints = SCALEWAY_ENDPOINTS;
     /** The zones it reads and creates in. */
     readonly zones: ScalewayZone[];
     /** The Project servers and SSH keys are created in, when one was given. */

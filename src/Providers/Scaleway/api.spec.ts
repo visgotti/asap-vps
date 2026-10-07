@@ -580,17 +580,15 @@ describe('images and SSH keys', () => {
 });
 
 describe('endpoints used by the client are the table\'s', () => {
-    it('every request goes to a path of SCALEWAY_ENDPOINTS', async () => {
+    it('every request is an entry of SCALEWAY_ENDPOINTS (method, path and query): one built by hand is refused before it is sent', async () => {
         const fake = fakeScaleway();
         const api = new ScalewayApi({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep: noSleep });
-        await api.serverTypes('fr-par-1');
-        await api.availability('fr-par-1');
         await api.listServers('fr-par-1');
-        await api.listImages('fr-par-1');
-        await api.listSSHKeys();
-        await api.listMarketplaceImages();
-        const templates = Object.values(SCALEWAY_ENDPOINTS).map((e) => new RegExp(`^${e.path.replace(/\{[a-z_]+\}/g, '[^/?]+')}(\\?|$)`));
-        for (const c of fake.calls) expect([c.path, templates.some((t) => t.test(c.path))]).toEqual([c.path, true]);
+        const sent = fake.calls.length;
+        expect(() => api.request('GET', '/instance/v1/zones/fr-par-1/security_groups')).toThrow(/is no endpoint of scaleway's table/);
+        expect(() => api.request('DELETE', '/instance/v1/zones/fr-par-1/servers')).toThrow(/is no endpoint of scaleway's table/);
+        expect(() => api.request('GET', '/instance/v1/zones/fr-par-1/servers?name=x')).toThrow(/is no endpoint of scaleway's table/);
+        expect(fake.calls).toHaveLength(sent);
         expect(fake.calls.map((c) => c.host)).toEqual(Array(fake.calls.length).fill('api.scaleway.com'));
     });
 });
