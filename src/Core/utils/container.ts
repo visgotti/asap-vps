@@ -98,15 +98,48 @@ export function withUserData(script: string, userData?: string): string {
 }
 
 /**
- * User data made of several parts (shell scripts, cloud-configs), run by
- * cloud-init in this order: one multipart document, or the part itself when
- * there is one; undefined when there is none.
+ * cloud-init's user-data formats by how a part begins, as cloud-init itself
+ * tells them apart (its INCLUSION_TYPES_MAP: case and leading space ignored,
+ * the longest prefix first, so a `#cloud-config-archive` is not taken for a
+ * `#cloud-config`): https://cloudinit.readthedocs.io/en/latest/explanation/format.html
+ */
+const CLOUD_INIT_TYPES: ReadonlyArray<readonly [string, string]> = [
+    ['#cloud-config-archive', 'text/cloud-config-archive'],
+    ['#cloud-config-jsonp', 'text/cloud-config-jsonp'],
+    ['## template: jinja', 'text/jinja2'],
+    ['#cloud-boothook', 'text/cloud-boothook'],
+    ['#part-handler', 'text/part-handler'],
+    ['#include-once', 'text/x-include-once-url'],
+    ['#cloud-config', 'text/cloud-config'],
+    ['#include', 'text/x-include-url'],
+    ['#!', 'text/x-shellscript'],
+];
+
+/** A part's MIME type: its cloud-init format's, a shell script's for anything else. */
+function cloudInitType(part: string): string {
+    const head = part.trimStart().toLowerCase();
+    return CLOUD_INIT_TYPES.find(([prefix]) => head.startsWith(prefix))?.[1] ?? 'text/x-shellscript';
+}
+
+/** Whether user data is a MIME document already (what `cloud-init devel make-mime` writes): it begins with its headers. */
+const isMime = (part: string) => /^(From [^\n]*\n)?(content-type|mime-version):/i.test(part.trimStart());
+
+/**
+ * User data made of several parts, run by cloud-init in this order: one
+ * multipart document, or the part itself when there is one; undefined when
+ * there is none. Each part is typed as cloud-init types it (a shell script, a
+ * cloud-config, a cloud-config archive, a boothook, an include, ...). A part
+ * that is a MIME document already goes in whole, as a nested multipart with
+ * its own headers and parts: cloud-init walks into it.
  */
 export function cloudInitParts(parts: Array<string | undefined>): string | undefined {
     const bodies = parts.filter((p): p is string => !!p);
     if (bodies.length <= 1) return bodies[0];
-    const boundary = '==asap-vps-container==';
-    const type = (part: string) => (/^#cloud-config/.test(part.trimStart()) ? 'text/cloud-config' : 'text/x-shellscript');
-    const part = (body: string) => [`--${boundary}`, `Content-Type: ${type(body)}; charset="utf-8"`, 'MIME-Version: 1.0', '', body].join('\n');
+    // A boundary no part contains (a nested document may be one of ours).
+    let boundary = '==asap-vps-container==';
+    for (let n = 2; bodies.some((b) => b.includes(boundary)); n++) boundary = `==asap-vps-container-${n}==`;
+    const part = (body: string) => (isMime(body)
+        ? [`--${boundary}`, body.trimStart().replace(/^From [^\n]*\n/, '').replace(/\n*$/, '')].join('\n')
+        : [`--${boundary}`, `Content-Type: ${cloudInitType(body)}; charset="utf-8"`, 'MIME-Version: 1.0', '', body].join('\n'));
     return [`Content-Type: multipart/mixed; boundary="${boundary}"`, 'MIME-Version: 1.0', '', ...bodies.map(part), `--${boundary}--`, ''].join('\n');
 }

@@ -225,6 +225,70 @@ describe('withUserData: the caller\'s user data and the container\'s script, as 
         expect(parts(withUserData(script, '#cloud-config\npackages: [htop]\n'))[0].type).toBe('text/cloud-config');
         expect(parts(withUserData(script, '\n  #cloud-config\nruncmd: []\n'))[0].type).toBe('text/cloud-config');
     });
+
+    /** The leaf parts of a MIME document, nested multiparts walked as cloud-init walks them: each one's type and body. */
+    const leaves = (doc: string): Array<{ type: string, body: string }> => {
+        const [head, ...rest] = doc.split('\n\n');
+        const body = rest.join('\n\n');
+        const type = /^content-type:\s*([^;\n]+)/im.exec(head)![1].trim();
+        const boundary = /boundary="([^"]+)"/i.exec(head)?.[1];
+        if (!type.startsWith('multipart/') || !boundary) return [{ type, body }];
+        const pieces: string[][] = [];
+        let open = false;
+        for (const line of body.split('\n')) {
+            if (line === `--${boundary}--`) open = false;
+            else if (line === `--${boundary}`) open = !!pieces.push([]);
+            else if (open) pieces[pieces.length - 1].push(line);
+        }
+        return pieces.flatMap((lines) => leaves(lines.join('\n')));
+    };
+
+    it('each part is typed as cloud-init types it, by how it begins: an archive is not a cloud-config, a boothook not a script', () => {
+        const formats: Array<[string, string]> = [
+            ['#!/bin/sh\necho hi', 'text/x-shellscript'],
+            ['#cloud-config\nruncmd: []', 'text/cloud-config'],
+            ['#cloud-config-archive\n- type: text/cloud-config\n  content: "runcmd: []"', 'text/cloud-config-archive'],
+            ['#cloud-config-jsonp\n[{"op": "add", "path": "/runcmd", "value": []}]', 'text/cloud-config-jsonp'],
+            ['#cloud-boothook\n#!/bin/sh\necho early', 'text/cloud-boothook'],
+            ['#include\nhttps://example.com/user-data', 'text/x-include-url'],
+            ['#include-once\nhttps://example.com/once', 'text/x-include-once-url'],
+            ['#part-handler\ndef list_types(): return []', 'text/part-handler'],
+            ['## template: jinja\n#cloud-config\nruncmd: []', 'text/jinja2'],
+            ['  #CLOUD-CONFIG\nruncmd: []', 'text/cloud-config'],
+            // Anything else runs as a script, as it did.
+            ['echo no shebang', 'text/x-shellscript'],
+        ];
+        for (const [body, type] of formats) expect([body, leaves(withUserData(script, body))[0]]).toEqual([body, { type, body }]);
+    });
+
+    it('a MIME document of the caller\'s goes in whole, nested: its parts keep their own types, and the container\'s script follows', () => {
+        const theirs = [
+            'Content-Type: multipart/mixed; boundary="===============123=="', 'MIME-Version: 1.0', '',
+            '--===============123==', 'Content-Type: text/cloud-config; charset="us-ascii"', 'MIME-Version: 1.0', '', '#cloud-config\npackages: [htop]',
+            '--===============123==', 'Content-Type: text/x-shellscript-per-boot; charset="us-ascii"', 'MIME-Version: 1.0', '', '#!/bin/sh\necho every boot',
+            '--===============123==--', '',
+        ].join('\n');
+        const expected = [
+            { type: 'text/cloud-config', body: '#cloud-config\npackages: [htop]' },
+            { type: 'text/x-shellscript-per-boot', body: '#!/bin/sh\necho every boot' },
+            { type: 'text/x-shellscript', body: script },
+        ];
+        expect(leaves(withUserData(script, theirs))).toEqual(expected);
+        // As a mailbox writes it too (a "From " line first).
+        expect(leaves(withUserData(script, `From nobody Wed Oct  7 2026\n${theirs}`))).toEqual(expected);
+    });
+
+    it('its boundary is one no part contains: a document of its own nests in another', () => {
+        const inner = cloudInitParts(['#cloud-config\nruncmd: []', '#!/bin/sh\necho a'])!;
+        const outer = cloudInitParts([inner, '#!/bin/sh\necho b'])!;
+        const boundary = (doc: string) => /boundary="([^"]+)"/.exec(doc)![1];
+        expect(boundary(outer)).not.toBe(boundary(inner));
+        expect(leaves(outer)).toEqual([
+            { type: 'text/cloud-config', body: '#cloud-config\nruncmd: []' },
+            { type: 'text/x-shellscript', body: '#!/bin/sh\necho a' },
+            { type: 'text/x-shellscript', body: '#!/bin/sh\necho b' },
+        ]);
+    });
 });
 
 describe('cloudInitParts: several parts, run by cloud-init in order', () => {
