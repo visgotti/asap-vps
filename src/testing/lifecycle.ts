@@ -461,8 +461,16 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
                 expect(x.id).toBeTruthy();
                 expect(STATUSES).toContain(x.status);
             }
+            // Each server is listed under exactly one kind, the one its GPUs say (live, one made or deleted meanwhile is left out).
+            const hasGpu = (x: Server) => (x.gpuCount ?? 0) > 0;
             const [gpus, cpus] = [await p.listServers({ kind: 'gpu' }), await p.listServers({ kind: 'cpu' })];
-            expect(gpus.length + cpus.length).toBeGreaterThanOrEqual(servers.length);
+            expect(gpus.filter((x) => !hasGpu(x)).map((x) => x.id)).toEqual([]);
+            expect(cpus.filter(hasGpu).map((x) => x.id)).toEqual([]);
+            const ids = (xs: Server[]) => new Set(xs.map((x) => String(x.id)));
+            const [g, c, still] = [ids(gpus), ids(cpus), ids(await p.listServers())];
+            for (const x of servers.filter((y) => still.has(String(y.id)))) {
+                expect([x.id, g.has(String(x.id)), c.has(String(x.id))]).toEqual([x.id, hasGpu(x), !hasGpu(x)]);
+            }
             if (supports(p, 'images')) {
                 for (const i of await p.listImages()) {
                     expect(i.provider).toBe(p.id);
@@ -600,6 +608,7 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
             expect(hour).toMatchObject({ from: cost.from, billedSeconds: 3600 });
             expect(hour?.usd).toBeCloseTo(Math.max(cost.pricePerHour, got?.billing?.minimumUsd ?? 0), 6);
             expect((await p.listServers({ kind: t.cpu ? 'cpu' : 'gpu' })).find((x) => x.id === server.id)).toMatchObject({ name: runName, status: 'running' });
+            expect((await p.listServers({ kind: t.cpu ? 'gpu' : 'cpu' })).map((x) => x.id)).not.toContain(server.id);
             expect((await p.waitForServer(server.id, (x) => x?.status === 'running', t.wait))?.id).toBe(server.id);
         }, t.timeouts.server);
 
