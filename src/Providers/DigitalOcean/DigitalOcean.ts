@@ -191,7 +191,9 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
     /**
      * A clean shutdown (a consistent disk, e.g. before createImage), else a hard
      * power-off, as DigitalOcean recommends; waits until the droplet is off. A
-     * stopped droplet still bills in full.
+     * shutdown that completes was issued, not obeyed ("this action guarantees
+     * that the command is issued, not that it succeeds"): the droplet is read,
+     * and powered off if it is still on. A stopped droplet still bills in full.
      */
     public async stopServer(id: string): Promise<void> {
         const s = await this.getServer(id);
@@ -199,10 +201,13 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         if (s.status === 'stopped') return;
         try {
             await this.action(id, 'shutdown', { timeoutMs: 3 * 60_000 });
+            const after = await this.api.getDroplet(id);
+            if (!after) throw new NotFoundError(this.id, `droplet ${id} is gone`);
+            if (after.status === 'off') return;
         } catch (e) {
             if (e instanceof NotFoundError) throw e;
-            await this.action(id, 'power_off');
         }
+        await this.action(id, 'power_off');
     }
 
     public async startServer(id: string): Promise<void> {

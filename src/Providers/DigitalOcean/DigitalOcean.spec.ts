@@ -111,6 +111,15 @@ describe('DigitalOcean API facts', () => {
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions')).map((c) => c.body.type)).toEqual(['shutdown', 'power_off']);
     });
 
+    it('a shutdown that completes without turning the droplet off (its guest ignored it) is followed by a hard power-off', async () => {
+        const { p, fake } = make({ ignoreShutdown: true });
+        const s = await p.createServer({ name: 'gpu-4', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
+        await running(p, s.id);
+        await p.stopServer(s.id);
+        expect((await p.getServer(s.id))?.status).toBe('stopped');
+        expect(fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions')).map((c) => c.body.type)).toEqual(['shutdown', 'power_off']);
+    });
+
     it('defaults 8-GPU NVIDIA sizes to the 8-GPU image', async () => {
         const { p, fake } = make();
         await p.createServer({ name: 'x8', offer: 'gpu-h100x8-640gb', region: 'nyc2' });

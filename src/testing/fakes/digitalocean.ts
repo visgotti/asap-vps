@@ -59,6 +59,8 @@ const SIZES = [
  */
 export function fakeDigitalOcean(o: {
     token?: string, bootReads?: number, dropletLimit?: number, actionReads?: number, failShutdown?: boolean, keyLag?: number, releaseReads?: number,
+    /** The guest ignores a shutdown: its action completes (the command was issued), and the droplet stays on. */
+    ignoreShutdown?: boolean,
     /** Reads before an imported custom image is available (or, for a URL with "corrupt" in it, deleted with an error). */
     importReads?: number,
     /** Reads before a new NFS share is ACTIVE (with its host and mount path). */
@@ -357,6 +359,7 @@ export function fakeDigitalOcean(o: {
             const done = { power_off: 'off', shutdown: 'off', power_on: 'active', reboot: 'active' }[body.type as string];
             if (!done) return err(422, 'unprocessable_entity', `unsupported action ${body.type}`);
             const action = startAction(body.type, () => {
+                if (body.type === 'shutdown' && o.ignoreShutdown) return;
                 d.status = done;
                 // A reboot or a power-on is a boot of this droplet, and of no other.
                 if (body.type === 'reboot' || body.type === 'power_on') d.boots++;
