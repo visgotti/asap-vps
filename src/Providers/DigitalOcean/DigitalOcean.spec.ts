@@ -549,6 +549,9 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
         // Hot: a share is mounted over the network, not attached.
         const s = await p.waitUntilRunning((await p.createServer(o)).id, fast);
         await expect(p.attachVolume(share.id, s.id, fast)).rejects.toThrow(/attaching a shared volume/);
+        // Nor detached: a detach that did nothing must not say it is done. A volume that is neither kind is still no error.
+        await expect(p.detachVolume(share.id, s.id, fast)).rejects.toThrow(/detaching a shared volume/);
+        await expect(p.detachVolume('00000000-0000-4000-8000-00000000dead', s.id, fast)).resolves.toBeUndefined();
     });
 
     it('a size out of bounds, or a region with no default VPC, is refused before anything is made; one that fails to become ACTIVE is deleted, and its failure thrown', async () => {

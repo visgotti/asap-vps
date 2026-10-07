@@ -391,9 +391,16 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         await this.volumeAction(v, 'attach', serverId, o);
     }
 
-    /** The `detach` volume action, waited for; a volume the droplet does not hold is left as it is. */
+    /**
+     * The `detach` volume action, waited for; a volume the droplet does not hold
+     * is left as it is. A share is refused, as its attach is: it was never
+     * attached, and a droplet that mounts it goes on mounting it.
+     */
     public async detachVolume(volumeId: string, serverId: string, o: WaitOptions = {}): Promise<void> {
         const v = await this.api.getVolume(volumeId);
+        if (!v && await this.findShare(volumeId)) {
+            throw new NotSupportedError(this.id, 'detaching a shared volume (an NFS share): it is mounted over the network, not attached, so unmount it on the droplet');
+        }
         if (!v || !v.droplet_ids?.includes(Number(serverId))) return;
         await this.volumeAction(v, 'detach', serverId, o);
     }
