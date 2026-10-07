@@ -66,10 +66,12 @@ describe('VastAI', () => {
         expect(all.map((x) => x.id)).toContain(s.id);
     });
 
-    it('fetches the uploaded log without sending the API key to the upload host', async () => {
+    it('fetches the uploaded log, as many last lines as asked, without sending the API key to the upload host', async () => {
         const { p, fake } = make();
-        const s = await p.createServer({ name: 'logs', offer: '101', image: 'img' });
-        expect(await p.getServerLogs(s.id)).toMatch(/hello from logs/);
+        const s = await p.createServer({ name: 'logs', offer: '101', image: 'img', command: ['sh', '-c', 'nvidia-smi -L; echo "one"; echo "two"; echo "three"'] });
+        // Only what the command printed.
+        expect(await p.getServerLogs(s.id)).toBe('GPU 0: NVIDIA RTX 4000Ada (UUID: GPU-9a8b7c6d-0)\none\ntwo\nthree\n');
+        expect(await p.getServerLogs(s.id, { tail: 2 })).toBe('two\nthree\n');
         const upload = fake.calls.filter((c) => c.host === 'logs.fake');
         expect(upload.length).toBeGreaterThan(1);
         expect(upload.every((c) => c.auth === undefined)).toBe(true);

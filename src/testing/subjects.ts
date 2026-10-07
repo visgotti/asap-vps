@@ -110,7 +110,7 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         unknownId: '1',
         // An instance has no tags (its userData is a script run before its command).
         refused: { tags: ['contract'] },
-        logLine: /hello from gpu-contract/,
+        logLine: /^GPU 0: NVIDIA /m,
         // A volume is on one machine: its servers are rented there (the cheapest GPU offer's machine); another machine is elsewhere.
         volumePlace: async (p) => {
             const [offer] = await p.listOffers({ kind: 'gpu' });

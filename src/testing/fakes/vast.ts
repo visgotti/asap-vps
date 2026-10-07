@@ -88,8 +88,12 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
     }
     const fail = (status: number, error: string, msg: string) => json(status, { success: false, error, msg });
     /** What one run of an instance's container prints: its GPU (when the command asks), its echoes, a hello. */
-    const containerRun = (i: any): string => `booting\n${String(i.image_args ?? '').includes('nvidia-smi') ? `GPU 0: NVIDIA ${i.gpu_name} (UUID: GPU-9a8b7c6d)\n` : ''}`
-        + `${echoed(i.image_args, Object.fromEntries(i.extra_env ?? [])).map((l) => `${l}\n`).join('')}hello from ${i.label}\n`;
+    /** What one run of an instance's container prints: only what its command prints (nvidia-smi -L: a line per GPU; its echoes). */
+    const containerRun = (i: any): string => {
+        const gpus = String(i.image_args ?? '').includes('nvidia-smi')
+            ? Array.from({ length: Number(i.num_gpus ?? 1) }, (_, k) => `GPU ${k}: NVIDIA ${i.gpu_name} (UUID: GPU-9a8b7c6d-${k})\n`).join('') : '';
+        return `${gpus}${echoed(i.image_args, Object.fromEntries(i.extra_env ?? [])).map((l) => `${l}\n`).join('')}`;
+    };
     /** A start or a reboot runs the container again: the log keeps every run, as docker's does. */
     const rerun = (id: string) => {
         const l = state.logs.get(id);
@@ -139,7 +143,10 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
         if (u.host === 'logs.fake') {
             const l = state.logs.get(path.slice(1));
             if (!l || l.fetchesBeforeReady-- > 0) return new Response('<Error><Code>NoSuchKey</Code></Error>', { status: 404, headers: { 'content-type': 'application/xml' } });
-            return new Response(l.text, { status: 200, headers: { 'content-type': 'text/plain' } });
+            // The last `tail` lines the request asked for.
+            const lines = l.text.split('\n').filter((x, k, all) => x !== '' || k < all.length - 1);
+            const tail = Number(u.searchParams.get('tail') ?? lines.length);
+            return new Response(lines.slice(-tail).map((x) => `${x}\n`).join(''), { status: 200, headers: { 'content-type': 'text/plain' } });
         }
         // What the real API answers (observed 2026-09-29): a 404, not a 401.
         if (auth !== `Bearer ${token}`) return fail(404, 'auth_error', 'Invalid user key');
@@ -287,7 +294,9 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
         }
         if (method === 'PUT' && (m = /^\/api\/v0\/instances\/request_logs\/(\d+)\/$/.exec(path))) {
             if (!state.instances.has(m[1])) return fail(404, 'no_such_instance', 'Instance not found');
-            return json(200, { success: true, result_url: `https://logs.fake/${m[1]}`, msg: 'Logs will be uploaded shortly' });
+            // The upload holds the last `tail` lines (a string, as the CLI sends it).
+            const tail = body?.tail !== undefined ? `?tail=${Number(body.tail)}` : '';
+            return json(200, { success: true, result_url: `https://logs.fake/${m[1]}${tail}`, msg: 'Logs will be uploaded shortly' });
         }
         if (method === 'POST' && path === '/api/v0/volumes/search/') {
             let offers = state.volumeAsks.filter((v) => v.disk_space > 0);
