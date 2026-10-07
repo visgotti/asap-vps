@@ -67,6 +67,7 @@ export function toOffer(a: VastOffer, interruptible: boolean): Offer<VastOffer> 
         vendor: gpuVendor(raw),
         gpuCount: Number(a.num_gpus ?? 1),
         vramGb,
+        // As the search prices it, with 8 GB of disk; a bid offer, its minimum bid alone. The disk rented bills on top (raw.storage_cost).
         pricePerHour: bid ?? Number(a.dph_total),
         billing: VAST_BILLING,
         // Where it is, and the machine it is (where a volume of it is: `machine:<id>`).

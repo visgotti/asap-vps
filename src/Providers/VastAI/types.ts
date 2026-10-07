@@ -54,8 +54,16 @@ export type VastOffer = {
     num_gpus?: number,
     /** Per GPU, MB. */
     gpu_ram?: number,
-    /** USD per hour for the whole offer (a bid search: the minimum bid plus storage). */
+    /**
+     * USD per hour for the whole offer (a bid search: the minimum bid plus
+     * storage), with the disk the search prices it for: 8 GB unless it asks
+     * for another size (`allocated_storage`).
+     */
     dph_total: number,
+    /** USD per hour without its disk. */
+    dph_base?: number,
+    /** What its disk costs, USD per GB per month, charged by the hour over 720 hours (seen live 2026-10-07: dph_total is dph_base plus 8 GB of it). */
+    storage_cost?: number,
     /** The least an interruptible rental of this machine may bid, USD per hour. */
     min_bid?: number,
     /** 'City, CC'. */
