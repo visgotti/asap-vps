@@ -8,7 +8,7 @@
 
 import type { CapabilityDescriptor, ComputeTraits, ICompute } from '../capabilities';
 import { MACHINE_TYPES, REGION_TYPES } from '../constants';
-import { isRetriable, NotSupportedError, ProviderError } from '../errors';
+import { CapacityError, isRetriable, NotSupportedError, ProviderError } from '../errors';
 import type {
     ContainerSpec, CostEstimate, CreateServerOptions, EndpointRequestInit, Offer, OfferQuery, PlatformTypes, RefusableOption, RegistryAuth, Server, ServerListOptions,
     Volume, VolumeMount, WaitOptions,
@@ -151,6 +151,10 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
         }
         if (!o.offer?.id) throw new ProviderError(this.id, 'createServer needs an offer (an offer from listOffers, or its id)');
         if (o.offer.provider !== this.id) throw new ProviderError(this.id, `offer ${o.offer.id} is ${o.offer.provider}'s, not ${this.id}'s`);
+        // An offer with stock nowhere (listOffers({ includeUnavailable: true }) lists them) and no region asked for is no capacity, on every provider.
+        if (asked === undefined && !o.offer.regions.length) {
+            throw new CapacityError(this.id, `offer ${o.offer.id} has no stock anywhere right now: pick an offer with regions, or ask for a region`);
+        }
         const region = asked ?? o.offer.regions[0];
         return { id: o.offer.id, offer: o.offer, ...(region ? { region } : {}) };
     }

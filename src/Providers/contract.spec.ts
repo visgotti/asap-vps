@@ -71,6 +71,10 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         const before = fake.liveServers();
         await expect(provider.createServer({ name: 'gpu-contract-none', offer: empty!.id, region: subject.anyRegion, ...(await subject.extra(provider)) }))
             .rejects.toBeInstanceOf(CapacityError);
+        // The offer itself, as listOffers gave it, with no region asked for: no capacity too, on every provider, so a
+        // "next offer on CapacityError" loop moves on rather than stopping.
+        await expect(provider.createServer({ name: 'gpu-contract-none', offer: empty!, ...(await subject.extra(provider)) }))
+            .rejects.toBeInstanceOf(CapacityError);
         expect(fake.liveServers()).toBe(before);
     });
 
