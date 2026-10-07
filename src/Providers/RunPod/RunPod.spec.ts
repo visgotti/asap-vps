@@ -8,6 +8,7 @@
 // holds any OpenSSH key type, and minCudaVersion scopes the catalog's stock and
 // places the pod.
 
+import { REGION_TYPES } from '../../constants';
 import { AuthError, CapacityError, NotFoundError, NotSupportedError, ProviderError } from '../../errors';
 import { fakeRunPod } from '../../testing/fakes/runpod';
 import { testPublicKey } from '../../testing/fakes/util';
@@ -390,6 +391,18 @@ describe('RunPod network volumes and registry logins', () => {
         await p.createServer({ name: 'c', offer, image: 'ghcr.io/acme/worker:2', registryAuth: { ...auth, password: 'ghp_two' } });
         expect(fake.state.registries.size).toBe(2);
         expect([...fake.state.registries.values()].map((r) => r.name).join()).not.toMatch(/ghp_/);
+    });
+
+    it('a create that is refused stores no login: the account is left with no credential of a pod or endpoint that was never made', async () => {
+        const { fake, p } = make();
+        const [offer] = await p.listOffers();
+        const login = { image: 'ghcr.io/acme/worker:1', registryAuth: { username: 'puller', password: 'ghp_one' } };
+        await expect(p.createServer({ name: 'a', offer, ...login, minCudaVersion: 'twelve' })).rejects.toThrow(/bad CUDA version/);
+        await expect(p.createServer({ name: 'a', offer, ...login, sshKeyIds: ['no-such-key'] })).rejects.toBeInstanceOf(ProviderError);
+        await expect(p.createServer({ name: 'a', offer, ...login, sshKeyIds: ['k'], env: { PUBLIC_KEY: 'ssh-ed25519 AAAA mine' } })).rejects.toThrow(/sshKeyIds or env.PUBLIC_KEY/);
+        await expect(p.createEndpoint({ name: 'e', container: login, region: REGION_TYPES.TORONTO })).rejects.toBeInstanceOf(NotSupportedError);
+        expect(fake.state.registries.size).toBe(0);
+        expect(podBodies(fake)).toEqual([]);
     });
 
     it('a login another create stored meanwhile is used, not stored twice; other refusals pass through', async () => {

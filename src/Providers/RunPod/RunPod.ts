@@ -115,7 +115,6 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
         // A pod that mounts a volume goes where the volume is.
         const region = network?.dataCenter ?? offered;
         if (c.registryAuth && o.providerOptions?.registry !== undefined) throw new ProviderError(this.id, 'pass registryAuth or providerOptions.registry, not both');
-        const registry = c.registryAuth ? await this.registryId(c.registryAuth, image) : undefined;
         const ports = [...(c.ports ?? [])];
         if (o.sshKeyIds?.length && !ports.some((p) => /^22\/tcp$/i.test(p))) ports.push('22/tcp');
         const minCuda = o.minCudaVersion !== undefined ? cudaVersion(o.minCudaVersion) : undefined;
@@ -124,6 +123,8 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
             if (env.PUBLIC_KEY !== undefined) throw new ProviderError(this.id, 'pass sshKeyIds or env.PUBLIC_KEY, not both');
             env.PUBLIC_KEY = pickSSHKeys(await this.listSSHKeys(), o.sshKeyIds, this.id).map((k) => k.publicKey).join('\n');
         }
+        // Stored last, once nothing of the request is left to refuse: a create that is refused leaves no login on the account.
+        const registry = c.registryAuth ? await this.registryId(c.registryAuth, image) : undefined;
         const pod = await this.api.call<RunPodPod>('POST', '/v2/pods', {
             name: o.name,
             image,
@@ -295,8 +296,9 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
         if (idle !== undefined && !(Number.isInteger(idle) && idle >= 1 && idle <= 3600)) throw new ProviderError(this.id, `idleTimeoutSeconds is 1-3600, not ${idle}`);
         const compute = await this.endpointCompute(o.offer);
         if (c.registryAuth && o.providerOptions?.registry !== undefined) throw new ProviderError(this.id, 'pass registryAuth or providerOptions.registry, not both');
-        const registry = c.registryAuth ? await this.registryId(c.registryAuth, image) : undefined;
         const region = o.region !== undefined ? this.regionName(o.region) : undefined;
+        // Stored last, as for a pod: a create that is refused leaves no login on the account.
+        const registry = c.registryAuth ? await this.registryId(c.registryAuth, image) : undefined;
         const body: RunPodCreateEndpointBody = {
             name: o.name,
             type: 'LOAD_BALANCER',
