@@ -119,24 +119,23 @@ function bootsIn(logs: string): Set<string> {
 /** Per provider: ids nothing has, and what is particular to its lifecycle. */
 const PROFILES: Record<string, {
     unknownServerId: string, unknownImageId: string, startMayLackGpu?: boolean, deadlineMs: number,
-    /** Regions to ask a copy for (default DigitalOcean's). */
+    /** Where a provider that copies images (imageCopy) is asked to copy one when no other region has an offer in stock: its own regions. */
     copyRegions?: string[],
     /** billingStartedAt is the rental's start, which a stop and start does not move (Vast). */
     billingFromRentalStart?: boolean,
     /** A marketplace whose rented hosts can be broken (Vast): see LifecycleTarget.hostsMayFail. */
     hostsMayFail?: boolean,
 }> = {
-    digitalocean: { unknownServerId: '1', unknownImageId: '1', deadlineMs: 3 * 3_600_000 },
+    digitalocean: { unknownServerId: '1', unknownImageId: '1', deadlineMs: 3 * 3_600_000, copyRegions: ['nyc3', 'sfo3', 'ams3'] },
     runpod: { unknownServerId: 'zzzzzzzzzzzzzz', unknownImageId: 'none', startMayLackGpu: true, deadlineMs: 90 * 60_000 },
     vast: { unknownServerId: '1', unknownImageId: 'none', startMayLackGpu: true, billingFromRentalStart: true, hostsMayFail: true, deadlineMs: 90 * 60_000 },
     lambda: { unknownServerId: 'f'.repeat(32), unknownImageId: 'none', deadlineMs: 90 * 60_000 },
-    // poweroff releases the GPU, so powering on again needs stock; an image stays in its zone (no imageCopy).
+    // poweroff releases the GPU, so powering on again needs stock; an image is copied to another zone through Object Storage.
     scaleway: {
         unknownServerId: '00000000-0000-4000-8000-ffffffffffff', unknownImageId: '00000000-0000-4000-8000-fffffffffffe', startMayLackGpu: true, deadlineMs: 90 * 60_000,
+        copyRegions: ['fr-par-1', 'nl-ams-1', 'pl-waw-2'],
     },
 };
-
-const COPY_REGIONS = ['nyc3', 'sfo3', 'ams3'];
 
 function profile(id: string) {
     const p = PROFILES[id];
@@ -144,7 +143,12 @@ function profile(id: string) {
     return p;
 }
 
-const copyRegionOf = (prof: { copyRegions?: string[] }) => (from: string) => (prof.copyRegions ?? COPY_REGIONS).find((r) => r !== from) as string;
+/** A region of the provider's own to copy an image to, other than where it is: never another provider's. */
+const copyRegionOf = (id: string, prof: { copyRegions?: string[] }) => (from: string): string => {
+    const to = prof.copyRegions?.find((r) => r !== from);
+    if (!to) throw new Error(`no region to copy an image of ${id} to from ${from} (set copyRegions in its lifecycle profile)`);
+    return to;
+};
 
 /** A provider's fake: every step in milliseconds, nothing rented. The shell (VMs) is the caller's mock of SSHService.connect. */
 export function fakeLifecycle(id: string, make: (apiKey?: string) => ComputeSubject, o: { cpu?: boolean } = {}): LifecycleTarget {
@@ -163,7 +167,7 @@ export function fakeLifecycle(id: string, make: (apiKey?: string) => ComputeSubj
         ...(o.cpu ? { cpu: true } : {}),
         freeOnly: false,
         images: true,
-        copyRegion: copyRegionOf(prof),
+        copyRegion: copyRegionOf(id, prof),
         wait: fast,
         imageWait: fast,
         sshRetry: { maxRetries: 1, retryTimeout: 0 },
@@ -204,7 +208,7 @@ export function liveLifecycle(id: string, opts: { cpu?: boolean } = {}): Lifecyc
         ...(opts.cpu ? { cpu: true } : {}),
         freeOnly: o.freeOnly,
         images: o.images,
-        copyRegion: copyRegionOf(prof),
+        copyRegion: copyRegionOf(id, prof),
         wait: { intervalMs: 10_000, timeoutMs: 20 * 60_000 },
         imageWait: { intervalMs: 15_000, timeoutMs: 60 * 60_000 },
         sshRetry: { maxRetries: 30, retryTimeout: 10_000 },

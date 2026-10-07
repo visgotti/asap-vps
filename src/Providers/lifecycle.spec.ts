@@ -9,6 +9,7 @@
 
 import { createPublicKey } from 'crypto';
 import type { NodeSSH } from 'node-ssh';
+import { requireCapability, supports } from '../capabilities';
 import { SSHService } from '../Core/SSHService';
 import { sshKeyFingerprint, toOpenSSHPublicKey } from '../Core/utils';
 import type { FakeApi } from '../testing/fakes/util';
@@ -72,3 +73,26 @@ for (const subject of CONTRACT_SUBJECTS) {
     // Where a provider rents machines without GPUs (capabilities.compute.cpu), its whole lifecycle also runs on one.
     if (subject.make().provider.capabilities.compute.cpu) describeGpuLifecycle(target(subject, { cpu: true }));
 }
+
+describe('the image copy\'s fallback region, asked for where no other region has an offer in stock', () => {
+    const fast = { intervalMs: 0, timeoutMs: 5000 };
+
+    for (const subject of CONTRACT_SUBJECTS.filter((x) => supports(x.make().provider, 'imageCopy'))) {
+        it(`${subject.name}: is a region of the provider's own, which an image copies to`, async () => {
+            const { provider } = subject.make();
+            const p = requireCapability(requireCapability(requireCapability(provider, 'imageCopy'), 'images'), 'power');
+            const [offer] = await p.listOffers({ kind: 'cpu' });
+            const s = await p.createServer({ name: 'copy-fallback', offer, ...(await subject.extra(provider)) });
+            await p.waitUntilRunning(s.id, fast);
+            await p.stopServer(s.id);
+            const image = await p.createImage(s.id, { name: 'copy-fallback', ...fast });
+            const to = fakeLifecycle(subject.name, () => provider).copyRegion(image.regions[0]);
+            expect(to).not.toBe(image.regions[0]);
+            expect((await p.copyImage(image.id, [to], fast)).regions).toEqual(expect.arrayContaining([image.regions[0], to]));
+        });
+    }
+
+    it('a provider with no regions of its own to copy to says so, rather than borrow another\'s', () => {
+        expect(() => fakeLifecycle('lambda', () => CONTRACT_SUBJECTS[0].make().provider).copyRegion('us-east-1')).toThrow(/no region to copy an image of lambda to from us-east-1/);
+    });
+});
