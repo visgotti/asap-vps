@@ -307,9 +307,15 @@ describe('serverless endpoints where the platform has them', () => {
             const offers = await p.listEndpointOffers();
             expect(offers.length).toBeGreaterThan(0);
             expect(offers.map((o) => o.pricePerHour)).toEqual([...offers.map((o) => o.pricePerHour)].sort((a, b) => a - b));
-            const [offer] = await p.listEndpointOffers({ kind: p.capabilities.serverless.cpu ? 'cpu' : 'gpu' });
+            // A kind lists exactly its offers: one that listed none would leave createEndpoint to pick its own.
+            const kind = p.capabilities.serverless.cpu ? 'cpu' : 'gpu';
+            const kinded = await p.listEndpointOffers({ kind });
+            expect(kinded.map((o) => o.id).sort()).toEqual(offers.filter((o) => (o.gpuCount > 0) === (kind === 'gpu')).map((o) => o.id).sort());
+            // Not the cheapest, which createEndpoint picks when given no offer: the endpoint runs on the one it was given.
+            const offer = kinded[kinded.length - 1];
+            expect(offer.id).not.toBe(offers[0].id);
             const e = await p.createEndpoint({ name: 'contract-endpoint', container: { image: 'traefik/whoami:v1.12.0', env: { MODE: 'probe' } }, offer, ...fast });
-            expect(e).toMatchObject({ provider: p.id, name: 'contract-endpoint', status: 'ready', image: 'traefik/whoami:v1.12.0', port: 80, minWorkers: 0, maxWorkers: 1 });
+            expect(e).toMatchObject({ provider: p.id, name: 'contract-endpoint', status: 'ready', image: 'traefik/whoami:v1.12.0', port: 80, minWorkers: 0, maxWorkers: 1, offerId: offer.id });
             expect(e.url).toMatch(/^https:\/\/[^/]+$/);
             expect((await p.requestEndpoint(e, '/hello', { intervalMs: 0 })).status).toBe(200);
             expect((await p.getEndpoint(e.id))?.id).toBe(e.id);

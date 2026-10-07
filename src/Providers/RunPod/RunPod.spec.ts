@@ -473,8 +473,11 @@ describe('RunPod serverless: load-balancing endpoints (plain HTTP workers, no Ru
         expect(offers.find((o) => o.id === 'NVIDIA RTX A4000')).toMatchObject({ gpuCount: 1, pricePerHour: 0.58, gpu: 'RTX A4000', regions: ['US-TX-3'] });
         expect(offers.find((o) => o.id === 'cpu3c:2')).toMatchObject({ gpuCount: 0, vcpus: 2, pricePerHour: 0.04, regions: ['US-TX-3'] });
         expect(offers.some((o) => o.id.endsWith(':1'))).toBe(false);
-        expect((await p.listEndpointOffers({ kind: 'cpu' })).every((o) => o.gpuCount === 0)).toBe(true);
-        expect((await p.listEndpointOffers({ kind: 'gpu' })).every((o) => o.gpuCount === 1)).toBe(true);
+        // Each kind lists exactly its offers: the CPU flavors, without GPUs, and the GPU types, with one each.
+        const ids = async (kind: 'cpu' | 'gpu') => (await p.listEndpointOffers({ kind })).map((o) => o.id).sort();
+        expect(offers.every((o) => o.gpuCount === 0 || o.gpuCount === 1)).toBe(true);
+        expect(await ids('cpu')).toEqual(offers.filter((o) => o.gpuCount === 0).map((o) => o.id).sort());
+        expect(await ids('gpu')).toEqual(offers.filter((o) => o.gpuCount === 1).map((o) => o.id).sort());
         expect((await p.listEndpointOffers({ includeUnavailable: true })).map((o) => o.id)).toContain('NVIDIA L4');
     });
 
