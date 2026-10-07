@@ -30,21 +30,25 @@ export { SSHService } from './Core/SSHService';
 // DigitalOcean: Droplets, with GPUs or without
 export { DigitalOcean, DIGITALOCEAN_CAPABILITIES } from './Providers/DigitalOcean/DigitalOcean';
 export { DigitalOceanApi } from './Providers/DigitalOcean/api';
+export { DIGITALOCEAN_ENDPOINTS } from './Providers/DigitalOcean/endpoints';
 export * from './Providers/DigitalOcean/types';
 
 // RunPod: GPU pods
 export { RunPod, RUNPOD_CAPABILITIES } from './Providers/RunPod/RunPod';
 export { RunPodApi } from './Providers/RunPod/api';
+export { RUNPOD_ENDPOINTS } from './Providers/RunPod/endpoints';
 export * from './Providers/RunPod/types';
 
 // Vast.ai: a GPU marketplace
 export { VastAI, VAST_CAPABILITIES } from './Providers/VastAI/VastAI';
 export { VastApi } from './Providers/VastAI/api';
+export { VAST_ENDPOINTS } from './Providers/VastAI/endpoints';
 export * from './Providers/VastAI/types';
 
 // Lambda Cloud: GPU VMs
 export { LambdaCloud, LAMBDA_CAPABILITIES } from './Providers/LambdaCloud/LambdaCloud';
 export { LambdaApi } from './Providers/LambdaCloud/api';
+export { LAMBDA_ENDPOINTS } from './Providers/LambdaCloud/endpoints';
 export * from './Providers/LambdaCloud/types';
 
 // Scaleway: Instances, with GPUs or without; the API client, its endpoint table and its id helpers
@@ -71,6 +75,7 @@ export {
     cudaVersion,
     decrypt,
     encrypt,
+    endpointOf,
     estimateCost,
     estimateServerCost,
     filterOffers,
@@ -92,4 +97,4 @@ export {
     VM_CONTAINER_NAME,
     withUserData,
 } from './Core/utils';
-export type { FetchImpl, GpuModel, HttpResult, ImageRef, Manifest, ParsedSSHPublicKey, RequestInfo, RequestOptions, Sleep } from './Core/utils';
+export type { ApiEndpoint, FetchImpl, GpuModel, HttpMethod, HttpResult, ImageRef, Manifest, ParsedSSHPublicKey, RequestInfo, RequestOptions, Sleep } from './Core/utils';

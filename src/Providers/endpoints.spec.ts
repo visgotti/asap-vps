@@ -11,6 +11,7 @@ import type { ApiEndpoint } from '../Core/utils';
 import { DIGITALOCEAN_ENDPOINTS } from './DigitalOcean/endpoints';
 import { LAMBDA_ENDPOINTS } from './LambdaCloud/endpoints';
 import { RUNPOD_ENDPOINTS } from './RunPod/endpoints';
+import { VAST_ENDPOINTS } from './VastAI/endpoints';
 
 const TABLES: Array<{ name: string, table: Readonly<Record<string, ApiEndpoint>>, docs: RegExp, operationId: RegExp }> = [
     {
@@ -19,6 +20,11 @@ const TABLES: Array<{ name: string, table: Readonly<Record<string, ApiEndpoint>>
     },
     { name: 'runpod', table: RUNPOD_ENDPOINTS, docs: /^https:\/\/docs\.runpod\.io\/api-reference-v2\/[a-z0-9-]+\/[a-z0-9-]+$/, operationId: /^[a-z][A-Za-z]+$/ },
     { name: 'lambda', table: LAMBDA_ENDPOINTS, docs: /^https:\/\/docs\.lambda\.ai\/api\/cloud#[a-z][A-Za-z]+$/, operationId: /^[a-z][A-Za-z]+$/ },
+    // A call the spec does not have is documented by the CLI that makes it.
+    {
+        name: 'vast', table: VAST_ENDPOINTS,
+        docs: /^(https:\/\/docs\.vast\.ai\/api-reference\/[a-z0-9-]+\/[a-z0-9-]+|https:\/\/github\.com\/vast-ai\/vast-cli\/blob\/master\/vast\.py)$/, operationId: /^[a-z][A-Za-z]+$/,
+    },
 ];
 
 describe.each(TABLES)('$name endpoint table', ({ table, docs, operationId }) => {

@@ -4,11 +4,13 @@
 
 import { ApiClient, errorText, HttpResult, RequestInfo } from '../../Core/utils';
 import { AuthError, CapacityError, NotFoundError, ProviderError, QuotaError } from '../../errors';
+import { VAST_ENDPOINTS } from './endpoints';
 import { VAST_ID } from './mappers';
 import type { VastAIParams } from './types';
 
 export class VastApi extends ApiClient {
     static readonly BASE_URL = 'https://console.vast.ai';
+    protected readonly endpoints = VAST_ENDPOINTS;
 
     constructor(params: VastAIParams | string) {
         super(params, VastApi.BASE_URL, VAST_ID);

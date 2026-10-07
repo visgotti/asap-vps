@@ -26,6 +26,7 @@ import type { ApiEndpoint } from '../src/Core/utils';
 import { DIGITALOCEAN_ENDPOINTS } from '../src/Providers/DigitalOcean/endpoints';
 import { LAMBDA_ENDPOINTS } from '../src/Providers/LambdaCloud/endpoints';
 import { RUNPOD_ENDPOINTS } from '../src/Providers/RunPod/endpoints';
+import { VAST_ENDPOINTS } from '../src/Providers/VastAI/endpoints';
 
 type Op = { method: string, path: string, operationId?: string, summary?: string, tags: string[], query: Set<string> };
 type Platform = {
@@ -33,6 +34,8 @@ type Platform = {
     spec: string,
     file: string,
     table: Readonly<Record<string, ApiEndpoint>>,
+    /** false: a path's trailing slash is not significant to the platform (it documents both), so it is not compared. */
+    trailingSlash?: false,
     /** The reference URL the platform gives an operation; undefined where its scheme cannot name it. */
     docs(op: Op): string | undefined,
     /** Whether the reference page at `url` documents `op` (its text read once per page). */
@@ -75,7 +78,25 @@ const PLATFORMS: Record<string, Platform> = {
             return !!text && !!anchor && text.includes(`"#${anchor}"`) && (!op?.operationId || anchor === op.operationId);
         },
     },
+    vast: {
+        // The spec the reference is built from (Vast's openapi.json differs from it only by trailing slashes, and has fewer paths).
+        spec: 'https://docs.vast.ai/api-reference/openapi.yaml',
+        file: 'vast.yaml',
+        table: VAST_ENDPOINTS,
+        trailingSlash: false,
+        // A page per operation: <tag>/<summary>, its markdown at .md.
+        docs: (op) => (op.tags[0] && op.summary ? `https://docs.vast.ai/api-reference/${slug(op.tags[0])}/${slug(op.summary)}` : undefined),
+        documents: mintlifyPage,
+    },
 };
+
+/** A page (a GitHub file read raw) that has the path's last fixed segment: what documents a call the spec does not have. */
+async function sourceHas(url: string, apiPath: string, page: (u: string) => Promise<string | undefined>): Promise<boolean> {
+    const raw = url.replace(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/blob\//, 'https://raw.githubusercontent.com/$1/');
+    const text = await page(raw.split('#')[0]);
+    const fixed = apiPath.split('/').filter((s) => s && !s.startsWith('{')).pop();
+    return !!text && !!fixed && text.includes(fixed);
+}
 
 /** A Mintlify reference page: its markdown (at .md) names the operation's method and path. */
 async function mintlifyPage(url: string, op: Op | undefined, page: (u: string) => Promise<string | undefined>): Promise<boolean> {
@@ -119,10 +140,12 @@ function operations(spec: any): Op[] {
     return out;
 }
 
-/** A path with its placeholders unnamed: '/v2/droplets/{}'. */
-const shape = (p: string) => p.replace(/\{[^}]+\}/g, '{}');
-
 async function check(name: string, p: Platform, dir: string | undefined, readDocs: boolean): Promise<string[]> {
+    /** A path with its placeholders unnamed ('/v2/droplets/{}'), and no trailing slash where that is not significant. */
+    const shape = (x: string) => {
+        const unnamed = x.replace(/\{[^}]+\}/g, '{}');
+        return p.trailingSlash === false ? unnamed.replace(/\/$/, '') : unnamed;
+    };
     const failures: string[] = [];
     const spec = await load(p, dir);
     const ops = operations(spec);
@@ -160,7 +183,8 @@ async function check(name: string, p: Platform, dir: string | undefined, readDoc
             const want = p.docs(op);
             if (want && e.docs !== want) fail(`docs ${e.docs}: the reference gives it ${want}`);
         }
-        if (readDocs && !await p.documents(e.docs, op, page)) fail(`docs ${e.docs} does not document it (the page is missing, or does not have it)`);
+        const documented = op ? await p.documents(e.docs, op, page) : await sourceHas(e.docs, e.path, page);
+        if (readDocs && !documented) fail(`docs ${e.docs} does not document it (the page is missing, or does not have it)`);
     }
     return failures;
 }
