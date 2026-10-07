@@ -106,7 +106,7 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         // Vast authorizes every account key on its ssh-runtype images; pass
         // providerOptions { runtype: 'ssh' } for that instead of sshKeyIds.
         this.rejectOptions(o, VAST_REFUSED);
-        // The offer is one machine: its GPUs are fixed, and its place is where it is (no region to pick).
+        // The offer is one machine: its GPUs are fixed, and its place is where it is (a region asked for must be one of its).
         const resolved = this.resolveOffer(o);
         this.checkFixedGpuCount(o, resolved.offer?.gpuCount);
         // The container: `container`, or the top-level image, env, command, ports and registryAuth.
@@ -131,8 +131,11 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         const bid = offer[2] !== undefined ? Number(offer[2]) : undefined;
         const [mount, ...more] = this.mountsOf(o.mounts);
         if (more.length) throw new NotSupportedError(this.id, 'createServer option "mounts" with more than one volume (an instance mounts one)');
-        // The machine's ask, read where something needs it: its driver, or the machine a volume must be on.
-        const ask = o.minCudaVersion !== undefined || (mount && resolved.offer?.raw.machine_id === undefined) ? await this.askOf(Number(offer[1]), bid !== undefined) : undefined;
+        // The machine's ask, read where something needs it: its driver, its place (a region asked of an offer given by id), or the machine a volume must be on.
+        const asked = o.region !== undefined ? this.regionName(o.region) : undefined;
+        const ask = o.minCudaVersion !== undefined || (asked !== undefined && !resolved.offer) || (mount && resolved.offer?.raw.machine_id === undefined)
+            ? await this.askOf(Number(offer[1]), bid !== undefined) : undefined;
+        if (asked !== undefined) this.checkRegion(resolved.id, (resolved.offer ?? toOffer(ask!, bid !== undefined)).regions, asked);
         if (o.minCudaVersion !== undefined) this.checkCuda(ask!, cudaVersion(o.minCudaVersion));
         const volumeInfo = mount ? await this.volumeInfo(mount, resolved.offer?.raw.machine_id ?? ask!.machine_id, resolved.id) : undefined;
         const body = await this.api.call<{ new_contract: number }>('PUT', `/api/v0/asks/${offer[1]}/`, {
@@ -488,6 +491,17 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         const a = (found?.offers ?? []).find((x) => x.id === askId || x.ask_contract_id === askId);
         if (!a) throw new CapacityError(this.id, `offer ${askId} is no longer offered`);
         return a;
+    }
+
+    /**
+     * A region asked for must be the offer's (its location, or its machine): a
+     * Vast offer is one machine, and renting it would place the instance where
+     * it is, not where it was asked to be. An offer with no stock anywhere is
+     * a CapacityError, as no stock is on every provider.
+     */
+    private checkRegion(offerId: string, regions: string[], asked: string): void {
+        if (!regions.length) throw new CapacityError(this.id, `offer ${offerId} has no stock anywhere right now`);
+        if (!regions.includes(asked)) throw new ProviderError(this.id, `offer ${offerId} is in ${regions.join(', ')}, not in ${asked}: a Vast offer is one machine, rented where it is`);
     }
 
     /** CapacityError when the machine's driver is older than `want`. */

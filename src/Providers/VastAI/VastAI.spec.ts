@@ -493,3 +493,41 @@ describe('Vast images: snapshots an instance pushes to a registry of yours (obse
         expect(last(rentals(fake))?.image_login).toBeUndefined();
     });
 });
+
+describe('Vast regions: an offer is one machine, rented where it is', () => {
+    const make = () => {
+        const fake = fakeVast();
+        return { fake, p: new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
+    };
+    const IMAGE = { image: 'nvidia/cuda:12.8.1-base-ubuntu24.04', command: ['nvidia-smi', '-L'] };
+    const rentals = (fake: ReturnType<typeof fakeVast>) => fake.calls.filter((c) => c.method === 'PUT' && /^\/api\/v0\/asks\/\d+\/$/.test(c.path));
+
+    it('a region that is the offer\'s (its location, or its machine) rents it; an offer given by its id is looked up first', async () => {
+        const { p, fake } = make();
+        const [offer] = await p.listOffers({ kind: 'gpu' });
+        expect(offer.regions).toEqual(['Ohio, US', 'machine:14']);
+        await p.createServer({ name: 'by-location', offer, region: 'Ohio, US', ...IMAGE });
+        fake.state.asks.find((a) => a.id === 104)!.rentable = true;
+        await p.createServer({ name: 'by-machine', offer, region: 'machine:14', ...IMAGE });
+        fake.state.asks.find((a) => a.id === 104)!.rentable = true;
+        const lookups = () => fake.calls.filter((c) => c.method === 'POST' && c.path === '/api/v0/bundles/' && c.body?.ask_contract_id).length;
+        const before = lookups();
+        await p.createServer({ name: 'by-id', offer: '104', region: 'machine:14', ...IMAGE });
+        expect([lookups() - before, rentals(fake).length]).toEqual([1, 3]);
+        // No region asked: no lookup, and rented where it is, as before.
+        await p.createServer({ name: 'anywhere', offer: '101', ...IMAGE });
+        expect([lookups() - before, rentals(fake).length]).toEqual([1, 4]);
+    });
+
+    it('a region that is not the offer\'s is refused before anything is rented; an offer with no stock anywhere is a CapacityError', async () => {
+        const { p, fake } = make();
+        const [offer] = await p.listOffers({ kind: 'gpu' });
+        await expect(p.createServer({ name: 'x', offer, region: 'Texas, US', ...IMAGE })).rejects.toThrow('offer 104 is in Ohio, US, machine:14, not in Texas, US: a Vast offer is one machine, rented where it is');
+        await expect(p.createServer({ name: 'x', offer: '104', region: 'machine:11', ...IMAGE })).rejects.toThrow(/offer 104 is in Ohio, US, machine:14, not in machine:11/);
+        // The 4090 in Sweden is rented out: no stock anywhere, whatever is asked.
+        const taken = (await p.listOffers({ kind: 'gpu', includeUnavailable: true })).find((o) => o.id === '103')!;
+        await expect(p.createServer({ name: 'x', offer: taken, region: 'Sweden, SE', ...IMAGE })).rejects.toBeInstanceOf(CapacityError);
+        await expect(p.createServer({ name: 'x', offer: '103', region: 'Sweden, SE', ...IMAGE })).rejects.toThrow(/offer 103 has no stock anywhere right now/);
+        expect(rentals(fake)).toEqual([]);
+    });
+});

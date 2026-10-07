@@ -348,6 +348,7 @@ These are the behaviours that shape the primitives, checked against each provide
   - Its name may hold only letters, digits and underscores (at most 64; anything else is a 422).
   - It lives until it is deleted, or until its host's listing ends (`raw.end_date`).
   - An instance mounts one volume, set when it is rented, so a volume on another machine, or one another instance holds, is refused before anything is rented.
+  - An offer is one machine, rented where it is: a `region` asked for must be one of the offer's (its location, or its `machine:<id>`), and another is refused before anything is rented.
   - Vast's single read of an instance does not show the volume it mounts, but its instance list does. So `getServer` reads the instance from that list, and its `mounts` give each volume's path.
   - A deleted instance keeps its volume `in-use` for about 30 s (observed), and `deleteServerAndWait` waits for it to be let go.
   - Vast withdrew its network volumes in July 2026: `listVolumes` leaves them out.
