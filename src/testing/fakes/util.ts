@@ -106,3 +106,24 @@ export function echoed(command: unknown, env: Record<string, unknown> = {}): str
 export function testPublicKey(comment = 'test@asap-vps'): string {
     return toOpenSSHPublicKey(generateKeyPairSync('ed25519').publicKey, comment);
 }
+
+/**
+ * A fetch that follows redirects as the real one does unless asked not to
+ * (`redirect: 'manual'`): the same request to the Location, its headers with
+ * it (only Authorization and cookies are left behind across origins). What a
+ * test that a key never leaves its host runs against.
+ */
+export function followingRedirects(inner: typeof fetch): typeof fetch {
+    return (async (url: string | URL | Request, init?: RequestInit) => {
+        let target = String(url);
+        let r = await inner(target, init);
+        for (let hops = 0; init?.redirect !== 'manual' && r.status >= 300 && r.status < 400 && r.headers.get('location') && hops < 5; hops++) {
+            const next = new URL(r.headers.get('location')!, target);
+            const headers = Object.fromEntries(new Headers(init?.headers).entries());
+            if (next.origin !== new URL(target).origin) for (const h of ['authorization', 'cookie', 'proxy-authorization']) delete headers[h];
+            target = next.toString();
+            r = await inner(target, { ...init, headers });
+        }
+        return r;
+    }) as typeof fetch;
+}

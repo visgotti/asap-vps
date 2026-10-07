@@ -11,7 +11,7 @@
 import { REGION_TYPES } from '../../constants';
 import { AuthError, CapacityError, NotFoundError, NotSupportedError, ProviderError } from '../../errors';
 import { fakeRunPod } from '../../testing/fakes/runpod';
-import { testPublicKey } from '../../testing/fakes/util';
+import { followingRedirects, testPublicKey } from '../../testing/fakes/util';
 import { runPodGpuName, sseLogLines } from './mappers';
 import { RunPod } from './RunPod';
 
@@ -725,6 +725,26 @@ describe('RunPod serverless: load-balancing endpoints (plain HTTP workers, no Ru
         expect(fake.calls.some((c) => c.host === 'evil.example.com')).toBe(false);
         await expect(p.requestEndpoint('../x', '/api')).rejects.toThrow(/bad endpoint id/);
         await expect(p.requestEndpoint({ ...e, provider: 'scaleway' }, '/api')).rejects.toThrow(/scaleway's, not runpod's/);
+    });
+
+    it('a redirect from the workers is answered, never followed: nothing of the request goes where it points', async () => {
+        const fake = fakeRunPod({ coldRequests: 0 });
+        const elsewhere: string[] = [];
+        let redirecting = '';
+        const p = new RunPod({ apiKey: 'rp-test', sleep: noSleep, fetchImpl: followingRedirects((async (url: string | URL | Request, init?: RequestInit) => {
+            const host = new URL(String(url)).host;
+            if (host === redirecting) return new Response(null, { status: 307, headers: { location: 'https://evil.example.com/steal' } });
+            if (host === 'evil.example.com') {
+                elsewhere.push(`${init?.method ?? 'GET'} ${String(url)}`);
+                return new Response('thanks', { status: 200 });
+            }
+            return fake.fetchImpl(url, init);
+        }) as typeof fetch) });
+        const e = await p.createEndpoint({ name: 'whoami', container: WHOAMI, offer: 'cpu3c:2' });
+        redirecting = `${e.id}.api.runpod.ai`;
+        const r = await p.requestEndpoint(e, '/api', { method: 'POST', body: '{"prompt":"secret"}', intervalMs: 0 });
+        expect([r.status, r.headers.get('location')]).toEqual([307, 'https://evil.example.com/steal']);
+        expect(elsewhere).toEqual([]);
     });
 
     it('a cold start that outlasts the wait returns RunPod\'s answer; a body that is a stream is sent once', async () => {

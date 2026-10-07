@@ -562,7 +562,8 @@ export type CreateEndpointOptions<T extends PlatformTypes = PlatformTypes> = {
 } & WaitOptions;
 
 /** What requestEndpoint takes besides fetch's own: how long to wait out a cold start. */
-export type EndpointRequestInit = RequestInit & WaitOptions;
+/** What requestEndpoint sends, and how long it waits out a cold start. A redirect is never followed (its answer is returned), so `redirect` is not one of them. */
+export type EndpointRequestInit = Omit<RequestInit, 'redirect'> & WaitOptions;
 
 // ── volumes ──────────────────────────────────────────────────────────────
 

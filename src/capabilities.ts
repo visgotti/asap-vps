@@ -141,8 +141,9 @@ export interface IServerless<T extends PlatformTypes = PlatformTypes> {
     deleteEndpoint(id: string, o?: WaitOptions): Promise<void>;
     /**
      * A request to `path` under its URL, with the auth it takes (sent to the
-     * platform's own host only). A cold start is waited out: while no worker
-     * answers yet, the request is sent again, until `timeoutMs` (default 5 min).
+     * platform's own host only: a redirect is not followed, its answer is
+     * returned). A cold start is waited out: while no worker answers yet, the
+     * request is sent again, until `timeoutMs` (default 5 min).
      */
     requestEndpoint(endpoint: Endpoint | string, path: string, init?: EndpointRequestInit): Promise<Response>;
 }

@@ -13,7 +13,7 @@ import { sshKeyFingerprint } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
 import { FAKE_SCALEWAY_PROJECT, fakeScaleway, FakeScalewayOptions } from '../../testing/fakes/scaleway';
 import { SERVER_TYPES } from '../../testing/fakes/scalewayCatalog';
-import { json, testPublicKey } from '../../testing/fakes/util';
+import { followingRedirects, json, testPublicKey } from '../../testing/fakes/util';
 import type { Offer } from '../../types';
 import { fileSystemMounts, MOUNT_TAG, mountedVolumeIds, toVolume } from './mappers';
 import { REGION_TYPES } from '../../constants';
@@ -1202,6 +1202,31 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         await expect(p.requestEndpoint(e, '/')).rejects.toThrow(/answers on evil\.example\.com, not on a Scaleway host/);
         await expect(p.requestEndpoint('fr-par/00000000-0000-4000-8000-0000000000ff', '/')).rejects.toBeInstanceOf(NotFoundError);
         await expect(p.requestEndpoint({ ...e, provider: 'runpod' }, '/')).rejects.toThrow(/runpod's, not scaleway's/);
+    });
+
+    it('a redirect from a private container is answered, never followed: the key does not reach the host it points to', async () => {
+        const fake = fakeScaleway();
+        const sent: Array<{ host: string, key: string | undefined }> = [];
+        let redirecting = '';
+        // The network as fetch sees it: the container redirects elsewhere, and fetch follows unless told not to.
+        const fetchImpl = followingRedirects((async (url: string | URL | Request, init?: RequestInit) => {
+            const host = new URL(String(url)).host;
+            if (host === redirecting) return new Response(null, { status: 302, headers: { location: 'https://evil.example.com/steal' } });
+            if (host === 'evil.example.com') {
+                sent.push({ host, key: new Headers(init?.headers).get('x-auth-token') ?? undefined });
+                return new Response('thanks', { status: 200 });
+            }
+            return fake.fetchImpl(url, init);
+        }) as typeof fetch);
+        const p = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl, sleep: noSleep });
+        const e = await p.createEndpoint({ name: 'whoami', container: WHOAMI, ...fast });
+        redirecting = new URL(e.url).host;
+        const r = await p.requestEndpoint(e, '/api', { intervalMs: 0 });
+        expect([r.status, r.headers.get('location')]).toEqual([302, 'https://evil.example.com/steal']);
+        expect(sent).toEqual([]);
+        // What the helper stands for: fetch, left to follow, would have sent the key on.
+        await fetchImpl(`https://${redirecting}/api`, { headers: { 'x-auth-token': 'scw-test' } });
+        expect(sent).toEqual([{ host: 'evil.example.com', key: 'scw-test' }]);
     });
 
     it('deleted: the container, then the namespace made for it, both waited until gone; a namespace of the caller\'s own stays; deleting again is no error', async () => {

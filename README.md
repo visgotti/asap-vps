@@ -149,7 +149,7 @@ const r = await runpod.requestEndpoint(e, "/api");                       // the 
 await runpod.deleteEndpoint(e.id);                                         // its workers stop with it
 ```
 
-- `requestEndpoint` sends the account's key only to the platform's own host: RunPod's URL is made from the endpoint's id, Scaleway's read from the platform and held to `*.scw.cloud`. It waits out a cold start (no worker up yet, a fresh host name that does not resolve yet) up to `timeoutMs` (default 5 min).
+- `requestEndpoint` sends the account's key only to the platform's own host: RunPod's URL is made from the endpoint's id, Scaleway's read from the platform and held to `*.scw.cloud`. A redirect is not followed: its answer is returned, as fetch would otherwise send the key on to wherever it points. It waits out a cold start (no worker up yet, a fresh host name that does not resolve yet) up to `timeoutMs` (default 5 min).
 - **RunPod**: load-balancing endpoints (`https://<id>.api.runpod.ai`), on a GPU type of a serverless pool (the offer's type, the pool's others left out) or a CPU flavor at 2 or more vCPUs. A private image's login is stored as for pods. A worker answers the health check (`/ping`) on `PORT`. Seen live: an idle endpoint kept its worker (IDLE) for 15 minutes after its last request despite an `idleTimeoutSeconds` of 5; `deleteEndpoint` (which scales to no worker first) is what stops it.
 - **Scaleway**: Serverless Containers (CPU only), private (the key goes as `X-Auth-Token`), each in a namespace made for it and deleted with it. A public image from any registry, or one of the Project's own registry (no other login); an idle instance stops after 15 minutes.
 

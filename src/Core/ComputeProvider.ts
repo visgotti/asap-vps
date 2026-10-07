@@ -249,7 +249,9 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
         for (;;) {
             let r: Response;
             try {
-                r = await send(url, { ...req, headers });
+                // A redirect is answered, never followed: fetch would send the auth on to wherever it points
+                // (it strips only Authorization and cookies across origins, not a key in a header of the platform's own).
+                r = await send(url, { ...req, headers, redirect: 'manual' });
             } catch (e) {
                 if (once || Date.now() >= end) throw e;
                 await this.api.sleep(intervalMs);
