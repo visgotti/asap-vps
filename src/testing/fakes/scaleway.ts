@@ -460,12 +460,19 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
             calls.push({ method: (init?.method ?? 'GET').toUpperCase(), host, path: new URL(String(url)).pathname, body: undefined, auth: undefined, headers: {} });
             return state.s3[s3[1]]?.fetchImpl(url, init) ?? json(404, { message: `no Object Storage in ${s3[1]}` });
         }
-        // A file anyone can download (an image's QCOW2): a small one whose first bytes say QCOW2 ("corrupt" in its name: they do not).
+        // A file anyone can download (an image's QCOW2): a small one whose first bytes say QCOW2 ("corrupt" in its name: they do not;
+        // "big": 20 MiB). Its server serves ranges of it where its name says "ranged" (HEAD: accept-ranges; GET range: 206).
         if (!/scw\.cloud$|scaleway\.com$/.test(host)) {
-            calls.push({ method: (init?.method ?? 'GET').toUpperCase(), host, path: new URL(String(url)).pathname, body: undefined, auth: undefined, headers: {} });
+            const method = (init?.method ?? 'GET').toUpperCase();
+            const range = new Headers(init?.headers).get('range') ?? undefined;
+            calls.push({ method, host, path: new URL(String(url)).pathname, body: undefined, auth: undefined, headers: range ? { range } : {} });
             if (/missing/.test(String(url))) return new Response('not found', { status: 404, statusText: 'Not Found' });
-            const bytes = Buffer.alloc(4096, 1);
+            const bytes = Buffer.alloc(/big/.test(String(url)) ? 20 * 1024 * 1024 : 4096, 1);
             if (!/corrupt/.test(String(url))) bytes.write('QFI\xfb', 0, 'latin1');
+            const ranged = /ranged/.test(String(url));
+            if (method === 'HEAD') return new Response(null, { status: 200, headers: { 'content-length': String(bytes.length), ...(ranged ? { 'accept-ranges': 'bytes' } : {}) } });
+            const m = ranged ? /^bytes=(\d+)-(\d+)$/.exec(range ?? '') : null;
+            if (m) return new Response(bytes.subarray(Number(m[1]), Number(m[2]) + 1), { status: 206, headers: { 'content-range': `bytes ${m[1]}-${m[2]}/${bytes.length}` } });
             return new Response(bytes, { status: 200, headers: { 'content-length': String(bytes.length) } });
         }
         const request = readRequest(calls, url, init);

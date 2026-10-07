@@ -729,6 +729,38 @@ describe('Scaleway images', () => {
         expect((await p.copyImage(image.id, ['pl-waw-3'])).regions).toEqual(['pl-waw-2', 'pl-waw-3']);
     });
 
+    it('a copy to another region moves the export by its ranges into that region\'s bucket (no file staged here); an export gone before it moves is thrown, its buckets deleted', async () => {
+        const { fake, p, s: server } = await stopped({}, { accessKey: 'SCWFAKEACCESSKEY0000' });
+        const image = await p.createImage(server.id, { name: 'copy', ...fast });
+        await p.copyImage(image.id, ['fr-par-2'], fast);
+        const read = fake.state.s3['pl-waw'].calls.filter((c) => c.method === 'GET' && /\.qcow2$/.test(c.path));
+        expect(read.length).toBeGreaterThan(0);
+        expect(read.every((c) => /^bytes=\d+-\d+$/.test(c.range ?? ''))).toBe(true);
+        // Each part read whole first, then sent signed with its hash.
+        expect(fake.state.s3['fr-par'].calls.some((c) => c.method === 'PUT' && /\.qcow2$/.test(c.path) && /^[0-9a-f]{64}$/.test(c.payloadHash))).toBe(true);
+        // The export is there for the wait, and gone by the time it is to move.
+        const fake2 = fakeScaleway();
+        const seen = new Set<string>();
+        const q = new Scaleway({
+            apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, accessKey: 'SCWFAKEACCESSKEY0000', sleep: noSleep,
+            fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+                const u = new URL(String(url));
+                const r = await fake2.fetchImpl(url, init);
+                if (u.host === 's3.pl-waw.scw.cloud' && init?.method === 'HEAD' && /\.qcow2$/.test(u.pathname) && r.status === 200 && !seen.has(u.pathname)) {
+                    seen.add(u.pathname);
+                    const [, bucket, key] = u.pathname.split('/');
+                    fake2.state.s3['pl-waw'].buckets.get(bucket)!.delete(key);
+                }
+                return r;
+            }) as typeof fetch,
+        });
+        const s2 = await running(q);
+        await q.stopServer(s2.id);
+        const other = await q.createImage(s2.id, { name: 'gone', ...fast });
+        await expect(q.copyImage(other.id, ['fr-par-2'], fast)).rejects.toThrow(/the export asap-vps-tmp-[0-9a-f]+\/[0-9a-f-]+\.qcow2 went before it was copied to fr-par/);
+        expect(Object.values(fake2.state.s3).every((x) => x.buckets.size === 0)).toBe(true);
+    });
+
     it('an image prepared on a CPU machine boots on a GPU in the same zone', async () => {
         const { p } = make();
         const prep = await p.createServer({ name: 'prep', offer: 'DEV1-S', region: 'pl-waw-2' });
@@ -1454,7 +1486,7 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
     const blockCalls = (fake: Fake) => fake.calls.filter((c) => /import-from-object-storage|\/images$|s3\./.test(`${c.host}${c.path}`) && c.method !== 'GET')
         .map((c) => `${c.method} ${c.host?.startsWith('s3.') ? `s3 ${c.path.replace(/asap-vps-tmp-[0-9a-f]+/, '<bucket>')}` : c.path.replace(/[0-9a-f-]{36}/g, '<id>')}`);
 
-    it('downloads the file, puts it in a bucket made for it (streamed, its MD5 checked), imports it, images it, and deletes the bucket', async () => {
+    it('downloads the file (its server serves no ranges), puts it in a bucket made for it (streamed, its MD5 checked), imports it, images it, and deletes the bucket', async () => {
         const { fake, p } = withKey();
         const image = await p.importImage({ name: 'noble-min', url: URL_OK, region: 'fr-par-2', providerOptions: { tags: ['imported'] }, ...fast });
         expect(blockCalls(fake)).toEqual([
@@ -1463,6 +1495,8 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
         ]);
         const put = fake.state.s3['fr-par'].calls.find((c) => c.method === 'PUT' && c.path.endsWith('/image.qcow2'))!;
         expect([put.payloadHash, put.duplex]).toEqual(['UNSIGNED-PAYLOAD', 'half']);
+        // Asked for its size and ranges first (it has none), then downloaded whole.
+        expect(fake.calls.filter((c) => c.host === 'cloud-images.example.com').map((c) => c.method)).toEqual(['HEAD', 'GET']);
         expect(fake.state.s3['fr-par'].buckets.size).toBe(0);
         expect(image).toMatchObject({ provider: 'scaleway', name: 'noble-min', status: 'available', regions: ['fr-par-2'] });
         expect(image.raw).toMatchObject({ arch: 'x86_64', root_volume: { volume_type: 'sbs_snapshot' }, tags: ['imported'] });
@@ -1471,6 +1505,18 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
         // One of the account's images, booted like any other.
         const s = await p.createServer({ name: 'from-import', offer: 'DEV1-S', region: 'fr-par-2', image: image.id });
         expect((await p.waitUntilRunning(s.id, fast)).status).toBe('running');
+    });
+
+    it('a file whose server serves ranges goes straight from it into the bucket, a range a part, several at a time: nothing downloaded here first', async () => {
+        const { fake, p } = withKey();
+        const image = await p.importImage({ name: 'big', url: 'https://cloud-images.example.com/ranged-big-noble.qcow2', region: 'fr-par-2', ...fast });
+        expect(image.status).toBe('available');
+        const file = fake.calls.filter((c) => c.host === 'cloud-images.example.com');
+        // 20 MiB in parts of 16 MiB: two ranges, no whole download.
+        expect(file.map((c) => `${c.method} ${c.headers?.range ?? ''}`.trim()).sort()).toEqual(['GET bytes=0-16777215', 'GET bytes=16777216-20971519', 'HEAD']);
+        const s3 = fake.state.s3['fr-par'].calls.map((c) => `${c.method} ${c.query.replace(/=[0-9a-f]{24}/, '=<id>')}`);
+        expect(s3).toEqual(expect.arrayContaining(['POST ?uploads=', 'PUT ?partNumber=1&uploadId=<id>', 'PUT ?partNumber=2&uploadId=<id>', 'POST ?uploadId=<id>']));
+        expect([fake.state.s3['fr-par'].buckets.size, fake.state.s3['fr-par'].uploads.size]).toEqual([0, 0]);
     });
 
     it('refuses before anything is made: no access key, a URL that is no file\'s', async () => {

@@ -23,7 +23,7 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider, ResolvedMount } from '../../Core/ComputeProvider';
 import { randomBytes } from 'crypto';
-import { filterOffers, findSSHKey, isKind, pickSSHKeys, S3Client, stageDownload } from '../../Core/utils';
+import { filterOffers, findSSHKey, isKind, pickSSHKeys, S3Client, stageDownload, urlSource } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError } from '../../errors';
 import type {
     CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, Server,
@@ -323,9 +323,11 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
 
     /**
      * An image from the QCOW2 at `url`, in a zone of this provider's
-     * (`region`): downloaded, put in a bucket made for it in the zone's region
-     * (Object Storage: needs `accessKey`), imported as a Block snapshot,
-     * imaged, the bucket deleted. It boots where it has UEFI boot and cloud-init
+     * (`region`): put in a bucket made for it in the zone's region (Object
+     * Storage: needs `accessKey`), imported as a Block snapshot, imaged, the
+     * bucket deleted. A server that serves ranges of the file has them streamed
+     * into the bucket's upload, several at a time, nothing kept here; any other
+     * is downloaded to a temporary file first. It boots where it has UEFI boot and cloud-init
      * (Scaleway boots no legacy BIOS). A file Scaleway cannot read is an error,
      * and leaves nothing behind. Default wait 1 h. Needs the Project.
      */
@@ -338,11 +340,15 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const bucket = `${TMP_BUCKET_PREFIX}${randomBytes(6).toString('hex')}`;
         await s3.createBucket(bucket);
         try {
-            const file = await stageDownload(o.url, this.api.fetchImpl);
-            try {
-                await s3.putFile(bucket, 'image.qcow2', file);
-            } finally {
-                await file.remove();
+            const source = await urlSource(o.url, this.api.fetchImpl);
+            if (source) await s3.upload(bucket, 'image.qcow2', source);
+            else {
+                const file = await stageDownload(o.url, this.api.fetchImpl);
+                try {
+                    await s3.putFile(bucket, 'image.qcow2', file);
+                } finally {
+                    await file.remove();
+                }
             }
             return await this.imageFromObject(zone, { bucket, key: 'image.qcow2', name: o.name, project }, wait, o.providerOptions);
         } finally {
@@ -363,7 +369,8 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
      * this provider's), and waits until each copy is available (default up to
      * 2 h): its root disk's snapshot exported as a QCOW2 to a bucket of its
      * region (Object Storage: needs `accessKey`), moved to a bucket of the
-     * other region where the zone is in another (through this machine), imported
+     * other region where the zone is in another (streamed through this machine,
+     * a range a part: nothing is kept here), imported
      * there as a Block snapshot, imaged; the buckets deleted. A copy is an image
      * of its zone (the same name, tagged COPY_TAG<source>): createServer boots it
      * for the source's id in that zone, and deleteImage deletes it with the
@@ -398,14 +405,12 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
                 const region = regionOfZone(zone);
                 let to = buckets.get(region);
                 if (!to) {
-                    // Another region: the QCOW2 goes there through this machine (Object Storage copies no object across regions).
+                    // Another region: Object Storage copies no object across regions, so the QCOW2 goes through this machine,
+                    // streamed a range a part (its time the slower of the download and the upload, not their sum; nothing kept here).
                     to = await bucketIn(region);
-                    const file = await from.s3.stageObject(from.bucket, key);
-                    try {
-                        await to.s3.putFile(to.bucket, key, file);
-                    } finally {
-                        await file.remove();
-                    }
+                    const source = await from.s3.objectSource(from.bucket, key);
+                    if (!source) throw new ProviderError(this.id, `the export ${from.bucket}/${key} went before it was copied to ${region}`);
+                    await to.s3.upload(to.bucket, key, source);
                 }
                 await this.imageFromObject(zone, { bucket: to.bucket, key, name: source.name, project }, wait, { arch: source.arch, tags: [copyTag(source.id)] });
                 have.add(zone);
