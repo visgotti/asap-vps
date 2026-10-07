@@ -5,11 +5,13 @@
 
 import { ApiClient, errorText, HttpResult, RequestInfo } from '../../Core/utils';
 import { AuthError, CapacityError, NotFoundError, nullIfNotFound, ProviderError, QuotaError } from '../../errors';
+import { RUNPOD_ENDPOINTS } from './endpoints';
 import { RUNPOD_ID } from './mappers';
 import type { RunPodNetworkVolume, RunPodParams, RunPodPod } from './types';
 
 export class RunPodApi extends ApiClient {
     static readonly BASE_URL = 'https://api.runpod.io';
+    protected readonly endpoints = RUNPOD_ENDPOINTS;
 
     constructor(params: RunPodParams | string) {
         super(params, RunPodApi.BASE_URL, RUNPOD_ID);
@@ -60,8 +62,10 @@ export class RunPodApi extends ApiClient {
         // The answer's headers get their own wait: the window is for the backfill, not for RunPod to answer.
         let timer = setTimeout(() => ctrl.abort(), 30_000);
         let text = '';
+        const path = `/v2/pods/${encodeURIComponent(id)}/logs?source=container&tail=${tail}`;
+        this.described('GET', path);
         try {
-            const res = await (this.fetchImpl ?? fetch)(`${this.baseUrl}/v2/pods/${encodeURIComponent(id)}/logs?source=container&tail=${tail}`, {
+            const res = await (this.fetchImpl ?? fetch)(`${this.baseUrl}${path}`, {
                 headers: { ...this.authHeaders(), accept: 'text/event-stream' },
                 signal: ctrl.signal,
             });

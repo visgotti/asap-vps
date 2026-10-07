@@ -24,6 +24,7 @@ import * as path from 'path';
 import * as yaml from 'js-yaml';
 import type { ApiEndpoint } from '../src/Core/utils';
 import { DIGITALOCEAN_ENDPOINTS } from '../src/Providers/DigitalOcean/endpoints';
+import { RUNPOD_ENDPOINTS } from '../src/Providers/RunPod/endpoints';
 
 type Op = { method: string, path: string, operationId?: string, summary?: string, tags: string[], query: Set<string> };
 type Platform = {
@@ -53,7 +54,21 @@ const PLATFORMS: Record<string, Platform> = {
             return !!text && (!anchor || text.includes(`(#${anchor})`)) && (!op?.operationId || anchor === op.operationId);
         },
     },
+    runpod: {
+        spec: 'https://api.runpod.io/v2/openapi.json',
+        file: 'runpod.json',
+        table: RUNPOD_ENDPOINTS,
+        // A page per operation: <tag>/<summary>, its markdown at .md (the operation's method and path in it).
+        docs: (op) => (op.tags[0] && op.summary ? `https://docs.runpod.io/api-reference-v2/${slug(op.tags[0])}/${slug(op.summary)}` : undefined),
+        documents: mintlifyPage,
+    },
 };
+
+/** A Mintlify reference page: its markdown (at .md) names the operation's method and path. */
+async function mintlifyPage(url: string, op: Op | undefined, page: (u: string) => Promise<string | undefined>): Promise<boolean> {
+    const text = await page(`${url}.md`);
+    return !!text && (!op || text.includes(`${op.method.toLowerCase()} ${op.path}`) || text.includes(`${op.method} ${op.path}`));
+}
 
 function load(p: Platform, dir: string | undefined): Promise<any> {
     const parse = (text: string, name: string) => (name.endsWith('.json') ? JSON.parse(text) : yaml.load(text));

@@ -155,9 +155,7 @@ export class ApiClient {
      */
     request(method: string, path: string, o: RequestOptions = {}): Promise<HttpResult> {
         if (!path.startsWith('/')) throw new Error(`"${path}" is not an API path of ${this.baseUrl}`);
-        if (this.endpoints && endpointOf(this.endpoints, method, path) === undefined) {
-            throw new Error(`${method} ${path} is no endpoint of ${this.id}'s table (its endpoints.ts): add it there, with its spec operation and reference page`);
-        }
+        this.described(method, path);
         return http(`${this.baseUrl}${path}`, {
             method,
             json: o.json,
@@ -167,6 +165,13 @@ export class ApiClient {
             fetchImpl: this.fetchImpl,
             sleep: this.sleep,
         });
+    }
+
+    /** Refuses a request no entry of the client's table describes, where it has a table: what a request it sends itself checks first too. */
+    protected described(method: string, path: string): void {
+        if (this.endpoints && endpointOf(this.endpoints, method, path) === undefined) {
+            throw new Error(`${method} ${path} is no endpoint of ${this.id}'s table (its endpoints.ts): add it there, with its spec operation and reference page`);
+        }
     }
 
     authHeaders(): Record<string, string> {
