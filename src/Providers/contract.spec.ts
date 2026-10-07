@@ -6,12 +6,12 @@
 // method its capabilities do not declare fails here, not on a rented GPU.
 
 import { CAPABILITY_METHODS, CapabilityName, requireCapability, supports } from '../capabilities';
-import { sshKeyFingerprint } from '../Core/utils';
+import { canonicalGpu, sshKeyFingerprint } from '../Core/utils';
 import { AuthError, CapacityError, NotSupportedError } from '../errors';
 import { testPublicKey } from '../testing/fakes/util';
 import { CONTRACT_SUBJECTS } from '../testing/subjects';
 import type { VolumeKindTraits } from '../capabilities';
-import type { ContainerSpec } from '../types';
+import type { ContainerSpec, Offer, OfferQuery } from '../types';
 import type { AnyProvider } from './registry';
 
 const fast = { intervalMs: 0, timeoutMs: 5000 };
@@ -49,19 +49,38 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         for (let i = 1; i < offers.length; i++) expect(offers[i - 1].pricePerHour).toBeLessThanOrEqual(offers[i].pricePerHour);
         const all = await provider.listOffers({ ...GPU, includeUnavailable: true });
         expect(all.length).toBeGreaterThan(offers.length);
+        // A model asap-vps knows goes by its one name (a MIG slice's: the name and its profile) and its maker, whatever the platform calls it.
+        for (const o of all) {
+            const known = canonicalGpu(o.gpu);
+            if (known) expect([o.id, o.gpu.replace(/ MIG \S+$/, ''), o.vendor]).toEqual([o.id, known.name, known.vendor]);
+        }
     });
 
-    it('offer filters mean the same on every provider', async () => {
+    it('offer filters mean the same on every provider: each keeps exactly the offers it should', async () => {
         const { provider } = subject.make();
         const all = await provider.listOffers({ ...GPU, includeUnavailable: true });
-        expect((await provider.listOffers({ minVramGb: 40, includeUnavailable: true })).every((o) => o.vramGb >= 40)).toBe(true);
-        const gpu = all[0].gpu;
-        const same = await provider.listOffers({ gpus: [gpu], includeUnavailable: true });
-        expect(same.length).toBeGreaterThan(0);
-        expect(same.every((o) => o.gpu === gpu)).toBe(true);
-        const price = all[0].pricePerHour;
-        expect((await provider.listOffers({ maxPricePerHour: price, includeUnavailable: true })).every((o) => o.pricePerHour <= price)).toBe(true);
-        expect((await provider.listOffers({ vendor: 'amd', includeUnavailable: true })).every((o) => o.vendor === 'amd')).toBe(true);
+        const ids = (offers: Offer[]) => offers.map((o) => o.id).sort();
+        /** The query lists exactly the offers of `all` that `keep` keeps. */
+        const exactly = async (q: OfferQuery, keep: (o: Offer) => boolean) => {
+            expect([q, ids(await provider.listOffers({ ...GPU, ...q, includeUnavailable: true }))]).toEqual([q, ids(all.filter(keep))]);
+        };
+        /** A threshold in the middle of what is listed: it keeps some offers and leaves some, so neither ignoring it nor dropping too many passes. */
+        const middle = (values: number[]) => {
+            const v = [...new Set(values)].sort((a, b) => a - b);
+            expect(v.length).toBeGreaterThan(1);
+            return v[Math.floor((v.length - 1) / 2)];
+        };
+        const minVramGb = middle(all.map((o) => o.vramGb));
+        await exactly({ minVramGb }, (o) => o.vramGb >= minVramGb);
+        const maxPricePerHour = middle(all.map((o) => o.pricePerHour));
+        await exactly({ maxPricePerHour }, (o) => o.pricePerHour <= maxPricePerHour);
+        const models = [...new Set(all.map((o) => o.gpu))];
+        expect(models.length).toBeGreaterThan(2);
+        await exactly({ gpus: [models[0]] }, (o) => o.gpu === models[0]);
+        await exactly({ gpus: models.slice(1, 3) }, (o) => models.slice(1, 3).includes(o.gpu));
+        // Where every offer is NVIDIA's, asking for AMD lists none.
+        await exactly({ vendor: 'nvidia' }, (o) => o.vendor === 'nvidia');
+        await exactly({ vendor: 'amd' }, (o) => o.vendor === 'amd');
     });
 
     it('a create where there is no stock is a CapacityError, and makes nothing', async () => {

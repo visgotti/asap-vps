@@ -12,7 +12,7 @@ import { CAPABILITY_METHODS, CapabilityName, requireCapability, supports } from 
 import { asRoot, ProvisionTarget, ServerProvisioner } from '../Core/ServerProvisioner';
 import { SSHService } from '../Core/SSHService';
 import { RunCommandStep } from '../Core/steps';
-import { compareCudaVersions, sshKeyFingerprint } from '../Core/utils';
+import { canonicalGpu, compareCudaVersions, sshKeyFingerprint } from '../Core/utils';
 import { AuthError, CapacityError, NotSupportedError, ProviderError, QuotaError } from '../errors';
 import { DigitalOceanApi } from '../Providers/DigitalOcean/api';
 import { providerInfo } from '../Providers/registry';
@@ -413,6 +413,9 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
                 expect(o.id).toBeTruthy();
                 expect(o.gpu).toBeTruthy();
                 expect(['nvidia', 'amd']).toContain(o.vendor);
+                // A model asap-vps knows goes by its one name (a MIG slice's: the name and its profile) and its maker.
+                const known = canonicalGpu(o.gpu);
+                if (known) expect([o.id, o.gpu.replace(/ MIG \S+$/, ''), o.vendor]).toEqual([o.id, known.name, known.vendor]);
                 expect(o.gpuCount).toBeGreaterThanOrEqual(1);
                 expect(o.vramGb).toBeGreaterThan(0);
                 expect(o.pricePerHour).toBeGreaterThan(0);
