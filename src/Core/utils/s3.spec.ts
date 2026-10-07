@@ -4,8 +4,11 @@
 // signature of every request it is sent.
 
 import { createHash } from 'crypto';
+import { mkdtempSync, readdirSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { fakeS3 } from '../../testing/fakes/s3';
-import { EMPTY_SHA256, S3Client, S3Error, signS3, UNSIGNED_PAYLOAD } from './s3';
+import { EMPTY_SHA256, S3Client, S3Error, signS3, stageDownload, UNSIGNED_PAYLOAD } from './s3';
 
 const AWS = { accessKey: 'AKIAIOSFODNN7EXAMPLE', secretKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' };
 const NOW = new Date('2013-05-24T00:00:00Z');
@@ -165,4 +168,25 @@ describe('S3Client retries what the network or S3 fails', () => {
             await staged.remove();
         }
     });
+});
+
+describe('stageDownload: a file downloaded to a temporary one, hashed on the way', () => {
+    it('a download that breaks, or a disk that cannot take it, is thrown (not an end to the process), and leaves no file behind', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'asap-vps-stage-test-'));
+        const answer = (body: () => BodyInit) => (async () => new Response(body())) as unknown as typeof fetch;
+        try {
+            const breaking = answer(() => new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new Uint8Array(1024)); c.error(new Error('connection reset')); } }));
+            await expect(stageDownload('https://files.example/disk.qcow2', breaking, { dir })).rejects.toThrow(/connection reset/);
+            expect(readdirSync(dir)).toEqual([]);
+            // A directory that is not there: the file cannot be written (as on a full disk), and the write stream's error is heard.
+            await expect(stageDownload('https://files.example/disk.qcow2', answer(() => new Uint8Array(2048)), { dir: join(dir, 'missing') })).rejects.toMatchObject({ code: 'ENOENT' });
+            const staged = await stageDownload('https://files.example/disk.qcow2', answer(() => new Uint8Array(2048).fill(3)), { dir });
+            expect([staged.size, staged.sha256, readdirSync(dir).length]).toEqual([2048, createHash('sha256').update(new Uint8Array(2048).fill(3)).digest('hex'), 1]);
+            await staged.remove();
+            expect(readdirSync(dir)).toEqual([]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    // Real files on a disk other jobs may be busy with: more than the default 5 s.
+    }, 30_000);
 });

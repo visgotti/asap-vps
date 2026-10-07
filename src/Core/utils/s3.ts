@@ -11,7 +11,8 @@ import { createReadStream, createWriteStream } from 'fs';
 import { unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { Readable } from 'stream';
+import { Readable, Transform } from 'stream';
+import { pipeline } from 'stream/promises';
 import type { FetchImpl } from './http';
 
 export type S3Credentials = { accessKey: string, secretKey: string };
@@ -267,29 +268,34 @@ export type StagedFile = { path: string, size: number, sha256: string, remove():
  * held in memory) and hashed on the way: what an upload signs. A download
  * that fails leaves nothing behind.
  */
-export async function stageDownload(url: string, fetchImpl: FetchImpl = fetch): Promise<StagedFile> {
+export async function stageDownload(url: string, fetchImpl: FetchImpl = fetch, o: { dir?: string } = {}): Promise<StagedFile> {
     const r = await fetchImpl(url);
     if (!r.ok || !r.body) throw new Error(`${url}: ${r.status} ${r.statusText}`.trim());
-    return stageBody(r, url);
+    return stageBody(r, url, o.dir);
 }
 
-/** A response's body, written to a temporary file and hashed on the way; one that fails leaves nothing behind. */
-async function stageBody(r: Response, what: string): Promise<StagedFile> {
+/**
+ * A response's body, written to a temporary file and hashed on the way. A
+ * failure anywhere (the download, a full disk, a missing temporary directory)
+ * is thrown, and leaves nothing behind: the stages are a pipeline, so no
+ * stream's error goes unheard (an unheard one ends the process).
+ */
+async function stageBody(r: Response, what: string, dir = tmpdir()): Promise<StagedFile> {
     if (!r.body) throw new Error(`${what}: no body`);
-    const path = join(tmpdir(), `asap-vps-${randomBytes(8).toString('hex')}`);
+    const path = join(dir, `asap-vps-${randomBytes(8).toString('hex')}`);
     const remove = () => unlink(path).catch(() => undefined);
     const hash = createHash('sha256');
     let size = 0;
-    const out = createWriteStream(path);
-    try {
-        for await (const chunk of r.body as unknown as AsyncIterable<Uint8Array>) {
+    const tap = new Transform({
+        transform(chunk: Buffer, _encoding, done) {
             hash.update(chunk);
             size += chunk.byteLength;
-            if (!out.write(chunk)) await new Promise<void>((res) => out.once('drain', () => res()));
-        }
-        await new Promise<void>((res, rej) => out.end((e?: Error | null) => (e ? rej(e) : res())));
+            done(null, chunk);
+        },
+    });
+    try {
+        await pipeline(Readable.fromWeb(r.body as Parameters<typeof Readable.fromWeb>[0]), tap, createWriteStream(path));
     } catch (e) {
-        out.destroy();
         await remove();
         throw e;
     }
