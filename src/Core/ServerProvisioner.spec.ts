@@ -76,6 +76,15 @@ describe('ServerProvisioner', () => {
         expect(await p.listSSHKeys()).toEqual([]);
     });
 
+    it('cleanupProviderKey false keeps the key on a provider that would delete it by default, and its id comes back', async () => {
+        const { p } = digitalOcean();
+        const [offer] = await p.listOffers({ kind: 'cpu' });
+        const r = await new ServerProvisioner(p).provision({ serverOptions: { name: 'web-2', offer }, cleanupProviderKey: false, ...quick }, () => {});
+        const keys = await p.listSSHKeys();
+        expect(keys).toHaveLength(1);
+        expect(r.providerSshKeyId).toBe(keys[0].id);
+    });
+
     it('runs the steps as root through sudo when the image\'s login is not root (Lambda\'s ubuntu)', async () => {
         const fake = fakeLambda();
         const p = new LambdaCloud({ apiKey: 'lambda-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
