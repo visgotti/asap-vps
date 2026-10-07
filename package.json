@@ -19,7 +19,8 @@
     "gpu:smoke": "ts-node --transpile-only scripts/gpu-smoke.ts",
     "test:live": "jest --config jest.live.config.js",
     "test:coverage": "jest --coverage --coverageDirectory=coverage --collectCoverageFrom='src/Providers/Scaleway/*.ts' --collectCoverageFrom='!**/*.spec.ts' src/Providers/Scaleway",
-    "scaleway:spec": "ts-node --transpile-only scripts/scaleway-spec-check.ts"
+    "scaleway:spec": "ts-node --transpile-only scripts/scaleway-spec-check.ts",
+    "api:spec": "ts-node --transpile-only scripts/api-spec-check.ts"
   },
   "dependencies": {
     "node-ssh": "^13.1.0"

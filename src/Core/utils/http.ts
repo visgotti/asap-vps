@@ -11,6 +11,7 @@
 import { AuthError, NotFoundError, ProviderError, TransportError } from '../../errors';
 import type { ProviderParams } from '../../types';
 import { asyncTimeout, Sleep } from './async';
+import { ApiEndpoint, endpointOf } from './endpoints';
 
 export type FetchImpl = typeof fetch;
 
@@ -130,6 +131,12 @@ export class ApiClient {
     readonly baseUrl: string;
     readonly fetchImpl?: FetchImpl;
     readonly sleep: Sleep;
+    /**
+     * The endpoints this client calls (its platform's endpoints.ts), where it
+     * has a table: a request none of them describes is refused before it is
+     * sent, as a bug, never as the platform's answer.
+     */
+    protected readonly endpoints?: Readonly<Record<string, ApiEndpoint>>;
 
     constructor(params: ProviderParams | string, defaultBaseUrl: string, id = 'api') {
         const p = typeof params === 'string' ? { apiKey: params } : params;
@@ -148,6 +155,9 @@ export class ApiClient {
      */
     request(method: string, path: string, o: RequestOptions = {}): Promise<HttpResult> {
         if (!path.startsWith('/')) throw new Error(`"${path}" is not an API path of ${this.baseUrl}`);
+        if (this.endpoints && endpointOf(this.endpoints, method, path) === undefined) {
+            throw new Error(`${method} ${path} is no endpoint of ${this.id}'s table (its endpoints.ts): add it there, with its spec operation and reference page`);
+        }
         return http(`${this.baseUrl}${path}`, {
             method,
             json: o.json,

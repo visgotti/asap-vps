@@ -6,11 +6,13 @@
 import { ApiClient, errorText, findSSHKey, HttpResult, RequestInfo } from '../../Core/utils';
 import { AuthError, CapacityError, falseIfNotFound, NotFoundError, nullIfNotFound, ProviderError, QuotaError } from '../../errors';
 import type { InitializedSSHKeyData, ProviderParams } from '../../types';
+import { DIGITALOCEAN_ENDPOINTS } from './endpoints';
 import { DIGITALOCEAN_ID, toSSHKey } from './mappers';
 import type { DigitalOceanDropletData, DigitalOceanSSHData, DigitalOceanVolumeData } from './types';
 
 export class DigitalOceanApi extends ApiClient {
     static readonly BASE_URL = 'https://api.digitalocean.com';
+    protected readonly endpoints = DIGITALOCEAN_ENDPOINTS;
 
     constructor(params: ProviderParams | string) {
         super(params, DigitalOceanApi.BASE_URL, DIGITALOCEAN_ID);
