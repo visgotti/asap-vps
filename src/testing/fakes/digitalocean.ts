@@ -16,6 +16,12 @@ import { randomUUID } from 'crypto';
 import { sshKeyFingerprint } from '../../Core/utils';
 import { fakeBootId, FakeApi, json, readRequest, userDataFiles } from './util';
 
+/**
+ * The regions Network File Storage is in, from docs.digitalocean.com/products/nfs/details/availability/
+ * (generated 6 Oct 2026): a share anywhere else is refused. The live shares suite rents in these too.
+ */
+export const DO_NFS_REGIONS: readonly string[] = ['nyc2', 'ams3', 'atl1', 'ric1', 'mkc1', 'mem1'];
+
 /** Public images: GET /v2/images lists them with the account's own; ?private=true leaves them out. */
 const PUBLIC_IMAGES = [
     { id: 101, name: '24.04 (LTS) x64', distribution: 'Ubuntu', slug: 'ubuntu-24-04-x64', public: true, regions: ['nyc1', 'nyc2', 'tor1', 'sfo3'],
@@ -124,10 +130,9 @@ export function fakeDigitalOcean(o: {
 
     /** Network File Storage: shares made in a region's VPCs, listed (in every region, or one), read, deleted. */
     function nfs(method: string, path: string, u: URL, body: any): Response {
-        const sizes = [...new Set(state.sizes.flatMap((x) => x.regions))];
         if (path === '/v2/nfs' && method === 'POST') {
             if (typeof body?.name !== 'string' || !/^[a-z][a-z0-9-]*$/.test(body.name)) return err(400, 'bad_request', 'name must be lowercase letters, digits and dashes');
-            if (!sizes.includes(body.region)) return err(400, 'bad_request', `NFS is not available in region ${body.region}`);
+            if (!DO_NFS_REGIONS.includes(body.region)) return err(400, 'bad_request', `NFS is not available in region ${body.region}`);
             const tier = body.performance_tier ?? 'high';
             const least = tier === 'high' ? 500 : 50;
             if (!Number.isInteger(body.size_gib) || body.size_gib < least) return err(400, 'bad_request', `The value for 'size_gib' must be greater than or equal to ${least}Gib.`);

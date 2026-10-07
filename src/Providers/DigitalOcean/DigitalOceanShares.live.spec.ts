@@ -17,6 +17,7 @@ import { AuthError } from '../../errors';
 import {
     deleteRunKeys, deleteRunVolumes, liveOptions, liveRequested, loadCredentials, newRunName, runMatcher, startWatchdog, sweepLeftovers, teardown, trackSSHKeys, trackVolumes,
 } from '../../testing/live';
+import { DO_NFS_REGIONS as NFS_REGIONS } from '../../testing/fakes/digitalocean';
 import type { Offer, Server, Volume } from '../../types';
 import { DigitalOcean } from './DigitalOcean';
 import type { DigitalOceanDropletData, DigitalOceanNfsShare, DigitalOceanSizeData } from './types';
@@ -25,8 +26,6 @@ const requested = liveRequested('digitalocean-cpu');
 const { freeOnly, maxPricePerHour } = liveOptions();
 const paid = freeOnly ? it.skip : it;
 const WAIT = { intervalMs: 5000, timeoutMs: 15 * 60_000 };
-/** Where Network File Storage is (docs.digitalocean.com/products/nfs/details/availability, 2026-10-01). */
-const NFS_REGIONS = ['nyc2', 'ams3', 'atl1', 'ric1', 'mkc1', 'mem1'];
 const PATH = '/mnt/shared';
 
 (requested ? describe : describe.skip)(`DigitalOcean shared volumes: an NFS share droplets mount over NFS, against the live API${

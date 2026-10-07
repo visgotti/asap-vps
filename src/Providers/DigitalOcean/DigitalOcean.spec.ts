@@ -426,24 +426,24 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
 
     it('made in the region\'s default VPC, standard tier, once ACTIVE; a shared volume mounted at /mnt/<name> unless a mount says otherwise; listed with the block volumes', async () => {
         const { fake, p } = make();
-        const share = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 49.5 + 50, shared: true });
-        const vpc = fake.state.vpcs.find((v) => v.region === 'tor1')!.id;
-        expect(fake.calls.find((c) => c.method === 'POST' && c.path === '/v2/nfs')?.body).toEqual({ name: 'models', size_gib: 100, region: 'tor1', vpc_ids: [vpc], performance_tier: 'standard' });
-        expect(share).toMatchObject({ provider: 'digitalocean', name: 'models', region: 'tor1', shared: true, sizeGb: 100, status: 'available', providerStatus: 'ACTIVE', mountPath: '/mnt/models' });
+        const share = await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 49.5 + 50, shared: true });
+        const vpc = fake.state.vpcs.find((v) => v.region === 'nyc2')!.id;
+        expect(fake.calls.find((c) => c.method === 'POST' && c.path === '/v2/nfs')?.body).toEqual({ name: 'models', size_gib: 100, region: 'nyc2', vpc_ids: [vpc], performance_tier: 'standard' });
+        expect(share).toMatchObject({ provider: 'digitalocean', name: 'models', region: 'nyc2', shared: true, sizeGb: 100, status: 'available', providerStatus: 'ACTIVE', mountPath: '/mnt/models' });
         expect(share.raw).toMatchObject({ host: '10.10.0.5', mount_path: `/2559851/${share.id}`, vpc_ids: [vpc] });
-        const block = await p.createVolume({ name: 'scratch', region: 'tor1', sizeGb: 10 });
+        const block = await p.createVolume({ name: 'scratch', region: 'nyc2', sizeGb: 10 });
         expect((await p.listVolumes()).map((v) => [v.name, v.shared])).toEqual([['scratch', false], ['models', true]]);
         expect(await p.getVolume(share.id)).toMatchObject({ id: share.id, shared: true });
         expect(await p.getVolume(block.id)).toMatchObject({ id: block.id, shared: false });
         // VPCs of the caller's naming, and a high tier (from 500 GB).
-        await p.createVolume({ name: 'fast', region: 'tor1', sizeGb: 500, shared: true, providerOptions: { vpc_ids: [vpc], performance_tier: 'high' } });
+        await p.createVolume({ name: 'fast', region: 'nyc2', sizeGb: 500, shared: true, providerOptions: { vpc_ids: [vpc], performance_tier: 'high' } });
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/nfs').pop()?.body).toMatchObject({ vpc_ids: [vpc], performance_tier: 'high' });
     });
 
     it('a droplet created with a share joins its VPC, carries a tag for it, and mounts it over NFS at its path, now and at every boot', async () => {
         const { fake, p } = make();
-        const share = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 50, shared: true });
-        const s = await p.createServer({ name: 'gpu-1', offer: 'gpu-4000adax1-20gb', region: 'tor1', mounts: [{ volume: share, path: '/data/models' }] });
+        const share = await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 50, shared: true });
+        const s = await p.createServer({ name: 'gpu-1', offer: 'gpu-6000adax1-48gb', region: 'nyc2', mounts: [{ volume: share, path: '/data/models' }] });
         const body = creates(fake).pop();
         expect(body.vpc_uuid).toBe(share.raw.vpc_ids[0]);
         expect(body.tags).toEqual([`asap-vps-nfs:${share.id}:${Buffer.from('/data/models').toString('hex')}`]);
@@ -453,26 +453,26 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
         expect(() => execFileSync('/bin/bash', ['-n'], { input: body.user_data })).not.toThrow();
         expect((await p.waitUntilRunning(s.id, fast)).mounts).toEqual([{ volumeId: share.id, path: '/data/models' }]);
         // By id, at its mountPath; with a block volume and the caller's tags too: all of it in one droplet.
-        const block = await p.createVolume({ name: 'scratch', region: 'tor1', sizeGb: 10 });
-        const t = await p.createServer({ name: 'gpu-2', offer: 'gpu-4000adax1-20gb', region: 'tor1', tags: ['team-a'], mounts: [{ volume: block.id }, { volume: share.id }] });
+        const block = await p.createVolume({ name: 'scratch', region: 'nyc2', sizeGb: 10 });
+        const t = await p.createServer({ name: 'gpu-2', offer: 'gpu-6000adax1-48gb', region: 'nyc2', tags: ['team-a'], mounts: [{ volume: block.id }, { volume: share.id }] });
         expect(creates(fake).pop()).toMatchObject({ volumes: [block.id], tags: ['team-a', `asap-vps-nfs:${share.id}:${Buffer.from('/mnt/models').toString('hex')}`] });
         expect((await p.waitUntilRunning(t.id, fast)).mounts).toEqual([{ volumeId: block.id }, { volumeId: share.id, path: '/mnt/models' }]);
     });
 
     it('refuses before any droplet is asked for: a path for a block volume, a share elsewhere or not ACTIVE, a VPC no share is in', async () => {
         const { fake, p } = make();
-        const block = await p.createVolume({ name: 'scratch', region: 'tor1', sizeGb: 10 });
-        const share = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 50, shared: true });
-        const far = await p.createVolume({ name: 'far', region: 'nyc1', sizeGb: 50, shared: true });
-        const o = { name: 'x', offer: 'gpu-4000adax1-20gb', region: 'tor1' };
+        const block = await p.createVolume({ name: 'scratch', region: 'nyc2', sizeGb: 10 });
+        const share = await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 50, shared: true });
+        const far = await p.createVolume({ name: 'far', region: 'atl1', sizeGb: 50, shared: true });
+        const o = { name: 'x', offer: 'gpu-6000adax1-48gb', region: 'nyc2' };
         await expect(p.createServer({ ...o, mounts: [{ volume: block, path: '/data' }] })).rejects.toThrow(/a mount path for a Block Storage volume/);
-        await expect(p.createServer({ ...o, mounts: [{ volume: far.id }] })).rejects.toThrow(/share far is in nyc1: a droplet in tor1 cannot mount it/);
+        await expect(p.createServer({ ...o, mounts: [{ volume: far.id }] })).rejects.toThrow(/share far is in atl1: a droplet in nyc2 cannot mount it/);
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id, path: 'data' }] })).rejects.toThrow(/mount path "data" is not absolute/);
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id }], providerOptions: { vpc_uuid: 'elsewhere' } })).rejects.toThrow(/vpc_uuid elsewhere is not a VPC of every share/);
         fake.state.shares.get(share.id).status = 'INACTIVE';
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id }] })).rejects.toThrow(/share models is INACTIVE: it is mounted once ACTIVE/);
         fake.state.shares.get(share.id).status = 'ACTIVE';
-        const other = await p.createVolume({ name: 'other', region: 'tor1', sizeGb: 50, shared: true });
+        const other = await p.createVolume({ name: 'other', region: 'nyc2', sizeGb: 50, shared: true });
         fake.state.shares.get(other.id).vpc_ids = ['another-vpc'];
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id }, { volume: other.id }] })).rejects.toThrow(/have no VPC in common/);
         expect(creates(fake)).toEqual([]);
@@ -483,19 +483,25 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
 
     it('a size out of bounds, or a region with no default VPC, is refused before anything is made; one that fails to become ACTIVE is deleted, and its failure thrown', async () => {
         const { fake, p } = make();
-        await expect(p.createVolume({ name: 'tiny', region: 'tor1', sizeGb: 49, shared: true })).rejects.toThrow(/50-32768 GB, not 49/);
-        await expect(p.createVolume({ name: 'huge', region: 'tor1', sizeGb: 40000, shared: true })).rejects.toThrow(/50-32768 GB/);
-        fake.state.vpcs = fake.state.vpcs.filter((v) => v.region !== 'nyc1');
-        await expect(p.createVolume({ name: 'novpc', region: 'nyc1', sizeGb: 50, shared: true })).rejects.toThrow(/region nyc1 has no default VPC yet/);
+        await expect(p.createVolume({ name: 'tiny', region: 'nyc2', sizeGb: 49, shared: true })).rejects.toThrow(/50-32768 GB, not 49/);
+        await expect(p.createVolume({ name: 'huge', region: 'nyc2', sizeGb: 40000, shared: true })).rejects.toThrow(/50-32768 GB/);
+        fake.state.vpcs = fake.state.vpcs.filter((v) => v.region !== 'atl1');
+        await expect(p.createVolume({ name: 'novpc', region: 'atl1', sizeGb: 50, shared: true })).rejects.toThrow(/region atl1 has no default VPC yet/);
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/nfs')).toEqual([]);
         const { fake: f2, p: p2 } = make({ shareReads: 1e9 });
-        await expect(p2.createVolume({ name: 'slow', region: 'tor1', sizeGb: 50, shared: true, intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/waiting for share slow: CREATING/);
+        await expect(p2.createVolume({ name: 'slow', region: 'nyc2', sizeGb: 50, shared: true, intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/waiting for share slow: CREATING/);
         expect(f2.state.shares.size).toBe(0);
+    });
+
+    it('a share where DigitalOcean has no Network File Storage is its refusal, and nothing is made', async () => {
+        const { fake, p } = make();
+        await expect(p.createVolume({ name: 'models', region: 'tor1', sizeGb: 50, shared: true })).rejects.toThrow(/NFS is not available in region tor1/);
+        expect(fake.state.shares.size).toBe(0);
     });
 
     it('deleted, waited for until gone; deleting again is no error', async () => {
         const { p } = make();
-        const share = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 50, shared: true });
+        const share = await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 50, shared: true });
         await p.deleteVolume(share.id);
         expect(await p.getVolume(share.id)).toBeNull();
         expect(await p.listVolumes()).toEqual([]);

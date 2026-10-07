@@ -64,7 +64,13 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         anyRegion: 'tor1',
         unknownId: '424242',
         refused: { env: { MODE: 'probe' } },
-        elsewhere: (region) => (region === 'nyc1' ? 'tor1' : 'nyc1'),
+        // Network File Storage is in a few regions only (none of them the cheapest GPU's): NYC2 and ATL1 among them.
+        elsewhere: (region, kind) => (kind === 'shared' ? (region === 'nyc2' ? 'atl1' : 'nyc2') : region === 'nyc1' ? 'tor1' : 'nyc1'),
+        volumePlace: async (p, kind) => {
+            if (kind !== 'shared') return undefined;
+            const offer = (await p.listOffers({ kind: 'gpu' })).find((o) => o.regions.includes('nyc2'));
+            return offer && { offer, region: 'nyc2' };
+        },
         userDataOf: (fake) => lastBody(fake, 'POST', /^\/v2\/droplets$/)?.user_data,
     },
     {
