@@ -24,17 +24,31 @@ describe('RunPod', () => {
         return { fake, p: new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep, cloud }) };
     };
 
-    it('offers what the chosen cloud sells, priced for the GPU count asked', async () => {
+    it('offers what the chosen cloud sells, where it has stock, for the GPU count asked', async () => {
         let { p } = make();
         let offers = await p.listOffers({ includeUnavailable: true });
         expect(offers.map((o) => o.id)).not.toContain('NVIDIA RTX A4000');
         expect(offers.find((o) => o.id === 'NVIDIA RTX A5000')).toMatchObject({ pricePerHour: 0.27, regions: ['US-TX-3'] });
         offers = await p.listOffers({ gpuCount: 2 });
         expect(offers.find((o) => o.id === 'NVIDIA RTX A5000')).toMatchObject({ gpuCount: 2, pricePerHour: 0.54 });
+        // A pod runs on one machine: where none has two of a type free, two are not in stock (the 4090 has one free).
+        expect(offers.map((o) => o.id)).not.toContain('NVIDIA GeForce RTX 4090');
+        expect((await p.listOffers({ includeUnavailable: true, gpuCount: 2 })).find((o) => o.id === 'NVIDIA GeForce RTX 4090')?.regions).toEqual([]);
         ({ p } = make('COMMUNITY'));
         offers = await p.listOffers({ includeUnavailable: true });
         expect(offers.find((o) => o.id === 'NVIDIA RTX A4000')?.pricePerHour).toBe(0.17);
         expect(offers.map((o) => o.id)).not.toContain('AMD Instinct MI300X OAM');
+        // The community cloud's own stock: its A5000s are in Romania, the secure cloud's in Texas.
+        expect(offers.find((o) => o.id === 'NVIDIA RTX A5000')).toMatchObject({ pricePerHour: 0.16, regions: ['EU-RO-1'] });
+    });
+
+    it('a pod is placed and billed on the chosen cloud', async () => {
+        const { p, fake } = make('COMMUNITY');
+        const [offer] = await p.listOffers({ gpus: ['RTX A5000'] });
+        const s = await p.createServer({ name: 'community', offer, image: 'img' });
+        expect(fake.calls.find((c) => c.method === 'POST' && c.path === '/v2/pods')?.body.cloud).toBe('COMMUNITY');
+        expect(fake.state.pods.get(s.id)).toMatchObject({ cloud: 'COMMUNITY', dataCenterId: 'EU-RO-1' });
+        expect(await p.waitUntilRunning(s.id, fast)).toMatchObject({ region: 'EU-RO-1', pricePerHour: 0.16 });
     });
 
     it('sends the command as exec-form cmd, ports, and SSH setup when keys are asked for', async () => {
@@ -318,9 +332,9 @@ describe('RunPod network volumes and registry logins', () => {
     };
     const IMAGE = 'nvidia/cuda:12.8.1-base-ubuntu24.04';
     const podBodies = (fake: ReturnType<typeof fakeRunPod>) => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/pods').map((c) => c.body);
-    /** The A5000 in stock in both data centers, so where a pod goes is the volume's choice, not the offer's. */
+    /** The A5000 in stock on the secure cloud in both data centers, so where a pod goes is the volume's choice, not the offer's. */
     const inBoth = (fake: ReturnType<typeof fakeRunPod>) => {
-        fake.state.gpus.find((g) => g.id === 'NVIDIA RTX A5000')!.dataCenters.forEach((d) => { d.availability = 'HIGH'; });
+        fake.state.gpus.find((g) => g.id === 'NVIDIA RTX A5000')!.dataCenters.forEach((d) => { d.SECURE = ['HIGH', 8]; });
     };
 
     it('a pod mounting a volume (by id) goes to the volume\'s data center, at /workspace unless the mount says', async () => {
@@ -472,6 +486,8 @@ describe('RunPod serverless: load-balancing endpoints (plain HTTP workers, no Ru
         // A type in no pool (the MIG slice, AMD) is no serverless offer; one out of stock is left out unless asked.
         expect(offers.map((o) => o.id)).not.toContain('AMD Instinct MI300X OAM');
         expect(offers.find((o) => o.id === 'NVIDIA RTX A4000')).toMatchObject({ gpuCount: 1, pricePerHour: 0.58, gpu: 'RTX A4000', regions: ['US-TX-3'] });
+        // Serverless stock is the pool's own: the 4090's workers run in Texas, its pods in Romania.
+        expect(offers.find((o) => o.id === 'NVIDIA GeForce RTX 4090')?.regions).toEqual(['US-TX-3']);
         expect(offers.find((o) => o.id === 'cpu3c:2')).toMatchObject({ gpuCount: 0, vcpus: 2, pricePerHour: 0.04, regions: ['US-TX-3'] });
         expect(offers.some((o) => o.id.endsWith(':1'))).toBe(false);
         // Each kind lists exactly its offers: the CPU flavors, without GPUs, and the GPU types, with one each.

@@ -1,9 +1,11 @@
 // A fetch() that answers like RunPod's REST v2 (api.runpod.io/v2/openapi.json,
 // read 2026-09-29) for the calls the GPU provider makes: the GPU catalog with
-// per-data-center stock (include=AVAILABILITY needs product=), scoped by
+// per-data-center stock for the product (pods or serverless workers), cloud
+// and GPU count asked (include=AVAILABILITY needs product=), scoped by
 // minCudaVersion and listing each type's cudaVersions; pods that go
-// PROVISIONING -> STARTING -> RUNNING over a few reads, placed only on hosts
-// whose CUDA meets gpu.minCudaVersion; POST .../action for start / stop /
+// PROVISIONING -> STARTING -> RUNNING over a few reads, placed on the cloud
+// they name, on a machine with their GPUs free and on hosts whose CUDA meets
+// gpu.minCudaVersion, and billed at that cloud's rate; POST .../action for start / stop /
 // restart (409 when the status does not allow it); cursor pages; the SSE log
 // stream (RunPod's own lines as source `system`, the command's output as
 // `container`; `source` picks one, `tail` backfills the last lines, 100 by
@@ -19,27 +21,58 @@
 
 import { echoed, FakeApi, json, readRequest } from './util';
 
-/** Each data center's hosts of a type run one CUDA version (`cuda`, the fake's own field). */
-const GPUS = [
+/** What the fake records of a GPU type in one data center: its stock in each context (absent: none there), its hosts' CUDA. */
+type GpuStock = {
+    id: string,
+    /** The one CUDA version this data center's hosts of the type run. */
+    cuda: string | null,
+    /** Pods on each cloud: the availability, and the GPUs free on the largest machine (a pod runs on one: more than that is none here). */
+    SECURE?: [string, number],
+    COMMUNITY?: [string, number],
+    /** Serverless workers of the type's pool. */
+    SERVERLESS?: string,
+};
+
+/**
+ * GPU types (`GET /v2/catalog/gpus`), with each data center's stock per
+ * product context: pods on the secure or community cloud, or serverless
+ * workers. The catalog answers for the product, cloud and GPU count asked, as
+ * the spec has it, and lists a data center only for a context it has stock
+ * records for.
+ */
+const GPUS: Array<{ id: string, name: string, manufacturer: string, memory: number, secure: boolean, community: boolean, maxCount: { secure: number, community: number },
+    pool: string | null, price: { secure: number | null, community: number | null, serverless: number | null }, dataCenters: GpuStock[] }> = [
     { id: 'NVIDIA RTX A5000', name: 'RTX A5000', manufacturer: 'NVIDIA', memory: 24, secure: true, community: true, maxCount: { secure: 8, community: 8 }, pool: 'AMPERE_24',
-        price: { secure: 0.27, community: 0.16, serverless: 0.69 }, dataCenters: [{ id: 'US-TX-3', availability: 'HIGH', cuda: '12.8' }, { id: 'EU-RO-1', availability: 'NONE', cuda: '12.4' }] },
+        price: { secure: 0.27, community: 0.16, serverless: 0.69 },
+        // Secure pods in Texas; community pods in Romania.
+        dataCenters: [{ id: 'US-TX-3', cuda: '12.8', SECURE: ['HIGH', 8], SERVERLESS: 'HIGH' }, { id: 'EU-RO-1', cuda: '12.4', SECURE: ['NONE', 0], COMMUNITY: ['HIGH', 4] }] },
     { id: 'NVIDIA L4', name: 'L4', manufacturer: 'NVIDIA', memory: 24, secure: true, community: true, maxCount: { secure: 8, community: 8 }, pool: 'AMPERE_24',
-        price: { secure: 0.49, community: 0.44, serverless: 0.69 }, dataCenters: [{ id: 'US-TX-3', availability: 'NONE', cuda: '12.8' }] },
+        price: { secure: 0.49, community: 0.44, serverless: 0.69 }, dataCenters: [{ id: 'US-TX-3', cuda: '12.8', SECURE: ['NONE', 0], COMMUNITY: ['NONE', 0], SERVERLESS: 'NONE' }] },
+    // One GPU free on a secure machine; its serverless pool runs in another data center than its pods.
     { id: 'NVIDIA GeForce RTX 4090', name: 'RTX 4090', manufacturer: 'NVIDIA', memory: 24, secure: true, community: true, maxCount: { secure: 8, community: 8 }, pool: 'ADA_24',
-        price: { secure: 0.74, community: 0.34, serverless: 1.1 }, dataCenters: [{ id: 'EU-RO-1', availability: 'LOW', cuda: '12.4' }] },
+        price: { secure: 0.74, community: 0.34, serverless: 1.1 },
+        dataCenters: [{ id: 'EU-RO-1', cuda: '12.4', SECURE: ['LOW', 1], COMMUNITY: ['HIGH', 2] }, { id: 'US-TX-3', cuda: '12.8', SERVERLESS: 'HIGH' }] },
     { id: 'AMD Instinct MI300X OAM', name: 'MI300X', manufacturer: 'AMD', memory: 192, secure: true, community: false, maxCount: { secure: 8, community: 0 }, pool: null,
-        price: { secure: 2.49, community: null, serverless: null }, dataCenters: [{ id: 'US-TX-3', availability: 'MEDIUM', cuda: null }] },
+        price: { secure: 2.49, community: null, serverless: null }, dataCenters: [{ id: 'US-TX-3', cuda: null, SECURE: ['MEDIUM', 8] }] },
     { id: 'NVIDIA RTX A4000', name: 'RTX A4000', manufacturer: 'NVIDIA', memory: 16, secure: false, community: true, maxCount: { secure: 0, community: 8 }, pool: 'AMPERE_16',
-        price: { secure: null, community: 0.17, serverless: 0.58 }, dataCenters: [{ id: 'US-TX-3', availability: 'HIGH', cuda: '12.9' }] },
+        price: { secure: null, community: 0.17, serverless: 0.58 }, dataCenters: [{ id: 'US-TX-3', cuda: '12.9', COMMUNITY: ['HIGH', 4], SERVERLESS: 'HIGH' }] },
     // A MIG slice of a card: its own GPU type, a fraction of the card's memory, cheaper than the card.
     { id: 'NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb', name: 'PRO 6000 MIG 24GB', manufacturer: 'NVIDIA', memory: 24, secure: true, community: false,
-        maxCount: { secure: 1, community: 0 }, pool: null, price: { secure: 0.8, community: null, serverless: null }, dataCenters: [{ id: 'US-TX-3', availability: 'HIGH', cuda: '12.9' }] },
+        maxCount: { secure: 1, community: 0 }, pool: null, price: { secure: 0.8, community: null, serverless: null }, dataCenters: [{ id: 'US-TX-3', cuda: '12.9', SECURE: ['HIGH', 1] }] },
     { id: 'NVIDIA RTX PRO 6000 Blackwell Server Edition', name: 'RTX PRO 6000', manufacturer: 'NVIDIA', memory: 96, secure: true, community: false,
-        maxCount: { secure: 8, community: 0 }, pool: 'BLACKWELL_96', price: { secure: 1.79, community: null, serverless: 2.79 }, dataCenters: [{ id: 'US-TX-3', availability: 'LOW', cuda: '12.9' }] },
+        maxCount: { secure: 8, community: 0 }, pool: 'BLACKWELL_96', price: { secure: 1.79, community: null, serverless: 2.79 },
+        dataCenters: [{ id: 'US-TX-3', cuda: '12.9', SECURE: ['LOW', 2], SERVERLESS: 'LOW' }] },
     // Listed with a secure price the secure cloud does not sell (the flag decides).
     { id: 'NVIDIA RTX 3090', name: 'RTX 3090', manufacturer: 'NVIDIA', memory: 24, secure: false, community: true, maxCount: { secure: 0, community: 4 }, pool: 'AMPERE_24',
-        price: { secure: 0.22, community: 0.22, serverless: 0.69 }, dataCenters: [{ id: 'US-TX-3', availability: 'HIGH', cuda: '12.2' }] },
+        price: { secure: 0.22, community: 0.22, serverless: 0.69 }, dataCenters: [{ id: 'US-TX-3', cuda: '12.2', COMMUNITY: ['HIGH', 2], SERVERLESS: 'HIGH' }] },
 ];
+
+/** A data center's stock of a GPU type in one context, for `count` GPUs per pod (serverless: per worker, one): undefined where it has none on record. */
+const stockIn = (d: GpuStock, context: 'SECURE' | 'COMMUNITY' | 'SERVERLESS', count: number): string | undefined => {
+    if (context === 'SERVERLESS') return d.SERVERLESS;
+    const pod = d[context];
+    return pod && (pod[1] >= count ? pod[0] : 'NONE');
+};
 
 /** CPU flavors (`GET /v2/catalog/cpus`): priced per vCPU, rented in power-of-two counts within `vcpu`; stock per data center and count (the fake's `stock`). */
 const CPUS = [
@@ -277,19 +310,32 @@ export function fakeRunPod(o: {
         if (method === 'GET' && path === '/v2/catalog/gpus') {
             const include = u.searchParams.get('include');
             if (Boolean(include) !== Boolean(u.searchParams.get('product'))) return problem(400, 'product is required with include=AVAILABILITY, and valid only with it');
+            for (const k of ['count', 'cloud', 'minCudaVersion']) if (u.searchParams.get(k) !== null && !include) return problem(400, `${k} is valid only with include=AVAILABILITY`);
+            const products = (u.searchParams.get('product') ?? '').split(',').filter(Boolean);
+            if (products.some((x) => !['POD', 'CLUSTER', 'SERVERLESS'].includes(x))) return invalid(['product: must be POD, CLUSTER or SERVERLESS']);
+            const cloud = u.searchParams.get('cloud') ?? 'SECURE';
+            if (!['SECURE', 'COMMUNITY'].includes(cloud)) return invalid(['cloud: must be SECURE or COMMUNITY']);
+            const count = Number(u.searchParams.get('count') ?? 1);
+            if (!(Number.isInteger(count) && count >= 1)) return invalid(['count: must be an integer from 1']);
             const minCuda = u.searchParams.get('minCudaVersion');
-            if (minCuda !== null && !include) return problem(400, 'minCudaVersion is valid only with include=AVAILABILITY');
             if (minCuda !== null && !/^\d+(\.\d+)?$/.test(minCuda)) return invalid([`minCudaVersion: does not match pattern`]);
+            // Pods (and clusters) are on the cloud asked; serverless workers are their pool's.
+            const contexts = [...new Set(products.map((x) => (x === 'SERVERLESS' ? 'SERVERLESS' : cloud) as 'SECURE' | 'COMMUNITY' | 'SERVERLESS'))];
+            const RANK = ['NONE', 'LOW', 'MEDIUM', 'HIGH'];
             return json(200, {
                 gpus: state.gpus.map(({ dataCenters, ...g }) => {
-                    // The catalog lists only the data centers that offer the type in the asked configuration.
-                    const dcs = dataCenters.filter((d) => minCuda === null || cudaAtLeast(d.cuda, minCuda));
+                    if (!include) return g;
+                    // The data centers that offer the type in the asked configuration, each at its best stock among the contexts asked.
+                    const dcs = dataCenters.filter((d) => minCuda === null || cudaAtLeast(d.cuda, minCuda)).flatMap((d) => {
+                        const levels = contexts.map((c) => stockIn(d, c, count)).filter((x): x is string => x !== undefined);
+                        return levels.length ? [{ id: d.id, cuda: d.cuda, availability: levels.sort((a, b) => RANK.indexOf(b) - RANK.indexOf(a))[0] }] : [];
+                    });
                     const versions = new Map<string, boolean>();
                     for (const d of dcs) if (d.cuda) versions.set(d.cuda, (versions.get(d.cuda) ?? false) || d.availability !== 'NONE');
                     return {
                         ...g,
                         availability: dcs.some((d) => d.availability !== 'NONE') ? 'HIGH' : 'NONE',
-                        ...(dcs.length ? { dataCenters: dcs.map(({ cuda, ...d }) => d) } : {}),
+                        ...(dcs.length ? { dataCenters: dcs.map(({ cuda, ...d }) => ({ ...d, name: d.id })) } : {}),
                         ...(versions.size ? { cudaVersions: [...versions].map(([version, available]) => ({ version, available })) } : {}),
                     };
                 }),
@@ -333,8 +379,12 @@ export function fakeRunPod(o: {
             if (body.registry !== undefined && !state.registries.has(body.registry)) return problem(400, `container registry auth ${body.registry} not found`);
             const g = state.gpus.find((x) => x.id === body.gpu.id);
             if (!g) return problem(400, `invalid GPU type id "${body.gpu.id}"`);
+            const cloud: 'SECURE' | 'COMMUNITY' = body.cloud ?? 'SECURE';
+            if (!['SECURE', 'COMMUNITY'].includes(cloud)) return invalid(['$.cloud: must be SECURE or COMMUNITY']);
+            const count = body.gpu.count ?? 1;
             const minCuda = body.gpu.minCudaVersion;
-            const inStock = g.dataCenters.filter((d) => d.availability !== 'NONE' && (!minCuda || cudaAtLeast(d.cuda, minCuda)));
+            // A machine of the type on the cloud asked, with `count` GPUs free, whose CUDA is new enough.
+            const inStock = g.dataCenters.filter((d) => ![undefined, 'NONE'].includes(stockIn(d, cloud, count)) && (!minCuda || cudaAtLeast(d.cuda, minCuda)));
             const dc = (body.dataCenterIds?.length ? body.dataCenterIds : inStock.map((d) => d.id)).map((id: string) => inStock.find((d) => d.id === id)).find(Boolean);
             if (!dc) return problem(400, 'There are no longer any instances available with the requested specifications. Please refresh and try again.');
             // A network volume is mounted only by a pod in its own data center.
@@ -344,7 +394,9 @@ export function fakeRunPod(o: {
             const id = `pod_${state.nextId++}`;
             const pod: any = { id, name: body.name, status: 'PROVISIONING', image: body.image, env: body.env ?? {}, ports: body.ports ?? [], cmd: body.cmd,
                 ...(body.mounts ? { mounts: body.mounts } : {}), registry: body.registry ?? null,
-                gpu: { id: g.id, count: body.gpu.count ?? 1 }, dataCenterId: dc.id, cudaVersion: dc.cuda, cost: Number(g.price.secure) * (body.gpu.count ?? 1), rate: Number(g.price.secure) * (body.gpu.count ?? 1), startedAt: null,
+                gpu: { id: g.id, count }, cloud, dataCenterId: dc.id, cudaVersion: dc.cuda,
+                // Billed at its cloud's rate, for each of its GPUs.
+                cost: Number(g.price[cloud === 'SECURE' ? 'secure' : 'community']) * count, rate: Number(g.price[cloud === 'SECURE' ? 'secure' : 'community']) * count, startedAt: null,
                 createdAt: new Date().toISOString(), reads: 0 };
             pod.logs = containerRun(pod);
             state.pods.set(id, pod);
