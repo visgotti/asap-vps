@@ -145,6 +145,11 @@ const LIVE_ONLY: Record<string, string[]> = {
 /** The public catalog answers --live reads (no key needed), the type each answer's entries are, and where they are. */
 const LIVE_CATALOG: Array<{ type: string, url: string, entries: (body: any) => any[] }> = [
     { type: 'ScalewayServerType', url: 'https://api.scaleway.com/instance/v1/zones/fr-par-1/products/servers?per_page=100', entries: (b) => Object.values(b.servers) },
+    // A server type's capabilities, read as objects of their own: their live-only fields are theirs.
+    {
+        type: 'ScalewayServerTypeCapabilities', url: 'https://api.scaleway.com/instance/v1/zones/fr-par-1/products/servers?per_page=100',
+        entries: (b) => Object.values<any>(b.servers).map((t) => t.capabilities).filter(Boolean),
+    },
     { type: 'ScalewayMarketplaceImage', url: 'https://api.scaleway.com/marketplace/v2/images?page_size=100', entries: (b) => b.images },
 ];
 
@@ -551,14 +556,17 @@ function checkZones(specs: Record<Api, Spec>): void {
 /** The live API's public catalog answers: a field the types call live-only must still be sent, and a field nobody typed is news. */
 async function checkLive(checker: Checker): Promise<void> {
     console.log('== live catalog (public endpoints, no key)');
+    // A type's live-only fields are checked on answers that are that type: one no answer is read for is never checked.
+    for (const type of Object.keys(LIVE_ONLY)) if (!LIVE_CATALOG.some((c) => c.type === type)) fail(`${type}: its LIVE_ONLY fields are read from no live answer (add it to LIVE_CATALOG)`);
+    const answers = new Map<string, Promise<any>>();
     for (const { type, url, entries } of LIVE_CATALOG) {
-        const answer = await (await fetch(url)).json();
-        const items = entries(answer);
+        if (!answers.has(url)) answers.set(url, fetch(url).then((r) => r.json()));
+        const items = entries(await answers.get(url));
         const sent = new Set(items.flatMap((i: object) => Object.keys(i)));
         const typed = new Set(checker.types.properties(checker.types.type(type), checker.types.declarations.get(type)!).map((p) => p.name));
         for (const field of LIVE_ONLY[type] ?? []) {
-            // Nested live-only fields are checked on the object that holds them.
-            if (!sent.has(field) && typed.has(field) && !items.some((i: any) => Object.values(i).some((v: any) => v && typeof v === 'object' && field in v))) fail(`${type}.${field}: no longer sent by the live API (${items.length} entries): take it out`);
+            if (!typed.has(field)) fail(`${type}.${field}: in LIVE_ONLY, but the type has no such field`);
+            else if (!sent.has(field)) fail(`${type}.${field}: no longer sent by the live API (${items.length} entries): take it out`);
         }
         const unknown = [...sent].filter((k) => !typed.has(k));
         console.log(`  ${type}: ${items.length} entries read; fields not typed: ${unknown.length ? unknown.join(', ') : 'none'}`);
