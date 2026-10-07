@@ -8,8 +8,12 @@
   "exports": {
     ".": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build": "tsc -d",
+    "build": "rm -rf dist && tsc -d -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
     "test": "jest",
     "test:do": "ASAP_VPS_LIVE=digitalocean-vps jest --config jest.live.config.js DigitalOceanVps.live",
     "test:do:cpu": "ASAP_VPS_LIVE=digitalocean-cpu jest --config jest.live.config.js DigitalOceanCpu.live",
