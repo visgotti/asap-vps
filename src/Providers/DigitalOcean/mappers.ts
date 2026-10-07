@@ -235,7 +235,12 @@ export function nfsMounts(tags: readonly string[] | undefined): Array<{ volumeId
     });
 }
 
-export const NFS_STATUS: Readonly<Record<string, VolumeStatus>> = Object.freeze({ CREATING: 'pending', ACTIVE: 'available', INACTIVE: 'error', FAILED: 'error', DELETED: 'deleting' });
+/**
+ * A share's status as a volume's. INACTIVE is no failure: "the share exists but
+ * is not attached to any VPC", so nothing can mount it yet. No unified word
+ * says that, so it reads 'unknown', with DigitalOcean's own word beside it.
+ */
+export const NFS_STATUS: Readonly<Record<string, VolumeStatus>> = Object.freeze({ CREATING: 'pending', ACTIVE: 'available', INACTIVE: 'unknown', FAILED: 'error', DELETED: 'deleting' });
 
 /** A Network File Storage share as a volume: shared, mounted by the library at the mount's path (default /mnt/<name>). DigitalOcean does not say which droplets mount it. */
 export function toNfsVolume(s: DigitalOceanNfsShare): Volume<DigitalOceanNfsShare> {

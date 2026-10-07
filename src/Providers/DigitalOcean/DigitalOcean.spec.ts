@@ -541,6 +541,10 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id }], providerOptions: { vpc_uuid: 'elsewhere' } })).rejects.toThrow(/vpc_uuid elsewhere is not a VPC of every share/);
         fake.state.shares.get(share.id).status = 'INACTIVE';
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id }] })).rejects.toThrow(/share models is INACTIVE: it is mounted once ACTIVE/);
+        // In no VPC, which is no failure: it does not read as an error, as a share that FAILED does.
+        expect(await p.getVolume(share.id)).toMatchObject({ status: 'unknown', providerStatus: 'INACTIVE' });
+        fake.state.shares.get(share.id).status = 'FAILED';
+        expect(await p.getVolume(share.id)).toMatchObject({ status: 'error', providerStatus: 'FAILED' });
         fake.state.shares.get(share.id).status = 'ACTIVE';
         const other = await p.createVolume({ name: 'other', region: 'nyc2', sizeGb: 50, shared: true });
         fake.state.shares.get(other.id).vpc_ids = ['another-vpc'];
