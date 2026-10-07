@@ -372,6 +372,19 @@ describe('RunPod API facts', () => {
         await expect(bad.getServerLogs(s.id, { windowMs: 200 })).rejects.toBeInstanceOf(AuthError);
     });
 
+    it('a log read RunPod refuses reads like any other refusal: a 422 with its reasons, a pod that is gone as not found', async () => {
+        // RunPod is asked for a longer backfill than it gives, as if its limit were lower than the one this client keeps to.
+        const { p } = make({}, undefined, (f) => ((url, init) => f(String(url).replace(/tail=\d+/, 'tail=6000'), init)) as typeof fetch);
+        const s = await p.createServer({ name: 'logs', offer: 'NVIDIA RTX A5000', image: 'img' });
+        const e = await p.getServerLogs(s.id, { windowMs: 200 }).catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e).toMatchObject({ status: 422, retriable: false });
+        expect(e.message).toMatch(/^runpod: GET \/v2\/pods\/[^/]+\/logs\?source=container&tail=\d+ -> 422 .*\(tail: must be between 0 and 5000\)$/);
+        const gone = await p.getServerLogs('pod_gone', { windowMs: 200 }).catch((x) => x);
+        expect(gone).toBeInstanceOf(NotFoundError);
+        expect(gone.message).toMatch(/^runpod: GET \/v2\/pods\/pod_gone\/logs\?/);
+    });
+
     it('a 422 says why (errors[]), and is not taken for no capacity', async () => {
         const { p } = make();
         const e = await p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: 'img', providerOptions: { bogus: 1 } }).catch((x) => x);

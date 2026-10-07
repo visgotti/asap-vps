@@ -81,12 +81,8 @@ export class RunPodApi extends ApiClient {
                 ctrl.abort();
             }, windowMs);
             if (!res.ok || !res.body) {
-                const detail = await res.text().catch(() => '');
-                const msg = `logs of pod ${id} -> ${res.status}${detail ? ` ${errorText(safeJson(detail))}` : ''}`;
-                const e = { status: res.status };
-                if (res.status === 401 || res.status === 403) throw new AuthError(this.id, msg, e);
-                if (res.status === 404) throw new NotFoundError(this.id, msg, e);
-                throw new ProviderError(this.id, msg, { ...e, retriable: res.status === 429 || res.status >= 500 });
+                // Read like any other answer of the API (toError), though this request is sent here and not by call().
+                throw this.failure({ status: res.status, body: safeJson(await res.text().catch(() => '')), headers: res.headers }, { method: 'GET', path });
             }
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
