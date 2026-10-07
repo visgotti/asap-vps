@@ -80,6 +80,40 @@ describe('RunPod', () => {
         expect((await p.listServers()).map((s) => s.id)).toContain('pod_cpu1');
     });
 
+    it('lists every page of the account\'s pods: by RunPod\'s cursor until it says there is no next page, never by counting rows', async () => {
+        // RunPod cuts its pages at two rows here (the spec: "a page may hold fewer than `limit` pods").
+        const fake = fakeRunPod({ pageSize: 2 });
+        const p = new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
+        // The account's two pods, then a CPU pod, then two GPU pods: five rows, three pages, newest first.
+        fake.state.pods.set('pod_cpu1', { id: 'pod_cpu1', name: 'cpu-box', status: 'RUNNING', gpu: null, cpu: { id: 'cpu3c', vcpuCount: 4, memory: 8 },
+            dataCenterId: 'US-TX-3', cost: 0.08, createdAt: '2026-01-02T00:00:00Z', reads: 99, logs: [] });
+        for (const name of ['a', 'b']) await p.createServer({ name, offer: 'NVIDIA RTX A5000', image: 'img' });
+        const reads = () => fake.calls.filter((c) => c.method === 'GET' && c.path.startsWith('/v2/pods?')).map((c) => new URLSearchParams(c.path.split('?')[1]));
+        const before = reads().length;
+        expect((await p.listServers()).map((s) => s.name)).toEqual(['b', 'a', 'cpu-box', 'jupyter', 'comfy-dev']);
+        const pages = reads().slice(before);
+        expect(pages.map((q) => q.get('limit'))).toEqual(['1000', '1000', '1000']);
+        expect(pages.map((q) => q.has('cursor'))).toEqual([false, true, true]);
+        // A page with no pod of the kind asked for is not the end of the list: the one CPU pod is on the second page.
+        expect((await p.listServers({ kind: 'cpu' })).map((s) => s.name)).toEqual(['cpu-box']);
+        expect((await p.listServers({ kind: 'gpu' })).map((s) => s.name)).toEqual(['b', 'a', 'jupyter', 'comfy-dev']);
+    });
+
+    it('gives up on a list that never ends: 200 pages, then an error', async () => {
+        const fake = fakeRunPod();
+        let reads = 0;
+        const endless = (async (url: string | URL | Request, init?: RequestInit) => {
+            if (!/\/v2\/(pods|serverless)\?/.test(String(url))) return fake.fetchImpl(url, init);
+            reads++;
+            return new Response(JSON.stringify({ pods: [], endpoints: [], pagination: { nextCursor: 'more', hasNextPage: true } }), { status: 200, headers: { 'content-type': 'application/json' } });
+        }) as typeof fetch;
+        const p = new RunPod({ apiKey: 'rp-test', fetchImpl: endless, sleep: noSleep });
+        await expect(p.listServers()).rejects.toThrow(/more than 200 pages/);
+        expect(reads).toBe(200);
+        await expect(p.listEndpoints()).rejects.toThrow(/more than 200 pages/);
+        expect(reads).toBe(400);
+    });
+
     it('a 400 that reads as a bad request is not taken for no capacity', async () => {
         const { p } = make();
         const e = await p.createServer({ name: 'x', offer: 'NVIDIA H200 NVL', image: 'img' }).catch((x) => x);
@@ -232,6 +266,25 @@ describe('RunPod API facts', () => {
         expect((await p.listOffers({ includeUnavailable: true })).map((o) => o.id)).not.toContain('NVIDIA RTX 3090');
         ({ p } = make({}, 'COMMUNITY'));
         expect((await p.listOffers({ includeUnavailable: true })).find((o) => o.id === 'NVIDIA RTX 3090')?.pricePerHour).toBe(0.22);
+    });
+
+    it('a list comes in pages RunPod cuts, newest first, by a cursor that is the listing operation\'s own; a limit is 1-1000', async () => {
+        const fake = fakeRunPod({ pageSize: 1 });
+        const get = async (path: string) => {
+            const r = await fake.fetchImpl(`https://api.runpod.io${path}`, { headers: { authorization: 'Bearer rp-test' } });
+            return { status: r.status, body: await r.json() as any };
+        };
+        // Fewer rows than asked for, and more to come: only `pagination` says so.
+        const first = await get('/v2/pods?limit=1000');
+        expect(first.body.pods.map((x: any) => x.name)).toEqual(['jupyter']);
+        expect(first.body.pagination).toEqual({ nextCursor: expect.any(String), hasNextPage: true });
+        const second = await get(`/v2/pods?limit=1000&cursor=${first.body.pagination.nextCursor}`);
+        expect(second.body.pods.map((x: any) => x.name)).toEqual(['comfy-dev']);
+        expect(second.body.pagination).toEqual({ nextCursor: null, hasNextPage: false });
+        // "A malformed or foreign cursor is rejected with 422" (the spec's words), as is a limit outside 1-1000.
+        for (const path of [`/v2/serverless?cursor=${first.body.pagination.nextCursor}`, '/v2/pods?cursor=1', '/v2/pods?cursor=', '/v2/pods?limit=1001', '/v2/pods?limit=0']) {
+            expect([path, (await get(path)).status]).toEqual([path, 422]);
+        }
     });
 
     it('pods take no UDP: refused before anything is sent', async () => {
@@ -700,11 +753,15 @@ describe('RunPod serverless: load-balancing endpoints (plain HTTP workers, no Ru
         await expect(p.deleteEndpoint(e.id)).resolves.toBeUndefined();
     });
 
-    it('lists every page of the account\'s endpoints', async () => {
-        const { fake, p } = make();
-        for (let i = 0; i < 3; i++) await p.createEndpoint({ name: `e${i}`, container: WHOAMI, offer: 'cpu3c:2' });
-        const all = await p.listEndpoints();
-        expect(all.map((e) => e.name)).toEqual(['e0', 'e1', 'e2']);
-        expect(fake.calls.filter((c) => c.method === 'GET' && c.path.startsWith('/v2/serverless?')).length).toBe(1);
+    it('lists every page of the account\'s endpoints, newest first, each page asked for by the cursor the one before gave', async () => {
+        // RunPod cuts its pages at two rows here: five endpoints are three pages.
+        const { fake, p } = make({ pageSize: 2 });
+        for (let i = 0; i < 5; i++) await p.createEndpoint({ name: `e${i}`, container: WHOAMI, offer: 'cpu3c:2' });
+        const reads = () => fake.calls.filter((c) => c.method === 'GET' && c.path.startsWith('/v2/serverless?')).map((c) => new URLSearchParams(c.path.split('?')[1]));
+        const before = reads().length;
+        expect((await p.listEndpoints()).map((e) => e.name)).toEqual(['e4', 'e3', 'e2', 'e1', 'e0']);
+        const pages = reads().slice(before);
+        expect(pages.map((q) => q.get('limit'))).toEqual(['1000', '1000', '1000']);
+        expect(pages.map((q) => q.has('cursor'))).toEqual([false, true, true]);
     });
 });

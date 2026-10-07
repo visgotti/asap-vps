@@ -6,7 +6,8 @@
 // PROVISIONING -> STARTING -> RUNNING over a few reads, placed on the cloud
 // they name, on a machine with their GPUs free and on hosts whose CUDA meets
 // gpu.minCudaVersion, and billed at that cloud's rate; POST .../action for start / stop /
-// restart (409 when the status does not allow it); cursor pages; the SSE log
+// restart (409 when the status does not allow it); the lists of pods and of
+// endpoints in pages, newest first, by an opaque cursor; the SSE log
 // stream (RunPod's own lines as source `system`, the command's output as
 // `container`; `source` picks one, `tail` backfills the last lines, 100 by
 // default, at most 5000); the account key list replaced whole by PUT; and
@@ -113,6 +114,8 @@ export function fakeRunPod(o: {
     token?: string, bootReads?: number, resumeWithoutGpu?: boolean,
     /** Requests a load-balancing endpoint answers "no workers available" while its first worker boots (a cold start). */
     coldRequests?: number,
+    /** The most rows a page of a list holds, whatever `limit` asks (the spec's 1000 unless set): a few rows then span pages. */
+    pageSize?: number,
 } = {}) {
     const token = o.token ?? 'rp-test';
     const calls: FakeApi['calls'] = [];
@@ -154,6 +157,25 @@ export function fakeRunPod(o: {
     /** The data centers the catalog knows: where a network volume can be made. */
     const dataCenters = () => new Set(state.gpus.flatMap((g) => g.dataCenters.map((d) => d.id)));
     const livePods = () => [...state.pods.values()].filter((x) => x.status !== 'TERMINATED');
+    /**
+     * One page of a list the spec paginates (listPods, listEndpoints), of rows
+     * given oldest first: served newest first, `limit` of them at most (1-1000,
+     * 1000 when omitted) and never more than `pageSize` (a page may hold fewer
+     * than `limit`: the spec says to follow `nextCursor` while `hasNextPage`,
+     * not to count rows), with a cursor that is opaque and good only for the
+     * operation that issued it (the spec: any other is rejected with 422).
+     */
+    const paged = (u: URL, operation: string, rows: any[]): { rows: any[], pagination: { nextCursor: string | null, hasNextPage: boolean } } | Response => {
+        const limit = u.searchParams.get('limit') ?? '1000';
+        if (!/^\d+$/.test(limit) || Number(limit) < 1 || Number(limit) > 1000) return invalid(['limit: must be an integer from 1 to 1000']);
+        const cursor = u.searchParams.get('cursor');
+        const [issuedBy, at] = cursor === null ? [operation, '0'] : Buffer.from(cursor, 'base64url').toString().split(':');
+        if (issuedBy !== operation || !/^\d+$/.test(at ?? '')) return invalid(['cursor: not a cursor this operation issued']);
+        const newestFirst = [...rows].reverse();
+        const end = Number(at) + Math.min(Number(limit), o.pageSize ?? 1000);
+        const more = end < newestFirst.length;
+        return { rows: newestFirst.slice(Number(at), end), pagination: { nextCursor: more ? Buffer.from(`${operation}:${end}`).toString('base64url') : null, hasNextPage: more } };
+    };
     const view = (p: any) => {
         const { reads, logs, rate, ...rest } = p;
         const running = p.status === 'RUNNING';
@@ -253,12 +275,8 @@ export function fakeRunPod(o: {
             return json(201, endpointView(e));
         }
         if (path === '/v2/serverless' && method === 'GET') {
-            const all = [...state.endpoints.values()];
-            const limit = Number(u.searchParams.get('limit') ?? 1000);
-            const start = Number(u.searchParams.get('cursor') ?? 0);
-            const page = all.slice(start, start + limit);
-            const more = start + page.length < all.length;
-            return json(200, { endpoints: page.map(endpointView), pagination: { nextCursor: more ? String(start + page.length) : null, hasNextPage: more } });
+            const page = paged(u, 'listEndpoints', [...state.endpoints.values()]);
+            return page instanceof Response ? page : json(200, { endpoints: page.rows.map(endpointView), pagination: page.pagination });
         }
         if ((m = /^\/v2\/serverless\/([^/]+)(\/workers)?$/.exec(path))) {
             const e = state.endpoints.get(m[1]);
@@ -403,11 +421,8 @@ export function fakeRunPod(o: {
             return json(201, view(pod));
         }
         if (method === 'GET' && path === '/v2/pods') {
-            const all = [...state.pods.values()].filter((x) => x.status !== 'TERMINATED');
-            const limit = Number(u.searchParams.get('limit') ?? 1000);
-            const at = Number(u.searchParams.get('cursor') ?? 0);
-            const next = at + limit < all.length ? String(at + limit) : null;
-            return json(200, { pods: all.slice(at, at + limit).map(view), pagination: { nextCursor: next, hasNextPage: next !== null } });
+            const page = paged(u, 'listPods', livePods());
+            return page instanceof Response ? page : json(200, { pods: page.rows.map(view), pagination: page.pagination });
         }
         if ((m = /^\/v2\/pods\/([^/]+)$/.exec(path))) {
             const pod = state.pods.get(m[1]);
