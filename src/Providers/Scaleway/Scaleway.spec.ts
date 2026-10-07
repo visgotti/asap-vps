@@ -1,6 +1,6 @@
 // Scaleway against the fake of Scaleway's API (src/testing/fakes/scaleway.ts):
-// what is particular to Scaleway beyond the shared contract (../gpuContract.spec.ts
-// and ../gpuLifecycle.spec.ts). From Scaleway's OpenAPI specs (Instance API v1,
+// what is particular to Scaleway beyond the shared contract (../contract.spec.ts
+// and ../lifecycle.spec.ts). From Scaleway's OpenAPI specs (Instance API v1,
 // IAM, Block Storage v1, read 2026-10-01) and its real catalog answers: prices
 // are euros and memory is bytes; stock is `available`, `scarce` or `shortage` per
 // zone; a server is named by zone and id, created powered off, and started by

@@ -1,5 +1,5 @@
 // VastAI against the fake of Vast.ai's API (src/testing/fakes/vast.ts): what is
-// particular to it beyond the shared contract (../gpuContract.spec.ts). From
+// particular to it beyond the shared contract (../contract.spec.ts). From
 // docs.vast.ai/api-reference, the create guide and the official CLI (checked
 // 2026-09-29): at most 64 offers per search, usable (not nominal) VRAM,
 // containers that crash or go silent never reach running, and each offer is one

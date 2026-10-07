@@ -1,7 +1,7 @@
-// A fetch() that answers like api.scaleway.com for the calls both Scaleway
-// initializers make, from Scaleway's OpenAPI specs (Instance API v1, IAM
+// A fetch() that answers like api.scaleway.com for the calls the Scaleway
+// provider makes, from Scaleway's OpenAPI specs (Instance API v1, IAM
 // v1alpha1, Block Storage v1, Marketplace v2, read 2026-10-01) and its real
-// catalog answers (./scalewayCatalog.ts). What it holds the initializers to:
+// catalog answers (./scalewayCatalog.ts). What it holds the provider to:
 //   - the secret key rides in X-Auth-Token (401 denied_authentication otherwise);
 //   - every Instance and Block call is zonal, and an id is read in its zone only;
 //   - a server is created `stopped` and runs after the `poweron` action; a type in

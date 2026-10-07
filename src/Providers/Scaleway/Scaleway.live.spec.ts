@@ -21,7 +21,7 @@ import { liveOptions, liveRequested } from '../../testing/live';
 import { AuditedScaleway, describeScalewayAudit } from '../../testing/scalewayAudit';
 
 const target = liveLifecycle('scaleway');
-// The suite's initializers are the audited ones: the key and the Project from the environment, `apiKey` replacing the key (the wrong-key check).
+// The suite's providers are the audited ones: the key and the Project from the environment, `apiKey` replacing the key (the wrong-key check).
 target.make = (apiKey) => new AuditedScaleway({
     ...(providerParams(providerInfo('scaleway'), process.env) ?? { apiKey: 'unset' }),
     ...(apiKey ? { apiKey } : {}),
