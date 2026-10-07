@@ -1353,6 +1353,9 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
         await p.attachVolume(share.id, s.id, fast);
         await p.attachVolume(b.id, s.id, fast);
         await expect(p.attachVolume(c.id, s.id, fast)).rejects.toThrow(/3 filesystems on .*it attaches 2/);
+        // One of the two it holds, asked for again: no third, and nothing to send.
+        await expect(p.attachVolume(b.id, s.id, fast)).resolves.toBeUndefined();
+        expect(fake.calls.filter((c) => c.path.endsWith('/attach-filesystem'))).toHaveLength(3);
         await expect(p.attachVolume('fr-par/00000000-0000-4000-8000-0000000000aa', s.id, fast)).rejects.toThrow(/no filesystem/);
         // A bare id of a filesystem works too.
         await p.detachVolume(b.id.split('/')[1], s.id, fast);

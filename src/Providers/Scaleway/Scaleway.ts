@@ -493,8 +493,11 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const f = await this.fileSystemOf(volumeId);
         if (f) {
             // A filesystem: attached (the Instance mounts it with virtiofs: `mount -t virtiofs <id> <path>`), and tagged at its mountPath.
-            this.checkFileSystems(s.zone, await this.typeOf(s.zone, s.commercial_type), [f], s.filesystems?.length ?? 0);
-            if (!s.filesystems?.some((x) => x.filesystem_id === f.id)) await this.api.attachServerFileSystem(s.zone, s.id, f.id);
+            // One the server holds already is no further one: it is not counted against what its type takes.
+            if (!s.filesystems?.some((x) => x.filesystem_id === f.id)) {
+                this.checkFileSystems(s.zone, await this.typeOf(s.zone, s.commercial_type), [f], s.filesystems?.length ?? 0);
+                await this.api.attachServerFileSystem(s.zone, s.id, f.id);
+            }
             await this.api.fileSystemState(s.zone, s.id, f.id, 'available', o);
             const tag = fileSystemTag(f.id, toFileSystemVolume(f).mountPath!);
             if (!s.tags.some((t) => t.startsWith(fileSystemTag(f.id, '')))) await this.api.setServerTags(s.zone, s.id, [...s.tags, tag]);
