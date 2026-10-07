@@ -165,7 +165,8 @@ describe('Scaleway as a VPS host: createServer', () => {
             return fake.fetchImpl(url, init);
         }) as typeof fetch;
         const vps2 = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: flaky, sleep: noSleep });
-        await expect(vps2.createServer(server)).rejects.toMatchObject({ status: 500, retriable: true });
+        // Not retriable either: a caller that tried again on isRetriable would rent a second one.
+        await expect(vps2.createServer(server)).rejects.toMatchObject({ status: 500, retriable: false });
         expect(posts).toBe(1);
         // The account's GPU quota: nothing will be created until it changes.
         const gpu = { ...server, region: REGION_TYPES.WARSAW_2, offer: 'L4-1-24G', image: 'ubuntu_noble_gpu_os_13_nvidia' };

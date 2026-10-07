@@ -119,7 +119,7 @@ export class ScalewayApi extends ApiClient {
         const path = fillPath(e.path, o.path) + queryString(query);
         const r = await this.request(e.method, path, { json: o.json, body: o.body, headers: o.headers, idempotent: o.idempotent });
         if (this.succeeded(r)) return r;
-        throw this.toError(r, { method: e.method, path });
+        throw this.failure(r, { method: e.method, path, idempotent: o.idempotent });
     }
 
     /**

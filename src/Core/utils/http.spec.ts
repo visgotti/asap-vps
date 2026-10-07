@@ -1,8 +1,8 @@
 // The HTTP retry rules every initializer's API calls follow, and ApiClient,
 // which holds a provider's base URL and key.
 
-import { TransportError } from '../../errors';
-import { ApiClient, errorText, http, redact } from './http';
+import { isRetriable, ProviderError, TransportError } from '../../errors';
+import { ApiClient, errorText, http, redact, RequestOptions } from './http';
 
 /** A fetch that answers from a list of statuses ('net' = a transport failure), recording calls. */
 function scripted(statuses: Array<number | 'net'>) {
@@ -34,6 +34,36 @@ describe('http', () => {
         expect(s.calls).toHaveLength(1);
         s = scripted([429, 202]);
         expect((await http('https://x/a', { method: 'POST', json: {}, fetchImpl: s.fetchImpl, sleep })).status).toBe(202);
+    });
+
+    it('never sends a create again after its answer was lost (it may have made a machine), and does not call that retriable', async () => {
+        let s = scripted(['net', 200]);
+        const lost = await http('https://x/a', { method: 'POST', json: {}, fetchImpl: s.fetchImpl, sleep }).catch((x) => x);
+        expect(s.calls).toHaveLength(1);
+        expect(lost).toBeInstanceOf(TransportError);
+        expect([lost.retriable, isRetriable(lost)]).toEqual([false, false]);
+        s = scripted(['net', 200]);
+        await expect(http('https://x/a', { method: 'PUT', json: {}, idempotent: false, fetchImpl: s.fetchImpl, sleep })).rejects.toMatchObject({ retriable: false });
+        expect(s.calls).toHaveLength(1);
+        // A read that never got an answer is retried, and still is when it gives up.
+        s = scripted(['net']);
+        const read = await http('https://x/a', { fetchImpl: s.fetchImpl, sleep }).catch((x) => x);
+        expect(s.calls).toHaveLength(4);
+        expect(isRetriable(read)).toBe(true);
+    });
+
+    it('an answer cut off mid-body is no answer: a read tries again, a create says so without trying again', async () => {
+        let n = 0;
+        const cutOnce = (async () => (n++ === 0
+            ? new Response(new ReadableStream({ start(c) { c.error(new TypeError('terminated')); } }), { status: 200, headers: { 'content-type': 'application/json' } })
+            : new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }))) as unknown as typeof fetch;
+        expect((await http('https://x/a', { fetchImpl: cutOnce, sleep })).body).toEqual({ ok: true });
+        expect(n).toBe(2);
+        n = 0;
+        const e = await http('https://x/a', { method: 'POST', json: {}, fetchImpl: cutOnce, sleep }).catch((x) => x);
+        expect(n).toBe(1);
+        expect(e).toBeInstanceOf(TransportError);
+        expect(e).toMatchObject({ retriable: false, message: expect.stringMatching(/POST https:\/\/x\/a: the answer \(200\) was cut off: terminated/) });
     });
 
     it('a failed request names no credential', async () => {
@@ -82,6 +112,21 @@ describe('ApiClient', () => {
         await api.request('POST', '/things', { json: { a: 1 } });
         expect(sent[0]).toMatchObject({ body: userData, headers: { 'content-type': 'text/plain' } });
         expect(sent[1]).toMatchObject({ body: '{"a":1}', headers: { 'content-type': 'application/json' } });
+    });
+
+    it('marks a failed answer retriable as is safe: a read\'s server error is, a create\'s is not; a refusal (429) is either way', async () => {
+        class Probe extends ApiClient {
+            call(method: string, path: string, o: RequestOptions = {}) {
+                return this.send(method, path, o);
+            }
+        }
+        const probe = (statuses: Array<number | 'net'>) => new Probe({ apiKey: 'k', fetchImpl: scripted(statuses).fetchImpl, sleep: async () => {} }, 'https://api.example.com');
+        const failed = (p: Promise<unknown>) => p.then(() => { throw new Error('did not fail'); }, (e: ProviderError) => [e.status, e.retriable, isRetriable(e)]);
+        expect(await failed(probe([503]).call('GET', '/things'))).toEqual([503, true, true]);
+        expect(await failed(probe([503]).call('POST', '/things', { json: {} }))).toEqual([503, false, false]);
+        expect(await failed(probe([503]).call('PUT', '/asks/1', { json: {}, idempotent: false }))).toEqual([503, false, false]);
+        expect(await failed(probe([503]).call('POST', '/terminate', { json: {}, idempotent: true }))).toEqual([503, true, true]);
+        expect(await failed(probe([429]).call('POST', '/things', { json: {} }))).toEqual([429, true, true]);
     });
 
     it('takes a bare key, defaults the rest, and refuses no key', () => {

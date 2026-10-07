@@ -60,7 +60,7 @@ export async function http(url: string, o: HttpOptions = {}): Promise<HttpResult
                 await sleep(backoff(attempt));
                 continue;
             }
-            throw new TransportError(`${method} ${redact(url)}: ${(e as Error).message}`, e);
+            throw new TransportError(`${method} ${redact(url)}: ${(e as Error).message}`, e, idempotent);
         }
         const retriable = res.status === 429 || (idempotent && res.status >= 500 && res.status !== 501);
         if (retriable && attempt < retries) {
@@ -68,7 +68,17 @@ export async function http(url: string, o: HttpOptions = {}): Promise<HttpResult
             await sleep(retryAfterMs(res.headers.get('retry-after')) ?? backoff(attempt));
             continue;
         }
-        const text = await res.text();
+        let text: string;
+        try {
+            text = await res.text();
+        } catch (e) {
+            // The answer was cut off (a reset or a timeout mid-body): no answer, as far as the caller can tell.
+            if (idempotent && attempt < retries) {
+                await sleep(backoff(attempt));
+                continue;
+            }
+            throw new TransportError(`${method} ${redact(url)}: the answer (${res.status}) was cut off: ${(e as Error).message}`, e, idempotent);
+        }
         let parsed: any = text;
         if (text && /json/i.test(res.headers.get('content-type') ?? '')) {
             try {
@@ -93,7 +103,17 @@ export type RequestOptions = {
 };
 
 /** The request a failed answer was to: what an error says it was. */
-export type RequestInfo = { method: string, path: string };
+export type RequestInfo = {
+    method: string,
+    path: string,
+    /** Overrides the method's default (GET, HEAD, PUT and DELETE do no harm twice). */
+    idempotent?: boolean,
+};
+
+/** Whether a request does no harm sent twice: its own say, else its method's. */
+export function isIdempotent(req: Pick<RequestInfo, 'method' | 'idempotent'>): boolean {
+    return req.idempotent ?? IDEMPOTENT.has(req.method.toUpperCase());
+}
 
 /**
  * One platform's REST API: its base URL and key, called with http()'s retry
@@ -147,7 +167,19 @@ export class ApiClient {
     protected async send<T = any>(method: string, path: string, o: RequestOptions = {}): Promise<T> {
         const r = await this.request(method, path, o);
         if (this.succeeded(r)) return r.body as T;
-        throw this.toError(r, { method, path });
+        throw this.failure(r, { method, path, idempotent: o.idempotent });
+    }
+
+    /**
+     * A failed answer's typed error (toError), never marked retriable where a
+     * request that may have done its work answered a server error: a create
+     * that answered 5xx may have made a machine. A refusal (4xx: a 429, a
+     * transient state) did nothing, and stays as toError says.
+     */
+    protected failure(r: HttpResult, req: RequestInfo): ProviderError {
+        const e = this.toError(r, req);
+        if (e.retriable && r.status >= 500 && !isIdempotent(req)) Object.defineProperty(e, 'retriable', { value: false });
+        return e;
     }
 
     /** Whether an answer is a success (2xx; a platform that answers its failures with 200 says more). */

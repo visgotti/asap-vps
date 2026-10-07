@@ -162,10 +162,12 @@ describe('errors: every kind of answer Scaleway sends is a typed error', () => {
         expect(locked).toMatchObject({ code: 'precondition_failed', retriable: false });
     });
 
-    it('a server error and a rate limit are retriable; an answer that is not JSON is read as text', async () => {
+    it('a server error is retriable for a read, never for a create (it may have made the server); a rate limit is; text is read as text', async () => {
         const down = await fails(503, 'upstream connect error', 'text/html');
-        expect(down).toMatchObject({ status: 503, retriable: true });
+        expect(down).toMatchObject({ status: 503, retriable: false });
         expect(down.message).toMatch(/503 .*upstream connect error/);
+        const read = await apiWith(answering(503, 'upstream connect error', 'text/html')).getServer('pl-waw-2', ID).catch((e) => e);
+        expect(read).toMatchObject({ status: 503, retriable: true });
         expect(await fails(429, { type: 'too_many_requests', message: 'slow down' })).toMatchObject({ status: 429, retriable: true });
         expect(await fails(400, 'not json at all', 'text/plain')).toMatchObject({ status: 400, retriable: false });
     });

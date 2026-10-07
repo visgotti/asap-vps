@@ -163,7 +163,8 @@ describe('DigitalOcean as a VPS host', () => {
             return fake.fetchImpl(url, init);
         }) as typeof fetch;
         const vps2 = new DigitalOcean({ apiKey: 'do-test', fetchImpl: flaky, sleep: noSleep });
-        await expect(vps2.createServer(droplet)).rejects.toMatchObject({ status: 500, retriable: true });
+        // Not retriable either: a caller that tried again on isRetriable would rent a second one.
+        await expect(vps2.createServer(droplet)).rejects.toMatchObject({ status: 500, retriable: false });
         expect(posts).toBe(1);
         // The account's droplet limit: nothing will be created until it changes.
         await vps.createServer(droplet);

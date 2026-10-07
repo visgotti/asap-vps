@@ -65,20 +65,31 @@ export class NotSupportedError extends ProviderError {
     }
 }
 
-/** A request that got no answer (refused, reset, timed out): what it did is unknown. */
+/** A request that got no answer, or not all of it (refused, reset, timed out, cut off): what it did is unknown. */
 export class TransportError extends Error {
     readonly cause?: unknown;
+    /**
+     * Worth sending again as it is: true for a request that does no harm twice
+     * (a read, an idempotent write); false for one that may have done its work
+     * (a create whose answer was lost: sending it again could rent a second machine).
+     */
+    readonly retriable: boolean;
 
-    constructor(message: string, cause?: unknown) {
+    constructor(message: string, cause?: unknown, retriable = true) {
         super(message);
         this.name = 'TransportError';
+        this.retriable = retriable;
         if (cause !== undefined) this.cause = cause;
     }
 }
 
-/** A failure worth trying again: no answer at all, or one the provider marks temporary. */
+/**
+ * A failure safe to try again as it is: a read or idempotent request that got
+ * no answer or a temporary error, or a rate limit (refused before anything was
+ * done). Never a create that may have done its work.
+ */
 export function isRetriable(e: unknown): boolean {
-    return e instanceof TransportError || (e instanceof ProviderError && e.retriable);
+    return (e instanceof TransportError || e instanceof ProviderError) && e.retriable;
 }
 
 /** What `work` resolved to, or null when it failed with NotFoundError: a read of something that may not exist. */
