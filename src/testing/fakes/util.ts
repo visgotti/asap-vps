@@ -6,19 +6,71 @@ import { toOpenSSHPublicKey } from '../../Core/utils';
 
 export type FakeCall = { method: string, host: string, path: string, body?: any, auth?: string, headers?: Record<string, string> };
 
+/** What the server at a host shows to a login: what a VM fake knows of that one server. */
+export type FakeMachine = {
+    /** Changes with each of this server's own boots (its first, its reboots, its power-ons), never with another's. */
+    bootId: string,
+    /** The files on its disk: what its user data wrote at its first boot, and what the image it booted from carried. */
+    files: Record<string, string>,
+    /** The public keys (OpenSSH lines) its sshd takes. */
+    keys: string[],
+};
+
 export type FakeApi = {
     fetchImpl: typeof fetch,
     calls: FakeCall[],
     /** Servers that exist at the provider right now (not deleted). */
     liveServers(): number,
     /**
-     * Whether the server reachable at `host` is up and accepts this public key (an
-     * OpenSSH line) right now, for a fake that models which keys a server
-     * authorizes (Scaleway applies its Project's keys at every boot); absent: any
-     * key does. Asking is a request like any other: time passes.
+     * Whether the server reachable at `host` is up and takes this public key (an
+     * OpenSSH line) right now: one of `machine(host)`'s keys. Asking is a
+     * request like any other: time passes.
      */
     authorized?(host: string, publicKey: string): boolean,
+    /**
+     * The server reachable at `host` right now, as its sshd would show it, for
+     * a fake of VMs; undefined when nothing answers there. Asking is a request
+     * like any other: time passes.
+     */
+    machine?(host: string): FakeMachine | undefined,
 };
+
+/**
+ * The files a user-data script's `echo <text> > <path>` lines write: what a
+ * fake VM's first boot leaves on its disk (a fake runs no script; this is the
+ * one form the tests write).
+ */
+export function userDataFiles(userData: unknown): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const m of String(userData ?? '').matchAll(/\becho\s+(\S+)\s*>\s*(\S+)/g)) out[m[2]] = m[1];
+    return out;
+}
+
+/** A boot id (as /proc/sys/kernel/random/boot_id reads) for a server's `n`th boot: `server` sets its first 8 hex digits. */
+export function fakeBootId(server: string | number, n: number): string {
+    const head = (typeof server === 'number' ? server.toString(16) : server.replace(/[^0-9a-f]/gi, '')).toLowerCase().padStart(8, '0').slice(-8);
+    return `${head}-0000-4000-8000-${String(n).padStart(12, '0')}`;
+}
+
+/** Files carried in a fake disk export (a QCOW2): written after its magic, so a byte-for-byte copy keeps them. */
+export function writeDiskFiles(disk: Buffer, files: Record<string, string> = {}): void {
+    const json = Buffer.from(JSON.stringify(files), 'utf8');
+    disk.writeUInt32BE(json.length, 2048);
+    json.copy(disk, 2052);
+}
+
+/** The files a fake disk export carries; {} for a disk with none. */
+export function readDiskFiles(disk: Uint8Array): Record<string, string> {
+    const b = Buffer.from(disk.buffer, disk.byteOffset, disk.byteLength);
+    if (b.length < 2052) return {};
+    const n = b.readUInt32BE(2048);
+    if (!n || 2052 + n > b.length) return {};
+    try {
+        return JSON.parse(b.subarray(2052, 2052 + n).toString('utf8'));
+    } catch {
+        return {};
+    }
+}
 
 export function json(status: number, body?: unknown, type = 'application/json', headers: Record<string, string> = {}): Response {
     return new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { 'content-type': type, ...headers } });

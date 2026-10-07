@@ -12,7 +12,7 @@
 // `data`; every failure is {error: {code, message}}. A test puts an instance in
 // `unhealthy` or `preempted` through `state.instances`.
 
-import { FakeApi, json, readRequest } from './util';
+import { fakeBootId, FakeApi, json, readRequest, userDataFiles } from './util';
 
 const TYPES = {
     gpu_1x_a10: { instance_type: { name: 'gpu_1x_a10', description: '1x A10 (24 GB PCIe)', gpu_description: 'A10 (24 GB PCIe)', price_cents_per_hour: 75,
@@ -57,7 +57,7 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
         file_system_names: [], region: { name: 'us-east-1', description: 'Virginia, USA' }, instance_type: TYPES.gpu_1x_a10.instance_type, actions: {}, first_healthy: '2026-01-01T00:00:00Z', reads: 99 });
     const fail = (status: number, code: string, message: string, suggestion?: string) => json(status, { error: { code, message, ...(suggestion ? { suggestion } : {}) } });
     const view = (i: any) => {
-        const { reads, terminatingReads, ...rest } = i;
+        const { reads, terminatingReads, files, boots, authKeys, ...rest } = i;
         return rest;
     };
     /** Whether a live instance mounts the filesystem, or Lambda has not let go of it yet. */
@@ -114,7 +114,9 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
             }
             const id = hex(state.nextId++);
             const fsMounts = [...mounts].map(([file_system_id, mount_point]) => ({ file_system_id, mount_point }));
-            state.instances.set(id, { id, name: body.name, status: 'booting', ssh_key_names: body.ssh_key_names,
+            // Its authorized_keys: the named keys as the account holds them now (deleting one later leaves the instance's copy).
+            const authKeys = body.ssh_key_names.map((n: string) => [...state.keys.values()].find((k) => k.name === n).public_key);
+            state.instances.set(id, { id, name: body.name, status: 'booting', ssh_key_names: body.ssh_key_names, authKeys,
                 file_system_names: fsMounts.map((x) => state.filesystems.get(x.file_system_id).name), ...(fsMounts.length ? { file_system_mounts: fsMounts } : {}),
                 region: { name: body.region_name, description: '' }, instance_type: t.instance_type, actions: {}, user_data: body.user_data, tags: body.tags, reads: 0 });
             return json(200, { data: { instance_ids: [id] } });
@@ -127,7 +129,12 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
             if (!i) return fail(404, 'global/object-does-not-exist', 'Specified instance does not exist.');
             i.reads++;
             // Billed from its first passed health check: first_healthy.
-            if (i.status === 'booting' && i.reads >= state.bootReads) Object.assign(i, { status: 'active', ip: `198.51.100.${i.reads}`, private_ip: '10.0.0.20', first_healthy: new Date().toISOString() });
+            if (i.status === 'booting' && i.reads >= state.bootReads) {
+                Object.assign(i, { status: 'active', ip: `198.51.100.${i.reads}`, private_ip: '10.0.0.20', first_healthy: new Date().toISOString() });
+                // Its first boot: cloud-init runs its user data.
+                i.boots = 1;
+                i.files = userDataFiles(i.user_data);
+            }
             else if (i.status === 'terminating') {
                 if (++i.terminatingReads > state.terminateReads) terminated(i);
             } else if (i.status === 'terminated') {
@@ -146,6 +153,8 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
         if (method === 'POST' && path === '/api/v1/instance-operations/restart') {
             const found = (body?.instance_ids ?? []).map((id: string) => state.instances.get(id)).filter(Boolean);
             if (!found.length) return fail(404, 'global/object-does-not-exist', 'Specified instance does not exist.');
+            // A restart is a boot of these instances, and of no other.
+            for (const i of found) i.boots = (i.boots ?? 1) + 1;
             return json(200, { data: { restarted_instances: found.map(view) } });
         }
         if (path === '/api/v1/filesystems') {
@@ -196,6 +205,13 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
         calls,
         state,
         liveServers: () => [...state.instances.values()].filter((i) => i.status !== 'terminated' && i.status !== 'terminating').length,
+        machine: (host: string) => {
+            const i = [...state.instances.values()].find((x) => x.status === 'active' && x.ip === host);
+            if (!i) return undefined;
+            // Its sshd takes the keys its launch named, as the account held them then (a seeded instance: as it holds them now).
+            const keys: string[] = i.authKeys ?? i.ssh_key_names.map((n: string) => [...state.keys.values()].find((k) => k.name === n)?.public_key).filter(Boolean);
+            return { bootId: fakeBootId(i.id, i.boots ?? 1), files: { ...(i.files ?? {}) }, keys: [...keys] };
+        },
     };
     return api;
 }

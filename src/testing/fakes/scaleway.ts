@@ -39,7 +39,7 @@
 // here, so a client that trusted it instead of computing the SHA256 one would show).
 
 import { sshKeyFingerprint } from '../../Core/utils';
-import { FakeApi, json, readRequest } from './util';
+import { fakeBootId, FakeApi, FakeMachine, json, readDiskFiles, readRequest, userDataFiles, writeDiskFiles } from './util';
 import { fakeS3, FakeS3 } from './s3';
 import { MARKETPLACE_IMAGES, SERVER_TYPES } from './scalewayCatalog';
 
@@ -188,7 +188,7 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
         stopping: [],
     };
     const view = (s: any) => {
-        const { bootLeft, stopLeft, terminating, userData, bootKeys, ...rest } = s;
+        const { bootLeft, stopLeft, terminating, userData, bootKeys, files, boots, ...rest } = s;
         return { ...rest, filesystems: (rest.filesystems ?? []).map((x: any) => ({ ...x })), allowed_actions: ALLOWED[s.state] ?? [] };
     };
     /** A server's filesystems let go of (it is deleted). */
@@ -238,6 +238,8 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
             s.modification_date = now();
             s.state_detail = '';
             s.bootKeys = [...state.keys.values()].filter((k) => k.project_id === s.project && !k.disabled).map((k) => k.public_key);
+            // cloud-init runs its user data at the first boot only.
+            if (++s.boots === 1) Object.assign(s.files, userDataFiles(s.userData['cloud-init']));
             // A dynamic IP is released when the server is stopped: a power-on gets a new one, a reboot keeps it.
             if (!s.public_ips.length) {
                 s.public_ips = [{ id: uuid(), address: `51.159.0.${state.nextIp++}`, gateway: '10.0.0.1', netmask: '32', family: 'inet', dynamic: true,
@@ -261,6 +263,7 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
             if (!x.exportTo || --x.exportTo.left > 0) continue;
             const qcow2 = Buffer.alloc(4096, 2);
             qcow2.write('QFI\xfb', 0, 'latin1');
+            writeDiskFiles(qcow2, x.files);
             state.s3[x.exportTo.region]?.buckets.get(x.exportTo.bucket)?.set(x.exportTo.key, new Uint8Array(qcow2));
             delete x.exportTo;
             if (x.volume_type === 'sbs_snapshot') x.status = 'available';
@@ -348,6 +351,8 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
             state_detail: '', boot_type: b.boot_type ?? 'local', arch: type.arch, zone, end_of_service: false, dns: null, ipv6: null,
             volumes,
             bootLeft: 0, stopLeft: 0, terminating: false, userData: {}, bootKeys: [],
+            // Its disk: what the image it boots from carries; its user data adds to it at its first boot.
+            files: { ...(image.files ?? {}) }, boots: 0,
         };
         state.servers.set(`${zone}/${id}`, s);
         return json(201, { server: view(s) });
@@ -398,12 +403,13 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
                 const made = vols.map((v) => {
                     const id = uuid();
                     const type = v.volume_type === 'sbs_volume' ? 'sbs_snapshot' : 'unified';
-                    state.snapshots.set(id, { id, name: `${b.name}-${v.name}`, volume_type: type, size: v.size, zone: s.zone, image: imageId });
+                    // The root disk's snapshot holds the server's files.
+                    state.snapshots.set(id, { id, name: `${b.name}-${v.name}`, volume_type: type, size: v.size, zone: s.zone, image: imageId, ...(v === own[0] ? { files: { ...s.files } } : {}) });
                     return { id, name: `${b.name}-${v.name}`, size: v.size, volume_type: type };
                 });
                 state.images.set(imageId, { id: imageId, name: b.name, arch: s.arch, from_server: s.id, organization: s.project, project: s.project, public: false,
                     root_volume: made[0] ?? null, extra_volumes: Object.fromEntries(made.slice(1).map((m, i) => [String(i + 1), { ...m, organization: s.project, project: s.project, tags: [], server: null, state: 'available', zone: s.zone }])), state: 'creating',
-                    tags: [], zone: s.zone, creation_date: now(), modification_date: now(), left: state.imageReads });
+                    tags: [], zone: s.zone, creation_date: now(), modification_date: now(), left: state.imageReads, files: { ...s.files } });
                 return json(200, { task: { id: uuid(), description: 'server_backup', progress: 0, status: 'pending', href_from: `/servers/${s.id}/action`, ...(o.noTaskHref ? {} : { href_result: `/images/${imageId}` }) } });
             }
             default:
@@ -424,7 +430,7 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
             public_ips: [{ id: uuid(), address: '51.159.1.1', gateway: '10.0.0.1', netmask: '32', family: 'inet', dynamic: true, provisioning_mode: 'dhcp', tags: [], ipam_id: uuid(), state: 'attached' }],
             mac_address: '02:00:00:00:00:02', state: 'running', state_detail: '', boot_type: 'local', arch: 'x86_64', zone, end_of_service: false, dns: null, ipv6: null,
             volumes: { 0: { id: rootId, name: `${name}-0`, volume_type: rootType, size: 20_000_000_000, boot: true, state: 'available', zone } },
-            bootLeft: 0, stopLeft: 0, terminating: false, userData: {}, bootKeys: [] });
+            bootLeft: 0, stopLeft: 0, terminating: false, userData: {}, bootKeys: [], files: {}, boots: 1 });
         return id;
     };
     const prodServer = seed('fr-par-1', 'api-1', 'DEV1-S', 'l_ssd');
@@ -729,7 +735,7 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
                 const id = uuid();
                 const image = { id, name: body.name, arch: body.arch, from_server: null, organization: body.project, project: body.project, public: body.public ?? false,
                     root_volume: { id: snap.id, name: snap.name, size: snap.size, volume_type: 'sbs_snapshot' }, extra_volumes: {}, state: 'creating', tags: body.tags ?? [],
-                    zone, creation_date: now(), modification_date: now(), left: state.imageReads };
+                    zone, creation_date: now(), modification_date: now(), left: state.imageReads, files: { ...(snap.files ?? {}) } };
                 state.images.set(id, image);
                 return json(201, { image: imageView(image) });
             }
@@ -810,7 +816,7 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
             const id = uuid();
             const snap = { id, name: body.name, size: body.size ?? 10e9, project_id: body.project_id ?? FAKE_SCALEWAY_PROJECT, created_at: now(), updated_at: now(),
                 status: 'creating', tags: body.tags ?? [], zone, volume_type: 'sbs_snapshot', left: o.importReads ?? 2,
-                corrupt: Buffer.from(object.slice(0, 4)).toString('latin1') !== 'QFI\xfb' };
+                corrupt: Buffer.from(object.slice(0, 4)).toString('latin1') !== 'QFI\xfb', files: readDiskFiles(object) };
             state.snapshots.set(id, snap);
             return json(200, snapshotView(snap));
         }
@@ -872,6 +878,14 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
         return err(404, 'unknown_resource', `fake has no route ${method} ${path}`);
     }
 
+    // A login attempt is a request like any other: time passes (a server that reboots is not reachable until it runs again).
+    const machine = (host: string): FakeMachine | undefined => {
+        advance();
+        const s = [...state.servers.values()].find((x) => x.state === 'running' && x.public_ips.some((ip: any) => ip.address === host));
+        // Its sshd takes the Project's keys as its last boot applied them.
+        return s && { bootId: fakeBootId(s.id, s.boots), files: { ...s.files }, keys: [...s.bootKeys] };
+    };
+
     const api: FakeApi & {
         state: typeof state, prodServerId: string, backupImageId: string, liveVolumes(): number, liveSnapshots(): number,
         intercept(match: (r: FakeScalewayRequest) => boolean, hook: FakeScalewayHook): void,
@@ -884,12 +898,8 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
         prodServerId: prodServer,
         backupImageId: backupId,
         liveServers: () => state.servers.size,
-        // A login attempt is a request like any other: time passes (a server that reboots is not reachable until it runs again).
-        authorized: (host, publicKey) => {
-            advance();
-            return [...state.servers.values()].some((s) => s.state === 'running' && s.public_ips.some((ip: any) => ip.address === host)
-                && s.bootKeys.some((k: string) => sshKeyFingerprint(k) === sshKeyFingerprint(publicKey)));
-        },
+        machine,
+        authorized: (host, publicKey) => !!machine(host)?.keys.some((k) => sshKeyFingerprint(k) === sshKeyFingerprint(publicKey)),
         /** Block Storage volumes that still exist: each bills until deleted. */
         liveVolumes: () => state.volumes.size + state.localVolumes.size,
         liveSnapshots: () => state.snapshots.size,

@@ -14,7 +14,7 @@
 
 import { randomUUID } from 'crypto';
 import { sshKeyFingerprint } from '../../Core/utils';
-import { FakeApi, json, readRequest } from './util';
+import { fakeBootId, FakeApi, json, readRequest, userDataFiles } from './util';
 
 /** Public images: GET /v2/images lists them with the account's own; ?private=true leaves them out. */
 const PUBLIC_IMAGES = [
@@ -91,7 +91,7 @@ export function fakeDigitalOcean(o: {
         size_gigabytes: 25, created_at: '2026-09-01T00:00:00Z', droplet_id: 5000 });
     const err = (status: number, id: string, message: string) => json(status, { id, message });
     const view = (d: any) => {
-        const { reads, user_data, ...rest } = d;
+        const { reads, user_data, files, boots, authKeys, ...rest } = d;
         return rest;
     };
     /** An image as read: an import moves on with each read (NEW, then available, or deleted with an error for a corrupt file). */
@@ -202,9 +202,13 @@ export function fakeDigitalOcean(o: {
             // A droplet joins the VPC it names (of its region), else its region's default one.
             if (body.vpc_uuid !== undefined && !state.vpcs.some((v) => v.id === body.vpc_uuid && v.region === body.region)) return err(422, 'unprocessable_entity', 'vpc_uuid is not a VPC of the region.');
             const id = state.nextId++;
+            // What its sshd takes: the keys it was created with (applied at creation only), and its disk: what the image carried.
+            const authKeys = (Array.isArray(body.ssh_keys) ? body.ssh_keys : []).map((r: unknown) => knownKeys().find((k) => String(k.id) === String(r) || k.fingerprint === r)!.public_key);
+            const carried = typeof body.image === 'number' ? state.images.get(String(body.image))?.files ?? {} : {};
             const d = { id, name: body.name, status: 'new', tags: body.tags ?? [], region: { slug: body.region }, size_slug: size.slug, size,
                 image: body.image, ssh_keys: body.ssh_keys, user_data: body.user_data, created_at: new Date().toISOString(), networks: { v4: [], v6: [] },
-                volume_ids: volumes.map((v: any) => v.id), vpc_uuid: body.vpc_uuid ?? state.vpcs.find((v) => v.region === body.region)?.id, reads: 0 };
+                volume_ids: volumes.map((v: any) => v.id), vpc_uuid: body.vpc_uuid ?? state.vpcs.find((v) => v.region === body.region)?.id, reads: 0,
+                authKeys, files: { ...carried }, boots: 0 };
             for (const v of volumes) v.droplet_ids = [id];
             state.droplets.set(String(id), d);
             return json(202, { droplet: view(d), links: { actions: [{ id: state.nextId++, rel: 'create' }] } });
@@ -221,6 +225,9 @@ export function fakeDigitalOcean(o: {
             if (method === 'GET') {
                 if (d.status === 'new' && ++d.reads >= state.bootReads) {
                     d.status = 'active';
+                    // Its first boot: cloud-init runs its user data.
+                    d.boots = 1;
+                    Object.assign(d.files, userDataFiles(d.user_data));
                     d.networks = { v4: [{ ip_address: `203.0.113.${d.id % 250}`, type: 'public' }, { ip_address: '10.10.0.2', type: 'private' }], v6: [] };
                 }
                 return json(200, { droplet: view(d) });
@@ -300,13 +307,17 @@ export function fakeDigitalOcean(o: {
                 const action = startAction('snapshot', () => {
                     const id = state.nextId++;
                     state.images.set(String(id), { id, name: body.name, type: 'snapshot', regions: [region], status: 'available',
-                        size_gigabytes: 23.25, created_at: new Date().toISOString(), droplet_id: dropletId });
+                        size_gigabytes: 23.25, created_at: new Date().toISOString(), droplet_id: dropletId, files: { ...(state.droplets.get(String(dropletId))?.files ?? {}) } });
                 }, d.id);
                 return json(201, { action });
             }
             const done = { power_off: 'off', shutdown: 'off', power_on: 'active', reboot: 'active' }[body.type as string];
             if (!done) return err(422, 'unprocessable_entity', `unsupported action ${body.type}`);
-            const action = startAction(body.type, () => { d.status = done; }, d.id);
+            const action = startAction(body.type, () => {
+                d.status = done;
+                // A reboot or a power-on is a boot of this droplet, and of no other.
+                if (body.type === 'reboot' || body.type === 'power_on') d.boots++;
+            }, d.id);
             return json(201, { action });
         }
         if (method === 'GET' && (m = /^\/v2\/actions\/(\d+)$/.exec(path))) {
@@ -405,6 +416,11 @@ export function fakeDigitalOcean(o: {
         calls,
         state,
         liveServers: () => state.droplets.size,
+        machine: (host: string) => {
+            const d = [...state.droplets.values()].find((x) => x.status === 'active' && x.networks.v4.some((n: any) => n.type === 'public' && n.ip_address === host));
+            // The account's own droplets (seeded) were made before the test: one boot, nothing on file.
+            return d && { bootId: fakeBootId(d.id, d.boots ?? 1), files: { ...(d.files ?? {}) }, keys: [...(d.authKeys ?? [])] };
+        },
         backupImageId: String(backupId),
     };
     return api;
