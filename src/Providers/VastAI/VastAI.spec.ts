@@ -92,6 +92,30 @@ describe('Vast.ai API facts', () => {
     };
     const searches = (fake: ReturnType<typeof fakeVast>) => fake.calls.filter((c) => c.method === 'POST' && c.path === '/api/v0/bundles/');
 
+    it('what is not there, as Vast answers it: an instance (200, none), an offer (a 404 that says no_such_ask only in its message, or a 410), a key (400 no_ssh_key)', async () => {
+        const { p, fake } = make();
+        const answered = async (method: string, path: string, body?: unknown) => {
+            const r = await fake.fetchImpl(`https://console.vast.ai${path}`, { method, headers: { authorization: 'Bearer vast-test' }, ...(body ? { body: JSON.stringify(body) } : {}) });
+            return [r.status, await r.json()];
+        };
+        // An instance Vast does not have: its read answers 200 with none (seen live 2026-10-07), not a 404. No server, and deleting it is no error.
+        expect(await answered('GET', '/api/v0/instances/424242/')).toEqual([200, { instances: null }]);
+        expect(await p.getServer('424242')).toBeNull();
+        expect(await answered('DELETE', '/api/v0/instances/424242/')).toEqual([404, { success: false, error: 'not_found', msg: 'Instance not found' }]);
+        await expect(p.deleteServer('424242')).resolves.toBeUndefined();
+        // An offer Vast does not have: no stock, like one rented since it was listed.
+        const unknown = await p.createServer({ name: 'x', offer: '999', image: 'img' }).catch((e) => e);
+        expect(unknown).toBeInstanceOf(CapacityError);
+        expect(unknown).toMatchObject({ status: 404, code: 'invalid_args', message: expect.stringMatching(/error 404\/3603: no_such_ask Instance type by id 999 is not available/) });
+        fake.state.asks.find((a) => a.id === 101)!.rentable = false;
+        const taken = await p.createServer({ name: 'x', offer: '101', image: 'img' }).catch((e) => e);
+        expect(taken).toBeInstanceOf(CapacityError);
+        expect(taken).toMatchObject({ status: 410, code: 'no_such_ask' });
+        // A key that is not there: nothing to delete.
+        expect(await answered('DELETE', '/api/v0/ssh/1/')).toEqual([400, { success: false, error: 'no_ssh_key', msg: 'No ssh key provided' }]);
+        expect(await p.deleteSSHKey('1')).toBe(false);
+    });
+
     it('asks Vast for the model and vendor it wants: a data-center card behind 600 cheap ones is one search away', async () => {
         const { p, fake } = make();
         cheapCards(fake);

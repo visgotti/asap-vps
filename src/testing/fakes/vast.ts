@@ -87,7 +87,6 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
             gpu_name: 'RTX 3090', num_gpus: 1, geolocation: 'Utah, US', dph_total: 0.2, machine_id: 99, start_date: 1_700_000_000, reads: 99 });
     }
     const fail = (status: number, error: string, msg: string) => json(status, { success: false, error, msg });
-    /** What one run of an instance's container prints: its GPU (when the command asks), its echoes, a hello. */
     /** What one run of an instance's container prints: only what its command prints (nvidia-smi -L: a line per GPU; its echoes). */
     const containerRun = (i: any): string => {
         const gpus = String(i.image_args ?? '').includes('nvidia-smi')
@@ -174,7 +173,10 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
                 return fail(status, 'server_error', 'upstream timeout');
             }
             const ask = state.asks.find((a) => String(a.id) === m![1]);
-            if (!ask || !ask.rentable) return fail(410, 'no_such_ask', `error 410/3907: no_such_ask Instance type ${m[1]} is no longer available.`);
+            // An offer Vast does not have: the spec's 404, whose error is invalid_args (only its message says no_such_ask).
+            if (!ask) return json(404, { success: false, error: 'invalid_args', msg: `error 404/3603: no_such_ask Instance type by id ${m[1]} is not available.`, ask_id: Number(m[1]) });
+            // One rented since it was listed: the spec's 410 (the answer with cancel_unavail).
+            if (!ask.rentable) return json(410, { success: false, error: 'no_such_ask', msg: `error 410/3907: no_such_ask Instance type ${m[1]} is no longer available.`, ask_id: Number(m[1]) });
             if (!body?.image) return fail(400, 'invalid_args', 'error 400/3467: Invalid args: image is required');
             // env is a JSON object (the create guide: a docker-flags STRING is not applied). The real API
             // ignores a string silently; the fake refuses it, so sending one fails loudly.
@@ -232,7 +234,9 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
         }
         if ((m = /^\/api\/v0\/instances\/(\d+)\/$/.exec(path))) {
             const i = state.instances.get(m[1]);
-            if (!i) return fail(404, 'no_such_instance', 'Instance not found');
+            // One Vast does not have. Its read answers 200 with no instance (seen live 2026-10-07: `{"instances":null}`);
+            // its delete, the spec's 404 not_found (which the spec gives its update too, without a body).
+            if (!i) return method === 'GET' ? json(200, { instances: null }) : fail(404, 'not_found', 'Instance not found');
             if (method === 'GET') {
                 readOne(i);
                 return json(200, { instances: view(i) });
@@ -347,7 +351,8 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
             }
         }
         if (method === 'DELETE' && (m = /^\/api\/v0\/ssh\/(\d+)\/$/.exec(path))) {
-            if (!state.keys.delete(m[1])) return fail(400, 'invalid_args', 'SSH key not found');
+            // A key that is not there: the one 400 the spec documents ("Invalid request or SSH key not found").
+            if (!state.keys.delete(m[1])) return fail(400, 'no_ssh_key', 'No ssh key provided');
             return json(200, { success: true });
         }
         return fail(404, 'not_found', `fake has no route ${method} ${path}`);
