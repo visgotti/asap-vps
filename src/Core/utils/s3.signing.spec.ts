@@ -66,6 +66,10 @@ describe('signS3: the canonical request S3 makes of a request', () => {
         expect(signed('/?list-type=2&continuation-token=1ue%2FGc%2Bx%2Fw%3D%3D'))
             .toBe(signatureOf(canonicalGet('/', 'continuation-token=1ue%2FGc%2Bx%2Fw%3D%3D&list-type=2')));
         expect(signed('/key?uploads')).toBe(signatureOf(canonicalGet('/key', 'uploads=')));
+        // By name, not by `name=value` as text: a name that begins another comes first, though `=` sorts after `-` (made-up names: no two of S3's own are like this).
+        expect(signed('/?part-number=2&part=1')).toBe(signatureOf(canonicalGet('/', 'part=1&part-number=2')));
+        // The same name twice: by value.
+        expect(signed('/?tag=b&tag=a&tag=a%2Fa')).toBe(signatureOf(canonicalGet('/', 'tag=a&tag=a%2Fa&tag=b')));
     });
 
     it('the headers: names in lower case and in order, each value trimmed with its runs of spaces as one', () => {

@@ -60,7 +60,10 @@ export function signS3(o: {
     const names = Object.keys(signed).sort();
     const canonicalHeaders = names.map((n) => `${n}:${signed[n].trim().replace(/\s+/g, ' ')}\n`).join('');
     const path = o.url.pathname.split('/').map((seg) => encode(decodeURIComponent(seg))).join('/');
-    const query = [...o.url.searchParams.entries()].map(([k, v]) => `${encode(k)}=${encode(v)}`).sort().join('&');
+    // In the order of the names, then of the values: a name that begins another comes first, which the pairs sorted as text would not put it (`=` sorts after `-`).
+    const query = [...o.url.searchParams.entries()].map(([k, v]) => [encode(k), encode(v)])
+        .sort(([a, x], [b, y]) => (a < b ? -1 : a > b ? 1 : x < y ? -1 : x > y ? 1 : 0))
+        .map(([k, v]) => `${k}=${v}`).join('&');
     const canonical = [o.method, path, query, canonicalHeaders, names.join(';'), o.payloadHash].join('\n');
     const scope = `${date}/${o.region}/${service}/aws4_request`;
     const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, createHash('sha256').update(canonical).digest('hex')].join('\n');
