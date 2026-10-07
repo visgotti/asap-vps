@@ -473,13 +473,16 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
         if (caps.sshKeys) {
             it('SSH keys: add (the same key again is the same registration), list, delete; the account\'s other keys untouched', async () => {
                 const p = requireCapability(provider(), 'sshKeys');
-                const before = (await p.listSSHKeys()).map((k) => String(k.id));
+                const has = (id: string | number) => (keys: InitializedSSHKeyData[]) => keys.some((k) => String(k.id) === String(id));
+                // A second key of the run's, so the account has another key to leave untouched even when it had none.
+                const other = await p.addSSHKey(testPublicKey(`${runName}-other`), `${runName}-other`);
+                const before = (await keysUntil(p, has(other.id), `${other.id} listed`)).map((k) => String(k.id));
                 const pub = testPublicKey(runName);
                 const key = await p.addSSHKey(pub, runName);
                 expect(key).toMatchObject({ name: runName, fingerprint: sshKeyFingerprint(pub) });
                 expect(key.publicKey.split(' ').slice(0, 2)).toEqual(pub.split(' ').slice(0, 2));
                 expect((await p.addSSHKey(pub, `${runName}-again`)).id).toBe(key.id);
-                const listed = (keys: InitializedSSHKeyData[]) => keys.some((k) => String(k.id) === String(key.id));
+                const listed = has(key.id);
                 const during = await keysUntil(p, listed, `${key.id} listed`);
                 expect(during.filter((k) => k.fingerprint === key.fingerprint).map((k) => k.id)).toEqual([key.id]);
                 expect(during.map((k) => String(k.id))).toEqual(expect.arrayContaining(before));
@@ -488,6 +491,7 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
                 const after = await keysUntil(p, (keys) => !listed(keys), `${key.id} gone`);
                 expect(after.map((k) => String(k.id))).toEqual(expect.arrayContaining(before));
                 expect(await p.deleteSSHKey(key.id)).toBe(false);
+                expect(await p.deleteSSHKey(other.id)).toBe(true);
             }, t.timeouts.free);
         }
 
