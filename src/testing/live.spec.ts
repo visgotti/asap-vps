@@ -4,11 +4,12 @@
 // list lags), a failed list is never read as empty, and the watchdog deletes
 // exactly the run's resources when the launcher dies.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { DigitalOcean } from '../Providers/DigitalOcean/DigitalOcean';
 import { LambdaCloud } from '../Providers/LambdaCloud/LambdaCloud';
+import { PROVIDERS } from '../Providers/registry';
 import { RunPod } from '../Providers/RunPod/RunPod';
 import { fakeDigitalOcean } from './fakes/digitalocean';
 import { fakeLambda } from './fakes/lambda';
@@ -351,5 +352,31 @@ describe('live selection and credentials', () => {
             rmSync(dir, { recursive: true, force: true });
         }
         expect(existsSync(dir)).toBe(false);
+    });
+
+    it('.env.template copied as it is sets no key: every provider is skipped, and the credentials file\'s keys are the ones used', () => {
+        const names = Object.values(PROVIDERS).flatMap((i) => [i.keyEnv, ...Object.values(('paramsEnv' in i ? i.paramsEnv : undefined) ?? {})]);
+        const saved = Object.fromEntries(names.map((n) => [n, process.env[n]]));
+        const dir = mkdtempSync(join(tmpdir(), 'asap-vps-template-'));
+        try {
+            const envTest = join(dir, '.env.test');
+            copyFileSync(join(__dirname, '..', '..', '.env.template'), envTest);
+            // The template names every setting a provider reads.
+            const template = readFileSync(envTest, 'utf8');
+            for (const n of names) expect([n, new RegExp(`^${n}=$`, 'm').test(template)]).toEqual([n, true]);
+            for (const n of names) delete process.env[n];
+            loadCredentials([envTest]);
+            expect(names.filter((n) => process.env[n] !== undefined)).toEqual([]);
+            const credentials = join(dir, 'credentials.env');
+            writeFileSync(credentials, names.map((n) => `${n}=real-${n}\n`).join(''), { mode: 0o600 });
+            loadCredentials([envTest, credentials]);
+            expect(names.map((n) => process.env[n])).toEqual(names.map((n) => `real-${n}`));
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+            for (const [n, v] of Object.entries(saved)) {
+                if (v === undefined) delete process.env[n];
+                else process.env[n] = v;
+            }
+        }
     });
 });
