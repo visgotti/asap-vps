@@ -61,17 +61,39 @@ describe('teardown and sweep', () => {
         expect(images).toContain('api-1 2026-09-01');
     });
 
-    it('an image it cannot delete is reported, not dropped', async () => {
+    it('an image it cannot delete is reported, not dropped; one whose delete only said so is found still listed', async () => {
         const fake = fakeDigitalOcean();
         const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
+        const remove = p.deleteImage.bind(p);
         p.deleteImage = async () => {
             throw new Error('503');
         };
         const [offer] = await p.listOffers();
         const s = await p.createServer({ name: `${RUN_PREFIX}r`, offer });
         await p.waitUntilRunning(s.id, { intervalMs: 0 });
-        await p.createImage(s.id, { name: `${RUN_PREFIX}r-image`, intervalMs: 0 });
-        expect(await deleteRunImages(p, runMatcher(`${RUN_PREFIX}r`), quiet)).toEqual([`${RUN_PREFIX}r-image`]);
+        const image = await p.createImage(s.id, { name: `${RUN_PREFIX}r-image`, intervalMs: 0 });
+        expect(await deleteRunImages(p, runMatcher(`${RUN_PREFIX}r`), fast)).toEqual([`image ${RUN_PREFIX}r-image (${image.id})`]);
+        // A delete that answers and deletes nothing: the image is still listed, and that is what counts.
+        p.deleteImage = async () => undefined;
+        expect(await deleteRunImages(p, runMatcher(`${RUN_PREFIX}r`), fast)).toEqual([`image ${RUN_PREFIX}r-image (${image.id})`]);
+        p.deleteImage = remove;
+        expect(await deleteRunImages(p, runMatcher(`${RUN_PREFIX}r`), fast)).toEqual([]);
+        expect((await p.listImages()).map((i) => i.id)).not.toContain(image.id);
+    });
+
+    it('one empty list is not proof that nothing is left: a server the list does not show yet is found by the next read, and deleted', async () => {
+        const fake = fakeDigitalOcean();
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
+        const before = fake.liveServers();
+        const [offer] = await p.listOffers();
+        await p.createServer({ name: `${RUN_PREFIX}late`, offer });
+        const list = p.listServers.bind(p);
+        let reads = 0;
+        // The account's list lags the create: the first read after it shows none of the run's.
+        p.listServers = async (o) => (reads++ === 0 ? [] : list(o));
+        expect(await teardown(p, `${RUN_PREFIX}late`, fast)).toEqual([]);
+        expect(reads).toBeGreaterThan(1);
+        expect(fake.liveServers()).toBe(before);
     });
 });
 

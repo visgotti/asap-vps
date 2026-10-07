@@ -19,7 +19,7 @@ import { AnyProvider, providerInfo, providerParams } from '../Providers/registry
 
 /** Any provider that rents servers: what the live helpers take. */
 export type ComputeSubject = ICompute & Capable;
-import type { Endpoint, Server, ServerImage, SSHRetryOptions } from '../types';
+import type { Server, SSHRetryOptions } from '../types';
 
 /** What every test run names its servers, keys and images with. */
 export const RUN_PREFIX = 'asap-vps-smoke-';
@@ -72,8 +72,9 @@ export function runMatcher(runName: string): (name: string) => boolean {
 
 /**
  * Delete every server `name` matches (a run name: it and `<name>-...`), and
- * `knownId`, then prove with a fresh list that none is left. Returns what is
- * still there ([] = verified gone).
+ * `knownId`, then prove with fresh lists that none is left: two reads in a
+ * row that show none, as a list may not show a server made a moment ago.
+ * Returns what is still there ([] = verified gone).
  */
 export async function teardown(
     p: ComputeSubject,
@@ -100,13 +101,21 @@ export async function teardown(
         }
         return targets;
     };
+    let clean = 0;
     for (let round = 0; round < (o.rounds ?? 5); round++) {
         const targets = await look();
         if (!targets) {
+            clean = 0;
             await sleep(o.intervalMs ?? 10_000);
             continue;
         }
-        if (!targets.size) return [];
+        if (!targets.size) {
+            // One empty list is not proof: it is read again, and only two in a row say nothing is left.
+            if (++clean >= 2) return [];
+            await sleep(o.intervalMs ?? 10_000);
+            continue;
+        }
+        clean = 0;
         for (const [id, n] of targets) {
             log(`deleting ${n} (${id})`);
             const gone = await p.deleteServerAndWait(id, { intervalMs: o.intervalMs ?? 10_000, timeoutMs: 5 * 60_000 }).catch((e) => {
@@ -232,45 +241,25 @@ export async function deleteRunVolumes(p: ComputeSubject, matches: (name: string
     return deleteVerified('volume', () => p.listVolumes(), (id) => p.deleteVolume(id), matches, o);
 }
 
-/** The images `matches` names, deleted (where the provider has images); what could not be deleted. */
-export async function deleteRunImages(p: ComputeSubject, matches: (name: string) => boolean, log: Log = console.log): Promise<string[]> {
+/**
+ * Delete the run's images (where the provider has images), by name, verified
+ * by fresh lists (deleteVerified): read at least twice, so an image is not
+ * taken for gone on its delete's word, nor "none" on one list's. Returns what
+ * is still listed ([] = verified gone).
+ */
+export async function deleteRunImages(p: ComputeSubject, matches: (name: string) => boolean, o: DeleteRunOptions = {}): Promise<string[]> {
     if (!supports(p, 'images')) return [];
-    let images: ServerImage[];
-    try {
-        images = (await p.listImages()).filter((i) => matches(i.name));
-    } catch (e) {
-        log(`could not list images (${(e as Error).message})`);
-        return ['(could not list images)'];
-    }
-    const left: string[] = [];
-    for (const i of images) {
-        log(`deleting image ${i.name} (${i.id})`);
-        await p.deleteImage(i.id).catch((e) => {
-            log(`  image delete failed: ${(e as Error).message}`);
-            left.push(i.name);
-        });
-    }
-    return left;
+    return deleteVerified('image', () => p.listImages(), (id) => p.deleteImage(id), matches, { rounds: 2, ...o });
 }
 
-/** The run's serverless endpoints (named after it), each deleted and waited for: what is still listed ([] = all gone). */
-export async function deleteRunEndpoints(p: ComputeSubject, matches: (name: string) => boolean, log: Log = console.log): Promise<string[]> {
+/**
+ * Delete the run's serverless endpoints (named after it), each waited for,
+ * verified by fresh lists like its images. Returns what is still listed
+ * ([] = all gone).
+ */
+export async function deleteRunEndpoints(p: ComputeSubject, matches: (name: string) => boolean, o: DeleteRunOptions = {}): Promise<string[]> {
     if (!supports(p, 'serverless')) return [];
-    const list = async () => (await p.listEndpoints()).filter((e) => matches(e.name));
-    let endpoints: Endpoint[];
-    try {
-        endpoints = await list();
-    } catch (e) {
-        log(`could not list endpoints (${(e as Error).message})`);
-        return ['(could not list endpoints)'];
-    }
-    for (const e of endpoints) {
-        log(`deleting endpoint ${e.name} (${e.id})`);
-        await p.deleteEndpoint(e.id).catch((x) => log(`  endpoint delete failed: ${(x as Error).message}`));
-    }
-    // What the deletes left, read again.
-    const left = await list().catch(() => null);
-    return left === null ? ['(could not list endpoints)'] : left.map((e) => `endpoint ${e.name} (${e.id})`);
+    return deleteVerified('endpoint', () => p.listEndpoints(), (id) => p.deleteEndpoint(id), matches, { rounds: 2, ...o });
 }
 
 /**
@@ -285,7 +274,8 @@ export async function sweepLeftovers(p: ComputeSubject, o: { log?: Log, sleep?: 
     const reads = { log: o.log, sleep: o.sleep, intervalMs: o.intervalMs, rounds: o.keyRounds };
     const keys = await deleteRunKeys(p, ours, reads);
     const volumes = await deleteRunVolumes(p, ours, reads);
-    return [...left, ...keys, ...volumes, ...await deleteRunImages(p, ours, o.log), ...await deleteRunEndpoints(p, ours, o.log)];
+    const kinds = { log: o.log, sleep: o.sleep, intervalMs: o.intervalMs };
+    return [...left, ...keys, ...volumes, ...await deleteRunImages(p, ours, kinds), ...await deleteRunEndpoints(p, ours, kinds)];
 }
 
 /**
@@ -335,8 +325,8 @@ export async function watchdogLoop(o: {
             const reads = { log: o.log, sleep, intervalMs: o.roundMs ?? 10_000, rounds: 6 };
             const keys = await deleteRunKeys(o.provider, run, reads);
             const volumes = await deleteRunVolumes(o.provider, run, reads);
-            const images = await deleteRunImages(o.provider, run, o.log);
-            const endpoints = await deleteRunEndpoints(o.provider, run, o.log);
+            const images = await deleteRunImages(o.provider, run, reads);
+            const endpoints = await deleteRunEndpoints(o.provider, run, reads);
             const left = [...keys, ...volumes, ...images, ...endpoints];
             o.log(left.length ? `servers verified gone; NOT deleted: ${left.join(', ')}` : `verified: nothing named ${o.runName} is left`);
             return left.length ? 'unverified' : 'swept';

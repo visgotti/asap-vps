@@ -398,7 +398,7 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
             const reads = { log: t.log, sleep: t.sleep, intervalMs: t.wait.intervalMs, rounds: t.mode === 'live' ? 10 : 1 };
             const keys = await deleteRunKeys(p, run, { ...reads, ids: keyIds });
             const volumes = await deleteRunVolumes(p, run, { ...reads, ids: volumeIds });
-            const images = await deleteRunImages(p, run, t.log);
+            const images = await deleteRunImages(p, run, { log: t.log, sleep: t.sleep, intervalMs: t.wait.intervalMs });
             if (watchdog && !servers.length && !keys.length && !volumes.length && !images.length) writeFileSync(watchdog.doneFile, 'done\n');
             expect({ servers, keys, volumes, images }).toEqual({ servers: [], keys: [], volumes: [], images: [] });
         }, t.timeouts.server);
