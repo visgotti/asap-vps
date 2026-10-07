@@ -45,6 +45,16 @@ describe('provider registry', () => {
         expect(providersWith('volumes', 'images').sort()).toEqual(['digitalocean', 'scaleway', 'vast']);
     });
 
+    it('the README\'s examples of providersWith say what it answers', () => {
+        const readme = readFileSync(join(__dirname, '../../README.md'), 'utf8');
+        // providersWith("images", "imageCopy");   // ['digitalocean', 'scaleway']: ...
+        const examples = [...readme.matchAll(/^providersWith\(([^)]*)\);\s*\/\/ (\[[^\]]*\])/gm)];
+        expect(examples.length).toBeGreaterThanOrEqual(2);
+        for (const [, asked, said] of examples) {
+            expect([asked, JSON.parse(said.replace(/'/g, '"'))]).toEqual([asked, providersWith(...JSON.parse(`[${asked}]`) as Parameters<typeof providersWith>)]);
+        }
+    });
+
     it('refuses an id it does not know, naming the ones it does', () => {
         expect(() => createProvider('fly', 'k')).toThrow(/unknown provider "fly" \(asap-vps has digitalocean, runpod, vast, lambda, scaleway\)/);
         // Names every object has are not providers.

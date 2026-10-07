@@ -102,11 +102,14 @@ so only one GPU droplet can run at a time.
    - Bearer: yourself (or an application with access to the Project).
    - Preferred Project: the one from step 3.
    - Copy the **secret key** (the UUID shown once). The access key (`SCW...`) is
-     not used.
+     needed only by `copyImage` and `importImage`: an image's file goes through
+     Object Storage, which signs its requests with both keys. Copy it too if
+     you will use them.
 5. Save them:
    ```sh
    printf 'SCW_SECRET_KEY=%s\n' "$(pbpaste)" >> ~/.config/asap-vps/credentials.env
    printf 'SCW_DEFAULT_PROJECT_ID=%s\n' "<the project id>" >> ~/.config/asap-vps/credentials.env
+   printf 'SCW_ACCESS_KEY=%s\n' "<the access key>" >> ~/.config/asap-vps/credentials.env   # for copyImage and importImage only
    ```
    Optionally `SCW_ZONES=fr-par-2,pl-waw-2` (or a region such as `fr-par`) to keep
    to some zones: every Instance call is zonal, so fewer zones are fewer calls.

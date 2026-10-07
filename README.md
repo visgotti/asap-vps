@@ -301,8 +301,8 @@ import { createProvider, providersFromEnv, providersWith, PROVIDERS } from "asap
 
 const vast = createProvider("vast", process.env.VAST_API_KEY!); // typed: a VastAI
 const all = providersFromEnv(process.env);                      // every provider whose key (PROVIDERS[id].keyEnv) is set
-providersWith("images", "imageCopy");                           // ['digitalocean']: read from the descriptors, nothing built
-providersWith("volumes");                                       // ['digitalocean', 'runpod', 'lambda', 'scaleway']
+providersWith("images", "imageCopy");                           // ['digitalocean', 'scaleway']: read from the descriptors, nothing built
+providersWith("volumes");                                       // ['digitalocean', 'runpod', 'vast', 'lambda', 'scaleway']
 ```
 
 # Errors
