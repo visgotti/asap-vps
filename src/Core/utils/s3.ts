@@ -11,7 +11,7 @@ import { createReadStream, createWriteStream } from 'fs';
 import { unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { Readable, Transform } from 'stream';
+import { pipeline as pipe, Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import type { FetchImpl } from './http';
 
@@ -26,7 +26,61 @@ export type S3Options = {
     fetchImpl?: FetchImpl,
     /** How a retry waits (default: a timer). */
     sleep?: (ms: number) => Promise<unknown>,
+    /** The most parts an upload is cut into (default 1000: Scaleway's cap; AWS takes 10,000). */
+    maxParts?: number,
+    /** The smallest part (default 16 MiB; S3 takes no part under 5 MiB but the last): an upload up to it is one PUT. */
+    partSize?: number,
+    /** How many parts are sent at once (default 4). */
+    concurrency?: number,
+    /** The largest part of a source not on disk held in memory while it is sent (default 64 MiB); a bigger one waits in a temporary file. */
+    memoryPart?: number,
 };
+
+/**
+ * Where the bytes of an upload come from: their size, and a stream of any
+ * range of them, made again for each attempt (a part that fails is read
+ * again from its source, not held anywhere).
+ */
+export type ByteSource = {
+    size: number,
+    /** Bytes `start` to `end`, both included. */
+    range(start: number, end: number): Promise<ReadableStream<Uint8Array>>,
+    /** What it is, for errors. */
+    what: string,
+    /** Its ranges are read from this machine's disk: a part streams from it as it is sent. Any other source's part is read whole first. */
+    local?: boolean,
+};
+
+const MiB = 1024 * 1024;
+
+/** A file on disk as a ByteSource. */
+export function fileSource(path: string, size: number): ByteSource {
+    return { size, what: path, local: true, range: async (start, end) => Readable.toWeb(createReadStream(path, { start, end })) as ReadableStream<Uint8Array> };
+}
+
+/**
+ * A file at an http(s) URL as a ByteSource, where its server says its size
+ * and serves ranges of it (a HEAD answering `accept-ranges: bytes` and a
+ * length); null where it does not, or does not answer a HEAD: download it
+ * whole instead (stageDownload).
+ */
+export async function urlSource(url: string, fetchImpl: FetchImpl = fetch): Promise<ByteSource | null> {
+    const head = await fetchImpl(url, { method: 'HEAD' }).catch(() => null);
+    const size = Number(head?.headers.get('content-length'));
+    if (!head?.ok || !/\bbytes\b/i.test(head.headers.get('accept-ranges') ?? '') || !Number.isFinite(size) || size <= 0) return null;
+    return {
+        size, what: url,
+        range: async (start, end) => {
+            const r = await fetchImpl(url, { headers: { range: `bytes=${start}-${end}` } });
+            if (r.status !== 206 || !r.body) {
+                await r.body?.cancel().catch(() => undefined);
+                // A server that stops serving ranges: an error worth trying again only when it says it is busy.
+                throw new S3Error(r.status >= 500 ? r.status : 502, 'RangeRefused', `${url}: bytes ${start}-${end}: ${r.status} ${r.statusText}`.trim());
+            }
+            return r.body;
+        },
+    };
+}
 
 export type S3Object = { key: string, size: number, etag?: string };
 
@@ -136,14 +190,14 @@ export class S3Client {
      * 4 times in all, 1, 2 and 4 s apart. The last answer, or the last failure,
      * with what the network said (`fetch failed` alone names nothing).
      */
-    private async retried<T>(what: string, send: () => Promise<T>, failed: (r: T) => boolean = (r) => (r as Response).status >= 500 || (r as Response).status === 429): Promise<T> {
+    private async retried<T>(what: string, send: () => Promise<T>, failed: (r: T) => boolean = (r) => [408, 429].includes((r as Response).status) || (r as Response).status >= 500): Promise<T> {
         for (let attempt = 1; ; attempt++) {
             try {
                 const r = await send();
                 if (!failed(r) || attempt === 4) return r;
                 await (r as Response).body?.cancel().catch(() => undefined);
             } catch (e) {
-                const retriable = !(e instanceof S3Error) || e.status >= 500 || e.status === 429;
+                const retriable = !(e instanceof S3Error) || e.status >= 500 || [408, 429].includes(e.status) || e.code === 'RequestTimeout';
                 if (!retriable || attempt === 4) {
                     const cause = (e as { cause?: { code?: string, message?: string } }).cause;
                     throw e instanceof S3Error || !cause ? e : new Error(`${this.o.endpoint} ${what}: ${(e as Error).message} (${cause.code ?? cause.message})`);
@@ -253,10 +307,134 @@ export class S3Client {
         }, () => false);
     }
 
-    /** Puts a file staged on disk (stageDownload), streamed and signed with its hash; sent again, from its start, where the network or S3 fails it. Its ETag. */
+    /** Puts a file staged on disk (stageDownload): upload. Its ETag. */
     async putFile(bucket: string, key: string, file: StagedFile): Promise<string | undefined> {
-        return this.retried(`PUT /${bucket}/${key}`, () => this.putObject(bucket, key, Readable.toWeb(createReadStream(file.path)) as ReadableStream<Uint8Array>,
-            file.size, 'application/octet-stream', file.sha256), () => false);
+        return this.upload(bucket, key, fileSource(file.path, file.size));
+    }
+
+    /** An object of this S3 as a ByteSource (its ranges read with GET `range`); null when there is none. */
+    async objectSource(bucket: string, key: string): Promise<ByteSource | null> {
+        const head = await this.headObject(bucket, key);
+        if (!head) return null;
+        return {
+            size: head.size, what: `${this.o.endpoint}/${bucket}/${key}`,
+            range: async (start, end) => {
+                const r = await this.request('GET', bucket, key, { headers: { range: `bytes=${start}-${end}` } });
+                if (r.status !== 206 && !(r.status === 200 && start === 0 && end === head.size - 1)) return S3Client.fail(r, `${bucket}/${key} bytes ${start}-${end}`);
+                return r.body!;
+            },
+        };
+    }
+
+    /**
+     * Uploads `source` as the object `key`: in one PUT when it fits in a
+     * part, else as a multipart upload (parts of at least `partSize`, at most
+     * `maxParts` of them, `concurrency` at a time). The file is never held
+     * whole: a part of a file on disk streams from it; a part of any other
+     * source is read whole first (putPart), so this machine holds at most
+     * `concurrency` parts. Each part's MD5 is checked against the ETag S3
+     * answers, and a part is sent again where the network or S3 fails it or
+     * the sums differ. An upload that fails is aborted (S3 keeps no part of
+     * it). The object's ETag.
+     */
+    async upload(bucket: string, key: string, source: ByteSource, contentType = 'application/octet-stream'): Promise<string | undefined> {
+        if (source.size === 0) return this.putObject(bucket, key, new Uint8Array(), 0, contentType);
+        // As many parts as it takes, but no more than maxParts: a bigger file has bigger parts.
+        const partSize = Math.max(this.o.partSize ?? 16 * MiB, Math.ceil(source.size / (this.o.maxParts ?? 1000)));
+        if (source.size <= partSize) return this.putPart(bucket, key, source, 0, source.size - 1, {}, contentType);
+        const created = await this.request('POST', bucket, key, { query: { uploads: '' }, headers: { 'content-type': contentType } });
+        if (!created.ok) return S3Client.fail(created, `multipart upload of ${bucket}/${key}`);
+        const uploadId = xmlText(await created.text(), 'UploadId');
+        if (!uploadId) throw new S3Error(created.status, undefined, `multipart upload of ${bucket}/${key}: S3 gave no UploadId`);
+        try {
+            const count = Math.ceil(source.size / partSize);
+            const etags: string[] = new Array(count);
+            let next = 0;
+            let failed = false;
+            // Workers take the next part until there is none, or one of them has failed.
+            const worker = async () => {
+                while (!failed && next < count) {
+                    const n = next++;
+                    try {
+                        etags[n] = await this.putPart(bucket, key, source, n * partSize, Math.min(source.size, (n + 1) * partSize) - 1, { partNumber: String(n + 1), uploadId });
+                    } catch (e) {
+                        failed = true;
+                        throw e;
+                    }
+                }
+            };
+            // Every worker settles before a failure is thrown: the abort below then finds no part still on its way (S3 could keep one that lands after it).
+            const settled = await Promise.allSettled(Array.from({ length: Math.min(this.o.concurrency ?? 4, count) }, worker));
+            const broken = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+            if (broken) throw broken.reason;
+            const body = `<CompleteMultipartUpload>${etags.map((e, i) => `<Part><PartNumber>${i + 1}</PartNumber><ETag>${e}</ETag></Part>`).join('')}</CompleteMultipartUpload>`;
+            const done = await this.request('POST', bucket, key, { query: { uploadId }, body: new TextEncoder().encode(body), headers: { 'content-type': 'application/xml' } });
+            // S3 may answer the completion 200 with an error in its body.
+            const text = await done.text();
+            if (!done.ok || /<Error>/.test(text)) throw new S3Error(done.ok ? 500 : done.status, xmlText(text, 'Code'), `completion of ${bucket}/${key}: ${done.status} ${xmlText(text, 'Code') ?? ''} ${xmlText(text, 'Message') ?? text.slice(0, 200)}`.trim());
+            return xmlText(text, 'ETag');
+        } catch (e) {
+            await this.request('DELETE', bucket, key, { query: { uploadId } }).then((r) => r.body?.cancel()).catch(() => undefined);
+            throw e;
+        }
+    }
+
+    /**
+     * One PUT of bytes `start` to `end` of `source` (the object, or the part
+     * `query` names): its ETag, once S3's matches the MD5 of what was sent.
+     * A part of a file on disk streams from it as it is sent. A part of any
+     * other source is read whole first (in memory, or past `memoryPart` in a
+     * temporary file), then sent: its upload never waits on its download (S3
+     * cuts a request it gets nothing of for a while, 408 RequestTimeout), and
+     * one sent again is not downloaded again.
+     */
+    private async putPart(bucket: string, key: string, source: ByteSource, start: number, end: number, query: Record<string, string>, contentType?: string): Promise<string> {
+        const what = `upload of ${bucket}/${key}${query.partNumber ? ` part ${query.partNumber}` : ''} (${source.what})`;
+        if (source.local) return this.streamPart(bucket, key, () => source.range(start, end), end - start + 1, query, what, contentType);
+        const read = `GET ${source.what} bytes ${start}-${end}`;
+        if (end - start + 1 <= (this.o.memoryPart ?? 64 * MiB)) {
+            const bytes = await this.retried(read, async () => new Uint8Array(await new Response(await source.range(start, end)).arrayBuffer()), () => false);
+            return this.retried(`PUT /${bucket}/${key}`, async () => {
+                const r = await this.request('PUT', bucket, key, { query, body: bytes, ...(contentType ? { headers: { 'content-type': contentType } } : {}) });
+                if (!r.ok) return S3Client.fail(r, what);
+                await r.body?.cancel().catch(() => undefined);
+                return S3Client.checked(r, createHash('md5').update(bytes).digest('hex'), what);
+            }, () => false);
+        }
+        const staged = await this.retried(read, async () => stageBody(new Response(await source.range(start, end)), read), () => false);
+        try {
+            return await this.streamPart(bucket, key, () => fileSource(staged.path, staged.size).range(0, staged.size - 1), staged.size, query, what, contentType);
+        } finally {
+            await staged.remove();
+        }
+    }
+
+    /** A PUT of `size` bytes `open` streams (each attempt opens them again), summed on the way: its ETag, checked. */
+    private async streamPart(bucket: string, key: string, open: () => Promise<ReadableStream<Uint8Array>>, size: number, query: Record<string, string>, what: string, contentType?: string): Promise<string> {
+        return this.retried(`PUT /${bucket}/${key}`, async () => {
+            const md5 = createHash('md5');
+            const tap = new Transform({ transform(chunk: Buffer, _encoding, done) { md5.update(chunk); done(null, chunk); } });
+            pipe(Readable.fromWeb(await open() as Parameters<typeof Readable.fromWeb>[0]), tap, () => undefined);
+            let r: Response;
+            try {
+                r = await this.request('PUT', bucket, key, {
+                    query, body: Readable.toWeb(tap) as ReadableStream<Uint8Array>, size, ...(contentType ? { headers: { 'content-type': contentType } } : {}),
+                });
+            } finally {
+                // Whatever the PUT did not read is not read: the source is closed with it (an attempt again opens its own).
+                tap.destroy();
+            }
+            if (!r.ok) return S3Client.fail(r, what);
+            await r.body?.cancel().catch(() => undefined);
+            return S3Client.checked(r, md5.digest('hex'), what);
+        }, () => false);
+    }
+
+    /** The ETag of a PUT of bytes whose MD5 is `sum`: one that is an MD5 must be it (a part's always is; an object's is, unless it is encrypted). */
+    private static checked(r: Response, sum: string, what: string): string {
+        const etag = r.headers.get('etag') ?? `"${sum}"`;
+        if (/^"?[0-9a-f]{32}"?$/i.test(etag) && etag.replace(/"/g, '').toLowerCase() !== sum) throw new S3Error(500, 'BadDigest', `${what}: S3 stored other bytes (ETag ${etag}, MD5 sent ${sum})`);
+        return etag;
     }
 }
 

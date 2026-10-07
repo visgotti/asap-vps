@@ -1454,7 +1454,7 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
     const blockCalls = (fake: Fake) => fake.calls.filter((c) => /import-from-object-storage|\/images$|s3\./.test(`${c.host}${c.path}`) && c.method !== 'GET')
         .map((c) => `${c.method} ${c.host?.startsWith('s3.') ? `s3 ${c.path.replace(/asap-vps-tmp-[0-9a-f]+/, '<bucket>')}` : c.path.replace(/[0-9a-f-]{36}/g, '<id>')}`);
 
-    it('downloads the file, puts it in a bucket made for it (signed with its hash), imports it, images it, and deletes the bucket', async () => {
+    it('downloads the file, puts it in a bucket made for it (streamed, its MD5 checked), imports it, images it, and deletes the bucket', async () => {
         const { fake, p } = withKey();
         const image = await p.importImage({ name: 'noble-min', url: URL_OK, region: 'fr-par-2', providerOptions: { tags: ['imported'] }, ...fast });
         expect(blockCalls(fake)).toEqual([
@@ -1462,7 +1462,7 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
             'DELETE s3 /<bucket>/image.qcow2', 'DELETE s3 /<bucket>',
         ]);
         const put = fake.state.s3['fr-par'].calls.find((c) => c.method === 'PUT' && c.path.endsWith('/image.qcow2'))!;
-        expect(put.payloadHash).toMatch(/^[0-9a-f]{64}$/);
+        expect([put.payloadHash, put.duplex]).toEqual(['UNSIGNED-PAYLOAD', 'half']);
         expect(fake.state.s3['fr-par'].buckets.size).toBe(0);
         expect(image).toMatchObject({ provider: 'scaleway', name: 'noble-min', status: 'available', regions: ['fr-par-2'] });
         expect(image.raw).toMatchObject({ arch: 'x86_64', root_volume: { volume_type: 'sbs_snapshot' }, tags: ['imported'] });
