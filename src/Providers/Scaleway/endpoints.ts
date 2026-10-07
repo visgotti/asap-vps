@@ -134,7 +134,7 @@ export const SCALEWAY_ENDPOINTS = {
 
     /** A Project's volumes in the zone (`project_id`), or every one the key can read. */
     listBlockVolumes: {
-        operationId: 'ListVolumes', method: 'GET', path: '/block/v1/zones/{zone}/volumes', query: ['page_size', 'page', 'project_id'],
+        operationId: 'ListVolumes', method: 'GET', path: '/block/v1/zones/{zone}/volumes', query: ['page_size', 'page', 'project_id', 'include_deleted'],
         docs: `${DOCS}/block/v1/volume#list-volumes`,
     },
     /** An empty volume (`from_empty`), `creating` and then `available` (within a second, checked live 2026-10-06). It bills until deleted. */
@@ -175,7 +175,7 @@ export const SCALEWAY_ENDPOINTS = {
         docs: `${DOCS}/block/v1/snapshot#export-a-snapshot-to-a-scaleway-object-storage-bucket`,
     },
     listBlockSnapshots: {
-        operationId: 'ListSnapshots', method: 'GET', path: '/block/v1/zones/{zone}/snapshots', query: ['page_size', 'page', 'project_id'],
+        operationId: 'ListSnapshots', method: 'GET', path: '/block/v1/zones/{zone}/snapshots', query: ['page_size', 'page', 'project_id', 'include_deleted'],
         docs: `${DOCS}/block/v1/snapshot#list-all-snapshots`,
     },
     getBlockSnapshot: {

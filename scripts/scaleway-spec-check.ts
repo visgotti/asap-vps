@@ -415,8 +415,8 @@ class Checker {
         }
     }
 
-    /** An object type's fields against a schema's. */
-    object(name: string, t: ts.Type, schema: Node, spec: Spec, at: ts.Node, liveOnly: string[]): void {
+    /** An object type's fields against a schema's; `sent`: a body asap-vps sends, which must have every field the spec requires. */
+    object(name: string, t: ts.Type, schema: Node, spec: Spec, at: ts.Node, liveOnly: string[], sent = false): void {
         const fields = this.types.properties(t, at);
         const specFields: Record<string, Node> = spec.norm(schema).node?.properties ?? {};
         for (const f of fields) {
@@ -435,6 +435,7 @@ class Checker {
         for (const required of spec.norm(schema).node?.required ?? []) {
             const f = fields.find((x) => x.name === required);
             if (f && f.optional) fail(`${name}.${required}: the spec requires it and the type makes it optional`);
+            if (!f && sent) fail(`${name}.${required}: the spec requires it in the body, and the type has no such field`);
         }
         const missing = Object.entries<Node>(specFields).filter(([k, v]) => !fields.some((f) => f.name === k) && !v.deprecated).map(([k]) => k);
         if (missing.length) this.unmodeled[name] = missing;
@@ -474,7 +475,7 @@ class Checker {
                 continue;
             }
             const before = failures;
-            this.object(alias, this.types.type(alias), node, spec, decl, LIVE_ONLY[alias] ?? []);
+            this.object(alias, this.types.type(alias), node, spec, decl, LIVE_ONLY[alias] ?? [], OBJECTS[alias][1].startsWith('request:'));
             if (failures === before) console.log(`  ok   ${alias} = ${name}`);
         }
     }
@@ -528,6 +529,10 @@ async function checkEndpoints(specs: Record<Api, Spec>): Promise<void> {
         else if (!await onPage(e.docs)) fail(`${name}: docs ${e.docs} is not on the reference (the page is not there, or has no such anchor)`);
         const params = new Set<string>((op.parameters ?? []).filter((p: Node) => p.in === 'query').map((p: Node) => p.name));
         for (const q of e.query ?? []) if (!params.has(q)) fail(`${name}: sends query parameter "${q}", which the operation does not have (it has: ${[...params].join(', ')})`);
+        // One the operation requires is sent: listed here, and the client sends it on every call (its specs hold it to that).
+        for (const p of (op.parameters ?? []).filter((x: Node) => x.in === 'query' && x.required)) {
+            if (!(e.query ?? []).includes(p.name)) fail(`${name}: the operation requires query parameter "${p.name}", and it is not sent`);
+        }
         const placeholders = [...e.path.matchAll(/\{([a-z_]+)\}/g)].map((m) => m[1]);
         const declared = (op.parameters ?? []).filter((p: Node) => p.in === 'path').map((p: Node) => p.name);
         if (!sameSet(placeholders, declared)) fail(`${name}: path placeholders ${placeholders.join(', ')}, the spec's path parameters ${declared.join(', ')}`);

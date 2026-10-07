@@ -431,7 +431,8 @@ export class ScalewayApi extends ApiClient {
 
     /** The Project's Block snapshots in the zone (every one the key can read without a Project). */
     listBlockSnapshots(zone: ScalewayZone): Promise<ScalewayBlockSnapshot[]> {
-        return this.pages(SCALEWAY_ENDPOINTS.listBlockSnapshots, { path: { zone }, query: { project_id: this.projectId }, size: 'page_size' }, (b) => listOf(b, 'snapshots'));
+        // include_deleted is required by the spec: a deleted snapshot is no snapshot of the account's.
+        return this.pages(SCALEWAY_ENDPOINTS.listBlockSnapshots, { path: { zone }, query: { project_id: this.projectId, include_deleted: false }, size: 'page_size' }, (b) => listOf(b, 'snapshots'));
     }
 
     getBlockSnapshot(zone: ScalewayZone, id: string): Promise<ScalewayBlockSnapshot | null> {
@@ -525,7 +526,8 @@ export class ScalewayApi extends ApiClient {
 
     /** The zone's volumes: the Project's when there is one, else every one the key can read. */
     listBlockVolumes(zone: ScalewayZone): Promise<ScalewayBlockVolume[]> {
-        return this.pages(SCALEWAY_ENDPOINTS.listBlockVolumes, { path: { zone }, query: { project_id: this.projectId }, size: 'page_size' }, (b) => listOf(b, 'volumes'));
+        // include_deleted is required by the spec: a deleted volume is no volume of the account's.
+        return this.pages(SCALEWAY_ENDPOINTS.listBlockVolumes, { path: { zone }, query: { project_id: this.projectId, include_deleted: false }, size: 'page_size' }, (b) => listOf(b, 'volumes'));
     }
 
     /** Never retried after a server error: it may exist, and a second one would bill. */

@@ -591,4 +591,15 @@ describe('endpoints used by the client are the table\'s', () => {
         expect(fake.calls).toHaveLength(sent);
         expect(fake.calls.map((c) => c.host)).toEqual(Array(fake.calls.length).fill('api.scaleway.com'));
     });
+
+    it('sends every query parameter its operation requires: the Block Storage lists ask for no deleted volume or snapshot', async () => {
+        const fake = fakeScaleway();
+        const api = new ScalewayApi({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep: noSleep });
+        await api.listBlockVolumes('fr-par-1');
+        await api.listBlockSnapshots('fr-par-1');
+        const asked = fake.calls.map((c) => new URL(`https://x${c.path}`)).filter((u) => /^\/block\/v1\/zones\/fr-par-1\/(volumes|snapshots)$/.test(u.pathname));
+        expect(asked.map((u) => [u.pathname, u.searchParams.get('include_deleted')])).toEqual([
+            ['/block/v1/zones/fr-par-1/volumes', 'false'], ['/block/v1/zones/fr-par-1/snapshots', 'false'],
+        ]);
+    });
 });
