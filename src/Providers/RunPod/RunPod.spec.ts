@@ -217,11 +217,12 @@ describe('RunPod API facts', () => {
         expect(e).not.toBeInstanceOf(CapacityError);
     });
 
-    it('logs backfill at most 5000 lines, and a refused key is an AuthError', async () => {
+    it('logs: the container\'s own lines (not RunPod\'s), the last `tail` of them, at most 5000; a refused key is an AuthError', async () => {
         const { p, fake } = make();
-        const s = await p.createServer({ name: 'logs', offer: 'NVIDIA RTX A5000', image: 'img', command: ['nvidia-smi', '-L'] });
-        expect(await p.getServerLogs(s.id, { tail: 100_000, windowMs: 200 })).toMatch(/GPU 0: NVIDIA RTX A5000/);
+        const s = await p.createServer({ name: 'logs', offer: 'NVIDIA RTX A5000', image: 'img', command: ['nvidia-smi', '-L'], gpuCount: 2 });
+        expect(await p.getServerLogs(s.id, { tail: 100_000, windowMs: 200 })).toBe('GPU 0: NVIDIA RTX A5000 (UUID: GPU-0f1e2d30)\nGPU 1: NVIDIA RTX A5000 (UUID: GPU-0f1e2d31)');
         expect(fake.calls.find((c) => c.path.includes('/logs'))?.path).toMatch(/tail=5000$/);
+        expect(await p.getServerLogs(s.id, { tail: 1, windowMs: 200 })).toBe('GPU 1: NVIDIA RTX A5000 (UUID: GPU-0f1e2d31)');
         const bad = new RunPod({ apiKey: 'wrong', fetchImpl: fake.fetchImpl, sleep: noSleep });
         await expect(bad.getServerLogs(s.id, { windowMs: 200 })).rejects.toBeInstanceOf(AuthError);
     });

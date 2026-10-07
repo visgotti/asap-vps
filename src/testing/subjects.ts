@@ -78,7 +78,8 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         unknownId: 'pod_missing',
         refused: { userData: '#!/bin/bash\ntrue\n' },
         anyGpuCount: true,
-        logLine: /hello from gpu-contract/,
+        // What its command, nvidia-smi -L, prints.
+        logLine: /^GPU 0: NVIDIA /m,
         elsewhere: (region) => (region === 'EU-RO-1' ? 'US-TX-3' : 'EU-RO-1'),
         // The pod names a stored login: what RunPod holds under it (RunPod reads the host from the image).
         loginOf: (fake) => {

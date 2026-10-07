@@ -5,7 +5,9 @@
 // PROVISIONING -> STARTING -> RUNNING over a few reads, placed only on hosts
 // whose CUDA meets gpu.minCudaVersion; POST .../action for start / stop /
 // restart (409 when the status does not allow it); cursor pages; the SSE log
-// stream (tail at most 5000); the account key list replaced whole by PUT; and
+// stream (RunPod's own lines as source `system`, the command's output as
+// `container`; `source` picks one, `tail` backfills the last lines, 100 by
+// default, at most 5000); the account key list replaced whole by PUT; and
 // ssh.proxy / ssh.direct (direct only with 22/tcp); stored registry logins
 // (/v2/registries: write-only credentials, a pod's `registry` must name one);
 // network volumes (/v2/network-volumes) that a pod mounts in their data center
@@ -104,9 +106,18 @@ export function fakeRunPod(o: {
     const problem = (status: number, detail: string, errors?: string[]) =>
         json(status, { title: 'Error', status, detail, ...(errors ? { errors } : {}) }, 'application/problem+json');
     const invalid = (errors: string[]) => problem(422, 'Request validation failed.', errors);
-    /** What one run of the pod's container prints: its GPU (when the command asks), its echoes, a hello. */
-    const containerRun = (pod: any): string[] => ['starting container',
-        ...(String(pod.cmd ?? '').includes('nvidia-smi') && pod.gpu ? [`GPU 0: ${pod.gpu.id} (UUID: GPU-0f1e2d3c)`] : []), ...echoed(pod.cmd, pod.env), `hello from ${pod.name}`];
+    /**
+     * One run of the pod's container, as its log has it: RunPod's own lines
+     * (source `system`), then what the command prints (source `container`):
+     * `nvidia-smi -L`'s line for each GPU it has, and its echoes.
+     */
+    const containerRun = (pod: any): Array<{ source: 'system' | 'container', line: string }> => [
+        { source: 'system', line: `create container ${pod.image}` },
+        { source: 'system', line: 'start container' },
+        ...(String(pod.cmd ?? '').includes('nvidia-smi') && pod.gpu
+            ? Array.from({ length: pod.gpu.count ?? 1 }, (_, i) => ({ source: 'container' as const, line: `GPU ${i}: ${pod.gpu.id} (UUID: GPU-0f1e2d3${i})` })) : []),
+        ...echoed(pod.cmd, pod.env).map((line) => ({ source: 'container' as const, line })),
+    ];
     /** The data centers the catalog knows: where a network volume can be made. */
     const dataCenters = () => new Set(state.gpus.flatMap((g) => g.dataCenters.map((d) => d.id)));
     const livePods = () => [...state.pods.values()].filter((x) => x.status !== 'TERMINATED');
@@ -382,9 +393,14 @@ export function fakeRunPod(o: {
         if (method === 'GET' && (m = /^\/v2\/pods\/([^/]+)\/logs$/.exec(path))) {
             const pod = state.pods.get(m[1]);
             if (!pod) return problem(404, 'resource not found');
-            const tail = u.searchParams.get('tail');
-            if (tail !== null && !(Number.isInteger(Number(tail)) && Number(tail) >= 0 && Number(tail) <= 5000)) return invalid(['tail: must be between 0 and 5000']);
-            const sse = pod.logs.map((line: string, i: number) => `id: 2026-09-29T12:00:0${i}Z\ndata: ${JSON.stringify({ ts: '2026-09-29T12:00:00Z', source: 'container', line })}\n\n`).join('');
+            const tail = Number(u.searchParams.get('tail') ?? 100);
+            if (!(Number.isInteger(tail) && tail >= 0 && tail <= 5000)) return invalid(['tail: must be between 0 and 5000']);
+            // Both sources unless one is asked for; the backfill is the last `tail` lines of those.
+            const source = u.searchParams.get('source');
+            if (source !== null && !['container', 'system'].includes(source)) return invalid(['source: must be one of container, system']);
+            const lines = pod.logs.map((x: { source: string, line: string }, i: number) => ({ ...x, i })).filter((x: { source: string }) => source === null || x.source === source);
+            const sse = lines.slice(lines.length - Math.min(tail, lines.length)).map((x: { source: string, line: string, i: number }) =>
+                `id: 2026-09-29T12:00:00Z/${String(x.i).padStart(12, '0')}\ndata: ${JSON.stringify({ ts: '2026-09-29T12:00:00Z', source: x.source, line: x.line })}\n\n`).join('');
             return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
         }
         if (path === '/v2/registries') {
