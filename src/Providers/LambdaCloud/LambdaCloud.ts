@@ -9,9 +9,9 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider } from '../../Core/ComputeProvider';
-import { filterOffers, findSSHKey, isKind, pickSSHKeys } from '../../Core/utils';
+import { filterOffers, findSSHKey, isKind, pickSSHKeys, timeLeft } from '../../Core/utils';
 import { falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
-import type { CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerListOptions, Volume } from '../../types';
+import type { CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerListOptions, Volume, WaitOptions } from '../../types';
 import { LambdaApi } from './api';
 import { LAMBDA_BILLING, LAMBDA_ID, LAMBDA_MOUNT_PATH, LAMBDA_REFUSED, toOffer, toServer, toSSHKey, toVolume } from './mappers';
 import type { LambdaFilesystem, LambdaFilesystemMount, LambdaInstance, LambdaInstanceTypes, LambdaSSHKeyData, LambdaTypes } from './types';
@@ -120,6 +120,19 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
         await falseIfNotFound(this.api.call('POST', '/api/v1/instance-operations/terminate', { instance_ids: [id] }, true));
     }
 
+    /**
+     * Deletes the instance, verified gone, and waits until Lambda lets go of the
+     * filesystems it mounted: one reads as in use for a while after its
+     * instance is gone (seen live), and deleteVolume is refused till then.
+     */
+    public override async deleteServerAndWait(id: string, o: WaitOptions = {}): Promise<boolean> {
+        const mounted = ((await this.getServer(id).catch(() => null))?.mounts ?? []).map((m) => m.volumeId);
+        const left = timeLeft(o);
+        if (!(await super.deleteServerAndWait(id, left()))) return false;
+        if (mounted.length) await this.released(mounted, left(), id);
+        return true;
+    }
+
     public async restartServer(id: string): Promise<void> {
         await this.api.call('POST', '/api/v1/instance-operations/restart', { instance_ids: [id] });
     }
@@ -151,9 +164,21 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
         return toVolume(data);
     }
 
-    /** One an instance mounts is refused (filesystems/filesystem-in-use): terminate the instance first. */
-    public async deleteVolume(id: string): Promise<void> {
-        await falseIfNotFound(this.api.call('DELETE', `/api/v1/filesystems/${encodeURIComponent(id)}`));
+    /**
+     * One a live instance mounts is refused (filesystems/filesystem-in-use):
+     * terminate the instance first. One that reads as in use with no live
+     * instance mounting it (Lambda lets go of a filesystem a while after its
+     * instance is gone) is waited for, up to `o.timeoutMs`, then deleted.
+     */
+    public async deleteVolume(id: string, o: WaitOptions = {}): Promise<void> {
+        const remove = () => falseIfNotFound(this.api.call('DELETE', `/api/v1/filesystems/${encodeURIComponent(id)}`));
+        try {
+            await remove();
+        } catch (e) {
+            if (!(e instanceof ProviderError) || e.code !== 'filesystems/filesystem-in-use' || (await this.liveMounts()).has(id)) throw e;
+            await this.released([id], o);
+            await remove();
+        }
     }
 
     // ── SSH keys ─────────────────────────────────────────────────────────
@@ -176,6 +201,23 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
     }
 
     // ── helpers ──────────────────────────────────────────────────────────
+
+    /** Until none of `ids` reads as in use but by a live instance that mounts it. */
+    private async released(ids: string[], o: WaitOptions, by?: string): Promise<void> {
+        await this.poll(async () => {
+            const [all, held] = await Promise.all([this.filesystems(), this.liveMounts()]);
+            return all.filter((f) => ids.includes(f.id) && f.is_in_use && !held.has(f.id)).map((f) => f.name);
+        }, (stuck) => stuck.length === 0, {
+            timeoutMs: 5 * 60_000, intervalMs: 10_000, ...o,
+            what: `filesystem(s) to be let go${by ? ` by instance ${by}` : ''}`, describe: (stuck) => `${stuck.join(', ')} in use, by no live instance`,
+        });
+    }
+
+    /** The filesystems the account's live instances mount. */
+    private async liveMounts(): Promise<Set<string>> {
+        const live = (await this.listServers()).filter((s) => s.status !== 'terminated');
+        return new Set(live.flatMap((s) => (s.mounts ?? []).map((m) => m.volumeId)));
+    }
 
     private async filesystems(): Promise<LambdaFilesystem[]> {
         return (await this.api.call<{ data: LambdaFilesystem[] }>('GET', '/api/v1/filesystems')).data ?? [];

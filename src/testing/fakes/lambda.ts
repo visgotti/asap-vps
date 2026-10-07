@@ -3,11 +3,14 @@
 // name with the regions that have capacity, launch by SSH key NAMES (400
 // instance-operations/launch/insufficient-capacity where a type has none,
 // global/quota-exceeded past the account's cap), instances that go booting ->
-// active, terminate -> terminating -> terminated -> gone, restart, SSH keys,
-// and filesystems (one region each; mounted at launch by name or with a mount
-// point under /home, /lambda/nfs or /data; in use while a live instance mounts
-// one, which cannot be deleted then). Every body is wrapped in `data`; every
-// failure is {error: {code, message}}.
+// active, terminate -> terminating (for `terminateReads` reads) -> terminated
+// -> gone, restart, SSH keys, and filesystems (one region each; mounted at
+// launch by name or with a mount point under /home, /lambda/nfs or /data; in
+// use while a live instance mounts one, and for `releaseReads` filesystem
+// reads after its last such instance is terminated, as Lambda lets go of it
+// late (seen live); one in use cannot be deleted). Every body is wrapped in
+// `data`; every failure is {error: {code, message}}. A test puts an instance in
+// `unhealthy` or `preempted` through `state.instances`.
 
 import { FakeApi, json, readRequest } from './util';
 
@@ -32,7 +35,7 @@ const TYPES = {
 /** The regions a filesystem can be made in. */
 const REGIONS = ['us-east-1', 'us-west-1', 'us-south-1'];
 
-export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuota?: number } = {}) {
+export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuota?: number, terminateReads?: number, releaseReads?: number } = {}) {
     const token = o.token ?? 'lambda-test';
     const calls: FakeApi['calls'] = [];
     const state = {
@@ -42,6 +45,10 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
         nextId: 1,
         bootReads: o.bootReads ?? 2,
         instanceQuota: o.instanceQuota ?? 10,
+        terminateReads: o.terminateReads ?? 1,
+        releaseReads: o.releaseReads ?? 2,
+        /** Filesystem reads each filesystem stays in use for, after its last instance went. */
+        lag: new Map<string, number>(),
     };
     const hex = (n: number) => n.toString(16).padStart(32, '0');
     state.keys.set('key0', { id: 'key0', name: 'laptop', public_key: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKd0 laptop' });
@@ -50,11 +57,17 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
         file_system_names: [], region: { name: 'us-east-1', description: 'Virginia, USA' }, instance_type: TYPES.gpu_1x_a10.instance_type, actions: {}, first_healthy: '2026-01-01T00:00:00Z', reads: 99 });
     const fail = (status: number, code: string, message: string, suggestion?: string) => json(status, { error: { code, message, ...(suggestion ? { suggestion } : {}) } });
     const view = (i: any) => {
-        const { reads, ...rest } = i;
+        const { reads, terminatingReads, ...rest } = i;
         return rest;
     };
-    /** Whether a live instance mounts the filesystem. */
-    const inUse = (id: string) => [...state.instances.values()].some((i) => i.status !== 'terminated' && (i.file_system_mounts ?? []).some((x: any) => x.file_system_id === id));
+    /** Whether a live instance mounts the filesystem, or Lambda has not let go of it yet. */
+    const inUse = (id: string) => (state.lag.get(id) ?? 0) > 0
+        || [...state.instances.values()].some((i) => i.status !== 'terminated' && (i.file_system_mounts ?? []).some((x: any) => x.file_system_id === id));
+    /** An instance terminated: Lambda lets go of its filesystems `releaseReads` reads later. */
+    const terminated = (i: any) => {
+        i.status = 'terminated';
+        for (const m of i.file_system_mounts ?? []) state.lag.set(m.file_system_id, state.releaseReads);
+    };
     const fsView = (f: any) => ({ ...f, is_in_use: inUse(f.id) });
 
     async function fetchImpl(url: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -115,8 +128,9 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
             i.reads++;
             // Billed from its first passed health check: first_healthy.
             if (i.status === 'booting' && i.reads >= state.bootReads) Object.assign(i, { status: 'active', ip: `198.51.100.${i.reads}`, private_ip: '10.0.0.20', first_healthy: new Date().toISOString() });
-            else if (i.status === 'terminating') i.status = 'terminated';
-            else if (i.status === 'terminated') {
+            else if (i.status === 'terminating') {
+                if (++i.terminatingReads > state.terminateReads) terminated(i);
+            } else if (i.status === 'terminated') {
                 state.instances.delete(m[1]);
                 return fail(404, 'global/object-does-not-exist', 'Specified instance does not exist.');
             }
@@ -125,7 +139,8 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
         if (method === 'POST' && path === '/api/v1/instance-operations/terminate') {
             const found = (body?.instance_ids ?? []).map((id: string) => state.instances.get(id)).filter((i: any) => i && i.status !== 'terminated');
             if (found.length !== (body?.instance_ids ?? []).length) return fail(404, 'global/object-does-not-exist', 'Specified instance does not exist.');
-            for (const i of found) i.status = 'terminating';
+            // Terminating again changes nothing: it goes on terminating.
+            for (const i of found) if (i.status !== 'terminating') Object.assign(i, { status: 'terminating', terminatingReads: 0 });
             return json(200, { data: { terminated_instances: found.map(view) } });
         }
         if (method === 'POST' && path === '/api/v1/instance-operations/restart') {
@@ -134,7 +149,12 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
             return json(200, { data: { restarted_instances: found.map(view) } });
         }
         if (path === '/api/v1/filesystems') {
-            if (method === 'GET') return json(200, { data: [...state.filesystems.values()].map(fsView) });
+            if (method === 'GET') {
+                const data = [...state.filesystems.values()].map(fsView);
+                // Each read brings Lambda closer to letting go of a filesystem whose instance went.
+                for (const [id, left] of state.lag) state.lag.set(id, Math.max(0, left - 1));
+                return json(200, { data });
+            }
             if (method === 'POST') {
                 if (typeof body?.name !== 'string' || !/^[a-zA-Z]+[0-9a-zA-Z-]*$/.test(body.name) || body.name.length > 60 || typeof body.region !== 'string') {
                     return fail(400, 'global/invalid-parameters', 'Invalid filesystem name or region.');

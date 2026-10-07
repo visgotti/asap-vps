@@ -14,7 +14,7 @@
 import { writeFileSync } from 'fs';
 import { ProvisionResult, ServerProvisioner } from '../../Core/ServerProvisioner';
 import { RunCommandStep } from '../../Core/steps';
-import { AuthError, ProviderError } from '../../errors';
+import { AuthError } from '../../errors';
 import {
     deleteRunKeys, deleteRunVolumes, liveOptions, liveRequested, loadCredentials, newRunName, runMatcher, startWatchdog, sweepLeftovers, teardown, trackSSHKeys,
     trackVolumes,
@@ -115,20 +115,10 @@ const SSH_RETRY = { maxRetries: 30, retryTimeout: 10_000 };
     paid('the instances go; the filesystem stays until deleteVolume, which is idempotent', async () => {
         expect(await p.deleteServerAndWait(writer.server.id, WAIT)).toBe(true);
         expect(await p.deleteServerAndWait(reader.server.id, WAIT)).toBe(true);
-        // The instances are gone; the filesystem is not.
-        expect((await p.getVolume(fs.id))?.id).toBe(fs.id);
-        // Lambda clears `in use` once the instances are gone: until then, a delete is refused.
-        let deleted = false;
-        for (let i = 0; i < 24 && !deleted; i++) {
-            try {
-                await p.deleteVolume(fs.id);
-                deleted = true;
-            } catch (e) {
-                if (!(e instanceof ProviderError) || e.code !== 'filesystems/filesystem-in-use') throw e;
-                await new Promise((r) => setTimeout(r, 10_000));
-            }
-        }
-        expect(deleted).toBe(true);
+        // The instances are gone; the filesystem is not, and deleteServerAndWait has waited until Lambda let go of it
+        // (it clears `in use` a while after the instances are gone): a delete is taken at once.
+        expect(await p.getVolume(fs.id)).toMatchObject({ id: fs.id, status: 'available' });
+        await p.deleteVolume(fs.id);
         expect(await p.getVolume(fs.id)).toBeNull();
         await expect(p.deleteVolume(fs.id)).resolves.toBeUndefined();
     }, 20 * 60_000);

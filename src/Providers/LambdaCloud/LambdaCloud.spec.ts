@@ -63,8 +63,21 @@ describe('LambdaCloud', () => {
         const s = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] });
         await p.waitUntilRunning(s.id, fast);
         await p.deleteServer(s.id);
+        expect((await p.getServer(s.id))?.status).toBe('terminating');
         expect((await p.getServer(s.id))?.status).toBe('terminated');
         expect(await p.getServer(s.id)).toBeNull();
+    });
+
+    it('reads every status word Lambda reports: unhealthy is an error, preempted is gone', async () => {
+        const { fake, p } = make();
+        const s = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] });
+        await p.waitUntilRunning(s.id, fast);
+        fake.state.instances.get(s.id).status = 'unhealthy';
+        expect(await p.getServer(s.id)).toMatchObject({ status: 'error', providerStatus: 'unhealthy' });
+        await expect(p.waitUntilRunning(s.id, fast)).rejects.toThrow(/is error \(unhealthy\)/);
+        fake.state.instances.get(s.id).status = 'preempted';
+        expect(await p.getServer(s.id)).toMatchObject({ status: 'terminated', providerStatus: 'preempted' });
+        await expect(p.waitUntilRunning(s.id, fast)).rejects.toThrow(/is terminated \(preempted\)/);
     });
 });
 
@@ -155,5 +168,42 @@ describe('Lambda filesystems', () => {
         expect(await p.deleteServerAndWait(s.id, fast)).toBe(true);
         await p.deleteVolume(fs.id);
         expect(await p.listVolumes()).toEqual([]);
+    });
+
+    it('deleteServerAndWait returns once Lambda has let go of the filesystems the instance mounted, which it does late', async () => {
+        const { fake, p } = make();
+        const [offer] = await p.listOffers();
+        const [key] = await p.listSSHKeys();
+        const fs = await p.createVolume({ name: 'models', region: offer.regions[0] });
+        const s = await p.createServer({ name: 'a', offer, sshKeyIds: [key.id], mounts: [{ volume: fs }] });
+        await p.waitUntilRunning(s.id, fast);
+        expect(await p.deleteServerAndWait(s.id, fast)).toBe(true);
+        // Let go of: a delete is taken at once, with no wait of its own.
+        expect(await p.getVolume(fs.id)).toMatchObject({ status: 'available' });
+        const before = reads(fake);
+        await p.deleteVolume(fs.id);
+        expect(reads(fake)).toBe(before);
+        expect(await p.getVolume(fs.id)).toBeNull();
+    });
+
+    it('deleteVolume waits out a filesystem Lambda has not let go of yet; one a live instance mounts is refused at once', async () => {
+        const { fake, p } = make();
+        const [offer] = await p.listOffers();
+        const [key] = await p.listSSHKeys();
+        const fs = await p.createVolume({ name: 'models', region: offer.regions[0] });
+        const s = await p.createServer({ name: 'a', offer, sshKeyIds: [key.id], mounts: [{ volume: fs }] });
+        await p.waitUntilRunning(s.id, fast);
+        // The instance goes by a plain delete: nothing waits for its filesystem.
+        await p.deleteServer(s.id);
+        while (await p.getServer(s.id)) { /* the fake moves on with every read */ }
+        expect(await p.getVolume(fs.id)).toMatchObject({ status: 'attached' });
+        await p.deleteVolume(fs.id, fast);
+        expect(await p.getVolume(fs.id)).toBeNull();
+        // In use by a live instance: refused, not waited for.
+        const other = await p.createVolume({ name: 'data', region: offer.regions[0] });
+        await p.createServer({ name: 'b', offer, sshKeyIds: [key.id], mounts: [{ volume: other }] });
+        const t0 = reads(fake);
+        await expect(p.deleteVolume(other.id, fast)).rejects.toMatchObject({ code: 'filesystems/filesystem-in-use' });
+        expect(reads(fake) - t0).toBeLessThanOrEqual(1);
     });
 });
