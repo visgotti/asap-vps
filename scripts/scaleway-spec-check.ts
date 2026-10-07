@@ -128,6 +128,14 @@ const OBJECTS: Record<string, [Api, string]> = {
     ScalewayMarketplaceImage: ['marketplace', 'Image'],
 };
 
+/**
+ * Fields compared with their spec schema by nothing: by `Type.field`, and why. A field of no one kind on
+ * either side (a union of kinds, an intersection the check cannot read) fails unless it is named here.
+ */
+const UNCOMPARED: Record<string, string> = {
+    'ScalewayUpdateServerBody.tags[]': 'the spec gives the array no items schema (`type: [array, null]` only); a server\'s tags are strings (Server.tags is string[])',
+};
+
 /** Fields the live API sends that its spec does not list, by TypeScript type: --live checks they are still sent. */
 const LIVE_ONLY: Record<string, string[]> = {
     ScalewayServerType: ['mig_profile'],
@@ -314,6 +322,8 @@ class Types {
         if (this.checker.isArrayType(t)) return { kind: 'array', element: this.checker.getTypeArguments(t as ts.TypeReference)[0] };
         if (alias === 'Record') return { kind: 'map', element: t.aliasTypeArguments![1] };
         if (f & ts.TypeFlags.Object) return { kind: 'object', type: t, alias };
+        // An intersection of object types is an object of all their fields.
+        if (t.isIntersection() && t.types.every((x) => x.flags & ts.TypeFlags.Object)) return { kind: 'object', type: t, alias };
         return { kind: 'unknown' };
     }
 
@@ -332,6 +342,12 @@ const sameSet = (a: string[], b: string[]) => a.length === b.length && a.every((
 function specKind(spec: Spec, original: Node): { kind: string, node: Node, ref?: string, values?: string[], element?: Node } {
     const { node, ref } = spec.norm(original);
     if (!node) return { kind: 'unknown', node };
+    // A nullable schema written as a choice of it and null is that schema.
+    const choice = node.oneOf ?? node.anyOf;
+    if (Array.isArray(choice)) {
+        const rest = choice.filter((x: Node) => !(x?.type === 'null' || (Array.isArray(x?.type) && x.type.length === 1 && x.type[0] === 'null')));
+        return rest.length === 1 ? specKind(spec, rest[0]) : { kind: 'unknown', node, ref };
+    }
     if (node.enum) return { kind: 'enum', node, ref, values: node.enum.map(String) };
     const t = (Array.isArray(node.type) ? node.type.filter((x: string) => x !== 'null')[0] : node.type) as string | undefined;
     if (t === 'integer' || t === 'number') return { kind: 'number', node, ref };
@@ -370,7 +386,11 @@ class Checker {
     compare(where: string, original: ts.Type, schema: Node, spec: Spec, at: ts.Node): void {
         const ts_ = this.types.classify(original);
         const sp = specKind(spec, schema);
-        if (sp.kind === 'unknown' || ts_.kind === 'unknown') return;
+        if (sp.kind === 'unknown' || ts_.kind === 'unknown') {
+            if (UNCOMPARED[where] !== undefined) return;
+            const side = ts_.kind === 'unknown' ? `the type (${this.types.checker.typeToString(original)})` : 'the spec\'s schema';
+            return fail(`${where}: ${side} is no one kind (a union of kinds, an intersection, a choice of schemas), so nothing compares it: make it one, or name it in UNCOMPARED with why`);
+        }
         if (sp.kind === 'enum') {
             if (ts_.kind !== 'enum') return fail(`${where}: the spec has an enum (${sp.values!.join('|')}) and the type is ${ts_.kind}`);
             if (!sameSet(ts_.values, sp.values!)) return fail(`${where}: members ${ts_.values.join('|')} but the spec's ${sp.ref ?? 'enum'} has ${sp.values!.join('|')}`);
