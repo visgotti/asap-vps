@@ -12,7 +12,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -d -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -d -p tsconfig.build.json && cp -R src/scripts dist/scripts",
     "prepublishOnly": "npm run build",
     "test": "jest",
     "test:do": "ASAP_VPS_LIVE=digitalocean-vps jest --config jest.live.config.js DigitalOceanVps.live",

@@ -4,9 +4,10 @@
 // license, package.json). Checked on the build's own inputs, read as tsc reads
 // them, so no build or `npm pack` is needed here.
 
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join, relative } from 'path';
 import * as ts from 'typescript';
+import { MACHINE_TYPES, SETUP_SCRIPTS } from './constants';
 
 const root = join(__dirname, '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
@@ -34,7 +35,16 @@ describe('the published package', () => {
     it('ships dist alone, built clean before every publish: nothing a past build left, no coverage report', () => {
         expect(pkg.files).toEqual(['dist']);
         expect(pkg.main).toBe('dist/index.js');
-        expect(pkg.scripts.build).toBe('rm -rf dist && tsc -d -p tsconfig.build.json');
+        expect(pkg.scripts.build).toBe('rm -rf dist && tsc -d -p tsconfig.build.json && cp -R src/scripts dist/scripts');
         expect(pkg.scripts.prepublishOnly).toBe('npm run build');
+    });
+
+    it('ships the setup scripts SSHService uploads: every one it can ask for, where the built code looks for it', () => {
+        // SSHService.sshSetupScript reads <its own directory>/../scripts/setup/<machine>/<script>.sh: src/scripts here,
+        // dist/scripts once built. tsc copies no .sh file, so the build does.
+        expect(pkg.scripts.build).toMatch(/ && cp -R src\/scripts dist\/scripts$/);
+        for (const machine of Object.values(MACHINE_TYPES)) {
+            for (const script of Object.values(SETUP_SCRIPTS)) expect(existsSync(join(root, 'src', 'scripts', 'setup', machine, `${script}.sh`))).toBe(true);
+        }
     });
 });
