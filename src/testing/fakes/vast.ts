@@ -73,6 +73,8 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
         snapshots: [] as Array<{ repo: string, tag: string, content: string, left: number }>,
         snapshotReads: o.snapshotReads ?? 2,
     };
+    /** Which instance rents each ask (ask id -> instance id). */
+    const rentedBy = new Map<number, number>();
     const registry = fakeRegistry(FAKE_SNAPSHOTS.server, { users: { [FAKE_SNAPSHOTS.username]: FAKE_SNAPSHOTS.password } });
     /** A request: time passes for the snapshots being pushed. */
     const tick = () => {
@@ -201,6 +203,7 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
             }
             ask.rentable = false;
             const id = state.nextId++;
+            rentedBy.set(ask.id, id);
             // Each "-p N:N" key opens container port N, mapped to a RANDOM public port.
             const ports: Record<string, Array<{ HostIp: string, HostPort: string }>> = {};
             for (const k of Object.keys(body.env ?? {})) {
@@ -257,6 +260,9 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
                 return json(200, { success: true });
             }
             if (method === 'DELETE') {
+                // The machine is on offer again once its renter is gone (a rented ask is gone from the market until then).
+                const ask = state.asks.find((a) => !a.rentable && rentedBy.get(a.id) === i.id);
+                if (ask) ask.rentable = true;
                 state.instances.delete(m[1]);
                 // Its volumes list it a while longer.
                 for (const v of state.volumes.values()) {
