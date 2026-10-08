@@ -4,9 +4,9 @@
 // list lags), a failed list is never read as empty, and the watchdog deletes
 // exactly the run's resources when the launcher dies.
 
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { DigitalOcean } from '../Providers/DigitalOcean/DigitalOcean';
 import { LambdaCloud } from '../Providers/LambdaCloud/LambdaCloud';
 import { PROVIDERS } from '../Providers/registry';
@@ -297,6 +297,8 @@ describe('watchdog', () => {
         const key = process.env.RUNPOD_API_KEY;
         process.env.RUNPOD_API_KEY = 'asap-vps-dummy-key';
         try {
+            // Where the watchdog keeps its files: startWatchdog makes it, but this run is marked done before it starts.
+            mkdirSync(dirname(files.doneFile), { recursive: true });
             writeFileSync(files.doneFile, 'done\n');
             await expect(startWatchdog('runpod', runName, Date.now() + 60_000)).resolves.toEqual(files);
             for (let i = 0; i < 80 && !readFileSync(files.logFile, 'utf8').includes('finished'); i++) await new Promise((r) => setTimeout(r, 250));
