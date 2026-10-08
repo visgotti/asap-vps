@@ -142,6 +142,53 @@ describe('RegistryClient and copyRegistryImage', () => {
         expect(await c.manifest('acme/app', 'nope')).toBeNull();
     });
 
+    it('a step a registry refuses fails the copy and names the step; a read it refuses is that refusal, never "nothing there"', async () => {
+        const src = fakeRegistry(SRC, { publicRepos: ['library/busybox'] });
+        const dst = fakeRegistry(DST, { users: { pusher: 'secret' } });
+        src.seed('library/busybox', '1.36');
+        // The registries as they are, but for the requests `refuse` answers with a status of its own.
+        let refuse: (host: string, method: string, path: string) => number | undefined = () => undefined;
+        const routed = both({ host: SRC, r: src }, { host: DST, r: dst });
+        const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+            const u = new URL(String(url));
+            const status = refuse(u.host, (init?.method ?? 'GET').toUpperCase(), u.pathname);
+            return status ? new Response('denied', { status }) : routed(url, init);
+        }) as typeof fetch;
+        const copy = (repo: string) => copyRegistryImage(`${SRC}/library/busybox:1.36`, `${DST}/${repo}:1.36`, { toAuth: push, fetchImpl });
+
+        refuse = (host, method, path) => (host === DST && method === 'POST' && path.endsWith('/blobs/uploads/') ? 403 : undefined);
+        await expect(copy('ns/a')).rejects.toThrow(`upload to ${DST}/ns/a: 403 denied`);
+        refuse = (host, method, path) => (host === DST && method === 'PUT' && path.includes('/blobs/uploads/') ? 400 : undefined);
+        await expect(copy('ns/a')).rejects.toThrow(new RegExp(`^blob sha256:[0-9a-f]{64} to ${DST}/ns/a: 400 denied$`));
+        refuse = (host, method, path) => (host === DST && method === 'PUT' && path.includes('/manifests/') ? 400 : undefined);
+        await expect(copy('ns/a')).rejects.toThrow(`manifest ${DST}/ns/a:1.36: 400 denied`);
+        refuse = (host, method, path) => (host === SRC && method === 'GET' && path.includes('/blobs/') ? 403 : undefined);
+        await expect(copy('ns/b')).rejects.toThrow(new RegExp(`^blob ${SRC}/library/busybox@sha256:[0-9a-f]{64}: 403 denied$`));
+        refuse = (host, method, path) => (host === SRC && path.includes('/manifests/') ? 403 : undefined);
+        await expect(copy('ns/b')).rejects.toThrow(`manifest ${SRC}/library/busybox:1.36: 403 denied`);
+
+        const reader = new RegistryClient(DST, push, fetchImpl);
+        refuse = (host, method, path) => (host === DST && path.endsWith('/tags/list') ? 403 : undefined);
+        await expect(reader.tags('ns/a')).rejects.toThrow(`tags of ${DST}/ns/a: 403 denied`);
+        refuse = (host, method) => (host === DST && method === 'HEAD' ? 403 : undefined);
+        await expect(reader.digest('ns/a', '1.36')).rejects.toThrow(`manifest ${DST}/ns/a:1.36: 403`);
+    });
+
+    it('a token answer is read from `token` or `access_token`; one that holds neither is an error', async () => {
+        const dst = fakeRegistry(DST, { users: { pusher: 'secret' } });
+        dst.seed('ns/app', '1');
+        let answer: (body: Record<string, unknown>) => Record<string, unknown> = (b) => b;
+        const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+            const r = await dst.fetchImpl(url, init);
+            if (new URL(String(url)).host !== `auth.${DST}`) return r;
+            return new Response(JSON.stringify(answer(await r.json() as Record<string, unknown>)), { status: r.status, headers: { 'content-type': 'application/json' } });
+        }) as typeof fetch;
+        answer = ({ token, ...rest }) => ({ ...rest, access_token: token });
+        expect(await new RegistryClient(DST, push, fetchImpl).tags('ns/app')).toEqual(['1']);
+        answer = () => ({ expires_in: 300 });
+        await expect(new RegistryClient(DST, push, fetchImpl).tags('ns/app')).rejects.toThrow(`registry ${DST}: the token answer for ns/app (pull) holds no token`);
+    });
+
     it('deletes a manifest by digest, its tags with it; deleting it again is false', async () => {
         const dst = fakeRegistry(DST, { users: { pusher: 'secret' } });
         const { manifestDigest } = dst.seed('ns/app', '1');
