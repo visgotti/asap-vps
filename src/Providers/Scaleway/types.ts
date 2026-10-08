@@ -775,6 +775,8 @@ export type ScalewayBlockSnapshot = {
     status: ScalewayBlockSnapshotStatus,
     tags: string[],
     zone: string,
+    /** What holds it: an image of it (`instance_image`) while it exists, and a volume made from it, as `in_use` says. */
+    references?: ScalewayBlockReference[],
 };
 
 /** POST .../snapshots/import-from-object-storage: a QCOW2 of a bucket of the zone's region, as a snapshot. https://www.scaleway.com/en/developers/api/block/v1/snapshot#import-a-snapshot-from-a-scaleway-object-storage-bucket */

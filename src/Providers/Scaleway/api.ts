@@ -39,6 +39,9 @@ const PAGE = 100;
 const TYPES_TTL_MS = 10 * 60_000;
 /** The wording of a refusal for want of capacity, where the answer is not typed `out_of_stock`. */
 const NO_STOCK = /out of stock|insufficient capacity|not enough capacity|no capacity|capacity is not available|temporarily unavailable|shortage/i;
+/** A snapshot Scaleway refuses to delete (`precondition_failed`) is tried this many times, `SNAPSHOT_RETRY_MS` apart (25 s of waiting), before it is taken for one another image uses. */
+const SNAPSHOT_TRIES = 6;
+const SNAPSHOT_RETRY_MS = 5000;
 
 export type ScalewayCallOptions = {
     /** Values for the endpoint path's `{placeholders}`. */
@@ -582,6 +585,11 @@ export class ScalewayApi extends ApiClient {
      * (Scaleway refuses to delete it). true when the image was deleted, false
      * when it was gone already. Every snapshot is tried: one that cannot be
      * deleted is named in the error, as nothing finds it once the image is gone.
+     * A snapshot Scaleway refuses to delete (`precondition_failed`: it is `in_use`
+     * while its image's reference is cleared, or while something else holds it) is
+     * asked again for 25 s; one that is still refused is kept only if another
+     * image of the zone has it, and otherwise named in the error: refused and
+     * left billing, as an earlier version did silently.
      */
     async deleteImage(zone: ScalewayZone, id: string): Promise<boolean> {
         const image = await this.getImage(zone, id);
@@ -590,7 +598,7 @@ export class ScalewayApi extends ApiClient {
         let cause: unknown;
         for (const s of imageVolumes(image)) {
             try {
-                await this.deleteSnapshot(zone, s);
+                await this.deleteSnapshot(zone, s, id);
             } catch (e) {
                 left.push(s.id);
                 cause ??= e;
@@ -602,13 +610,27 @@ export class ScalewayApi extends ApiClient {
         return true;
     }
 
-    /** A snapshot of an image, by the API that owns it: Block Storage for `sbs_snapshot`, the Instance API otherwise. Gone or still in use: left alone. */
-    private async deleteSnapshot(zone: ScalewayZone, s: ScalewayVolumeSummary): Promise<void> {
+    /**
+     * A snapshot of image `imageId`, by the API that owns it: Block Storage for
+     * `sbs_snapshot`, the Instance API otherwise. Gone already: nothing to do. Refused
+     * (`precondition_failed`): asked again, then kept if another image of the zone
+     * has it, else an error (see deleteImage).
+     */
+    private async deleteSnapshot(zone: ScalewayZone, s: ScalewayVolumeSummary, imageId: string): Promise<void> {
         const endpoint = s.volume_type === 'sbs_snapshot' ? SCALEWAY_ENDPOINTS.deleteBlockSnapshot : SCALEWAY_ENDPOINTS.deleteSnapshot;
-        try {
-            await this.deleted(endpoint, { path: { zone, snapshot_id: s.id } });
-        } catch (e) {
-            if (!(e instanceof ProviderError) || e.code !== 'precondition_failed') throw e;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                await this.deleted(endpoint, { path: { zone, snapshot_id: s.id } });
+                return;
+            } catch (e) {
+                if (!(e instanceof ProviderError) || e.code !== 'precondition_failed') throw e;
+                if (attempt < SNAPSHOT_TRIES) {
+                    await this.sleep(SNAPSHOT_RETRY_MS);
+                    continue;
+                }
+                if ((await this.listImages(zone)).some((i) => i.id !== imageId && imageVolumes(i).some((v) => v.id === s.id))) return;
+                throw e;
+            }
         }
     }
 

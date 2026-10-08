@@ -125,11 +125,14 @@ export async function auditScaleway(p: Scaleway, wait: WaitOptions = { timeoutMs
     const deleteSnapshot = async (key: string) => {
         const [zone, id, type] = key.split('/') as [ScalewayZone, string, string];
         const endpoint = type === 'sbs_snapshot' ? SCALEWAY_ENDPOINTS.deleteBlockSnapshot : SCALEWAY_ENDPOINTS.deleteSnapshot;
+        // What it was, read before it goes: a leak is only worth finding the cause of if the run says what leaked (name, state, what held it).
+        const seen = type === 'sbs_snapshot' ? await p.api.getBlockSnapshot(zone, id).catch(() => null) : null;
+        const detail = seen ? ` "${seen.name}" ${seen.status} held by ${(seen.references ?? []).map((r) => `${r.product_resource_type}:${r.status}`).join(', ') || 'nothing listed'}` : '';
         try {
             await p.api.call(endpoint, { path: { zone, snapshot_id: id } });
-            left.push(`snapshot ${key}`);
+            left.push(`snapshot ${key}${detail}`);
         } catch (e) {
-            if (!(e instanceof NotFoundError)) left.push(`snapshot ${key} (${(e as Error).message})`);
+            if (!(e instanceof NotFoundError)) left.push(`snapshot ${key}${detail} (${(e as Error).message})`);
         }
     };
     for (const key of snapshots) await deleteSnapshot(key);

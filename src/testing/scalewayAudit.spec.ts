@@ -37,7 +37,7 @@ describe('the audit of a live Scaleway run', () => {
         const left = await auditScaleway(p, fast);
         expect(left).toHaveLength(2);
         expect(left.join(' ')).toMatch(/volume pl-waw-2\/[0-9a-f-]+ \(available\)/);
-        expect(left.join(' ')).toMatch(/snapshot pl-waw-2\/[0-9a-f-]+\/sbs_snapshot/);
+        expect(left.join(' ')).toMatch(/snapshot pl-waw-2\/[0-9a-f-]+\/sbs_snapshot "[^"]*image[^"]*" \w+ held by /);
         expect([fake.liveVolumes(), fake.liveSnapshots()]).toEqual([1, 0]);
     });
 
@@ -59,8 +59,8 @@ describe('the audit of a live Scaleway run', () => {
         ]);
         const left = await auditScaleway(p, fast);
         expect(left).toEqual(expect.arrayContaining([
-            expect.stringMatching(/^snapshot fr-par-2\/[0-9a-f-]+\/sbs_snapshot$/),
-            expect.stringMatching(/^snapshot pl-waw-2\/[0-9a-f-]+\/sbs_snapshot \(.*used by an image/),
+            expect.stringMatching(/^snapshot fr-par-2\/[0-9a-f-]+\/sbs_snapshot "asap-vps-smoke-audit-import" available held by nothing listed$/),
+            expect.stringMatching(/^snapshot pl-waw-2\/[0-9a-f-]+\/sbs_snapshot "[^"]*" \w+ held by .* \(.*used by an image/),
             'bucket fr-par/asap-vps-tmp-0123456789ab', 'bucket nl-ams/asap-vps-tmp-older0000000 (made before this run: not deleted)',
         ]));
         expect(fake.state.s3['fr-par'].buckets.has('asap-vps-tmp-0123456789ab')).toBe(false);

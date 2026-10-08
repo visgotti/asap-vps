@@ -577,6 +577,57 @@ describe('images and SSH keys', () => {
         expect(await api.deleteImage('fr-par-1', fake.backupImageId)).toBe(false);
         expect(fake.state.images.has(fake.backupImageId)).toBe(true);
     });
+
+    describe('a snapshot Scaleway refuses to delete (precondition_failed)', () => {
+        const refusing = { type: 'precondition_failed', message: 'precondition is not respected' };
+        const snapshotDelete = (r: { method: string, path: string }) => r.method === 'DELETE' && /^\/block\/v1\/zones\/[a-z0-9-]+\/snapshots\//.test(r.path);
+        /** An API that records how long it waits, and an image of a stopped GPU server (its root snapshot is Block Storage's). */
+        const imaged = async (name: string, existing?: ReturnType<typeof made>) => {
+            const { fake, api: _ } = existing ?? made();
+            const slept: number[] = [];
+            const api = new ScalewayApi({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep: async (ms) => { slept.push(ms); } });
+            const server = await api.createServer('pl-waw-2', { name, commercial_type: 'L4-1-24G', image: 'ubuntu_noble_gpu_os_13_nvidia', project: FAKE_SCALEWAY_PROJECT, protected: false });
+            const task = await api.serverAction('pl-waw-2', server.id, { action: 'backup', name: `${name}-image` });
+            const imageId = /images\/([0-9a-f-]{36})/.exec(task!.href_result!)![1];
+            let image = await api.getImage('pl-waw-2', imageId);
+            while (image?.state === 'creating') image = await api.getImage('pl-waw-2', imageId);
+            return { fake, api, slept, image: image!, snapshot: image!.root_volume!.id };
+        };
+
+        it('is asked again until it goes: a reference that takes a moment to clear is not a leaked snapshot', async () => {
+            const { fake, api, slept, image, snapshot } = await imaged('late');
+            fake.intercept(snapshotDelete, { times: 3, answer: () => json(400, refusing) });
+            expect(await api.deleteImage('pl-waw-2', image.id)).toBe(true);
+            expect(fake.state.snapshots.has(snapshot)).toBe(false);
+            expect(fake.calls.filter((c) => c.method === 'DELETE' && c.path.endsWith(`/snapshots/${snapshot}`))).toHaveLength(4);
+            expect(slept).toEqual([5000, 5000, 5000]);
+        });
+
+        it('that never goes, and that no other image has, is an error naming it: the image is gone, and nothing finds the snapshot afterwards', async () => {
+            const { fake, api, slept, image, snapshot } = await imaged('stuck');
+            fake.intercept(snapshotDelete, { answer: () => json(400, refusing) });
+            await expect(api.deleteImage('pl-waw-2', image.id)).rejects.toMatchObject({
+                code: 'snapshot_left', message: expect.stringContaining(`its snapshot(s) ${snapshot} are not`),
+            });
+            expect(await api.getImage('pl-waw-2', image.id)).toBeNull();
+            expect(fake.state.snapshots.has(snapshot)).toBe(true);
+            // Six tries, 25 s of waiting in all, and then the check of the zone's other images.
+            expect(slept).toEqual([5000, 5000, 5000, 5000, 5000]);
+        });
+
+        it('that another image of the zone has is kept: it is that image\'s, not a leak, and the same wait comes first', async () => {
+            const { fake, api, slept, image: a, snapshot } = await imaged('shared');
+            // b is an image of the same snapshot.
+            const b = await imaged('sharing', { fake, api });
+            fake.state.images.get(b.image.id)!.root_volume = { ...fake.state.images.get(b.image.id)!.root_volume, id: snapshot };
+            expect(await api.deleteImage('pl-waw-2', a.id)).toBe(true);
+            expect(fake.state.snapshots.has(snapshot)).toBe(true);
+            expect(slept).toEqual([5000, 5000, 5000, 5000, 5000]);
+            // Once b goes, the snapshot goes with it.
+            expect(await b.api.deleteImage('pl-waw-2', b.image.id)).toBe(true);
+            expect(fake.state.snapshots.has(snapshot)).toBe(false);
+        });
+    });
 });
 
 describe('endpoints used by the client are the table\'s', () => {
