@@ -22,7 +22,7 @@
     "test:scw:volumes": "ASAP_VPS_LIVE=scaleway-vps jest --config jest.live.config.js ScalewayVolumes.live",
     "gpu:smoke": "ts-node --transpile-only scripts/gpu-smoke.ts",
     "test:live": "jest --config jest.live.config.js",
-    "test:coverage": "jest --coverage --coverageDirectory=coverage --collectCoverageFrom='src/Providers/Scaleway/*.ts' --collectCoverageFrom='!**/*.spec.ts' src/Providers/Scaleway",
+    "test:coverage": "jest --coverage",
     "scaleway:spec": "ts-node --transpile-only scripts/scaleway-spec-check.ts",
     "api:spec": "ts-node --transpile-only scripts/api-spec-check.ts"
   },
@@ -59,15 +59,24 @@
       "^.+\\.(t|j)s$": "ts-jest"
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "src/**/*.ts",
+      "!src/**/*.spec.ts",
+      "!src/testing/**"
     ],
-    "coverageDirectory": "../coverage",
+    "coverageDirectory": "coverage",
     "testEnvironment": "node",
+    "testTimeout": 30000,
     "testPathIgnorePatterns": [
       "/node_modules/",
       "\\.live\\.spec\\.ts$"
     ],
     "coverageThreshold": {
+      "global": {
+        "statements": 90,
+        "branches": 90,
+        "functions": 90,
+        "lines": 90
+      },
       "./src/Providers/Scaleway/api.ts": {
         "statements": 100,
         "branches": 100,
