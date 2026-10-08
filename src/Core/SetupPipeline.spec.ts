@@ -106,8 +106,8 @@ describe('SetupPipeline', () => {
 
             const results = await pipeline.execute(createMockSSH(), '1.2.3.4');
 
-            expect(results).toHaveLength(2);
-            expect(step2.execute).toHaveBeenCalled();
+            expect(results.map((r) => [r.step, r.success])).toEqual([['fail', false], ['still-runs', true]]);
+            expect(step2.execute).toHaveBeenCalledTimes(1);
         });
 
         it('should call onStepStart and onStepComplete callbacks', async () => {

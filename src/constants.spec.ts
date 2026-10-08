@@ -50,7 +50,7 @@ describe('constants', () => {
 
         it('should have a mapping for every PLATFORM value', () => {
             for (const p of Object.values(PLATFORM)) {
-                expect(PLATFORM_FAMILY[p]).toBeDefined();
+                expect([p, ['debian', 'rhel'].includes(PLATFORM_FAMILY[p])]).toEqual([p, true]);
             }
         });
     });

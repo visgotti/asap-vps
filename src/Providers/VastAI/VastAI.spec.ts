@@ -5,6 +5,7 @@
 // containers that crash or go silent never reach running, and each offer is one
 // machine, whose driver's CUDA version is read before it is rented.
 
+import { RegistryClient } from '../../Core/utils';
 import { CapacityError, NotSupportedError, ProviderError } from '../../errors';
 import { FAKE_SNAPSHOTS, fakeVast } from '../../testing/fakes/vast';
 import { VastAI } from './VastAI';
@@ -331,8 +332,11 @@ describe('Vast volumes: storage on one machine, mounted by an instance rented th
         const vol = await p.createVolume({ name: 'weights_1', region: 'machine:14', sizeGb: 20, ...fast });
         expect(vol).toMatchObject({ provider: 'vast', name: 'weights_1', region: 'machine:14', shared: false, sizeGb: 20, status: 'available', providerStatus: 'created',
             serverIds: [], mountPath: '/data' });
-        expect(vol.createdAt).toBeGreaterThan(0);
-        expect(vol.raw).toMatchObject({ type: 'machine', machine_id: 14, end_date: expect.any(Number), storage_total_cost: expect.any(Number) });
+        expect(vol.createdAt).toBe(Math.round(vol.raw.start_date! * 1000));
+        // Rented for 30 days, at the machine's storage price (0.2 a GB a month) for 20 GB, charged by the hour over 720.
+        expect(vol.raw).toMatchObject({ type: 'machine', machine_id: 14, storage_total_cost: (20 * 0.2) / 720 });
+        // (To the second: the two dates are two readings of the clock.)
+        expect(vol.raw.end_date! - vol.raw.start_date!).toBeCloseTo(30 * 86_400, 0);
         expect(last(fake.calls.filter((c) => c.method === 'PUT' && c.path === '/api/v0/volumes/'))?.body).toEqual({ id: 5014, size: 20, name: 'weights_1' });
         expect(await p.getVolume(vol.id)).toMatchObject({ id: vol.id });
         expect((await p.listVolumes()).map((v) => v.name)).toEqual(['weights_1']);
@@ -452,7 +456,9 @@ describe('Vast images: snapshots an instance pushes to a registry of yours (obse
         });
         expect(image).toMatchObject({ provider: 'vast', id: 'registry.fake/acme/snapshots:trained-v1', name: 'trained-v1', status: 'available', providerStatus: 'pushed', regions: [] });
         expect(image.raw).toMatchObject({ reference: image.id, tag: 'trained-v1', digest: expect.stringMatching(/^sha256:/) });
-        expect(image.sizeGb).toBeGreaterThan(0);
+        // Its layers as the registry stores them, in GB (1e9 bytes): read back through the Registry API, not from the provider.
+        const stored = await new RegistryClient('registry.fake', { username: 'pusher', password: 'push-secret' }, fake.fetchImpl).manifest('acme/snapshots', 'trained-v1');
+        expect(image.sizeGb).toBe(stored!.json.layers.reduce((n: number, l: { size: number }) => n + l.size, 0) / 1e9);
         // Vast's own tag and the name are one image: listed once, under its name.
         const tags = fake.registry.tags.get('acme/snapshots')!;
         expect([...tags.keys()].sort()).toEqual([expect.stringMatching(new RegExp(`^instance_${s.id}_at_October_6th_2026_at_\\d+-\\d\\d-\\d\\d_[AP]M_UTC$`)), 'trained-v1'].sort());

@@ -145,7 +145,8 @@ describe('Scaleway billing', () => {
         expect((await p.getServerCost(s.id, s.billingStartedAt! + 3_600_000))?.usd).toBeCloseTo(s.pricePerHour!, 9);
         // Standby bills as running.
         await p.api.serverAction('pl-waw-2', s.id.split('/')[1], { action: 'stop_in_place' });
-        expect((await p.getServer(s.id))?.billingStartedAt).toBeDefined();
+        const standby = await p.getServer(s.id);
+        expect(standby?.billingStartedAt).toBe(Date.parse(standby!.raw.modification_date!));
         // stopServer powers a server in standby off (it reads as stopped, but holds its slot and bills): no compute bills then.
         const offs = fake.calls.filter((c) => c.body?.action === 'poweroff').length;
         await p.stopServer(s.id);
@@ -383,7 +384,7 @@ describe('Scaleway servers', () => {
         const up = await p.waitUntilRunning(created.id, fast);
         expect(up.ip).toMatch(/^51\.159\.0\.\d+$/);
         expect(up.ssh).toEqual({ host: up.ip, port: 22, username: 'root' });
-        expect(up).toMatchObject({ gpu: 'L4', gpuCount: 1, region: 'pl-waw-2', createdAt: expect.any(Number) });
+        expect(up).toMatchObject({ gpu: 'L4', gpuCount: 1, region: 'pl-waw-2', createdAt: Date.parse(up.raw.creation_date!) });
         expect(up.pricePerHour).toBeCloseTo(offer.pricePerHour, 6);
     });
 
@@ -752,8 +753,11 @@ describe('Scaleway images', () => {
         const image = await p.createImage(server.id, { name: 'copy', ...fast });
         await p.copyImage(image.id, ['fr-par-2'], fast);
         const read = fake.state.s3['pl-waw'].calls.filter((c) => c.method === 'GET' && /\.qcow2$/.test(c.path));
-        expect(read.length).toBeGreaterThan(0);
+        // Ranges only, which tile the export from its first byte: no gap, no overlap.
         expect(read.every((c) => /^bytes=\d+-\d+$/.test(c.range ?? ''))).toBe(true);
+        const spans = read.map((c) => /^bytes=(\d+)-(\d+)$/.exec(c.range!)!.slice(1).map(Number)).sort((a, b) => a[0] - b[0]);
+        expect(spans[0][0]).toBe(0);
+        for (let i = 1; i < spans.length; i++) expect(spans[i][0]).toBe(spans[i - 1][1] + 1);
         // Each part read whole first, then sent signed with its hash.
         expect(fake.state.s3['fr-par'].calls.some((c) => c.method === 'PUT' && /\.qcow2$/.test(c.path) && /^[0-9a-f]{64}$/.test(c.payloadHash))).toBe(true);
         // The export is there for the wait, and gone by the time it is to move.
@@ -902,7 +906,7 @@ describe('Scaleway volumes (Block Storage)', () => {
             .toEqual([{ name: 'models', perf_iops: 5000, project_id: FAKE_SCALEWAY_PROJECT, from_empty: { size: 20e9 } }]);
         expect(v).toMatchObject({ provider: 'scaleway', name: 'models', region: 'pl-waw-2', sizeGb: 20, status: 'available', providerStatus: 'available', serverIds: [] });
         expect(v.id).toMatch(/^pl-waw-2\//);
-        expect(v.createdAt).toBeGreaterThan(0);
+        expect(v.createdAt).toBe(Date.parse(v.raw.created_at!));
         expect((await p.getVolume(v.id))?.id).toBe(v.id);
         expect((await p.getVolume(v.id.split('/')[1]))?.id).toBe(v.id);
         expect(await p.getVolume(UNKNOWN)).toBeNull();
@@ -1159,7 +1163,7 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
             region: 'fr-par', minWorkers: 1, maxWorkers: 3, idleTimeoutSeconds: 900, private: true });
         expect(e.id).toMatch(/^fr-par\/[0-9a-f-]{36}$/);
         expect(e.url).toMatch(/^https:\/\/whoami[0-9a-f]{8}-whoami\.functions\.fnc\.fr-par\.scw\.cloud$/);
-        expect(e.createdAt).toBeGreaterThan(0);
+        expect(e.createdAt).toBe(Date.parse(e.raw.created_at!));
         expect(await p.getEndpoint(e.id)).toMatchObject({ id: e.id });
         expect(await p.getEndpoint(e.id.split('/')[1])).toMatchObject({ id: e.id });
         expect(await p.getEndpoint('fr-par/00000000-0000-4000-8000-0000000000ff')).toBeNull();
@@ -1334,7 +1338,8 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         c2.deleteReads = 0;
         f2.intercept((r) => r.method === 'GET' && r.path.endsWith(`/namespaces/${ns2}`), { answer: () => json(200, { ...f2.state.namespaces.get(ns2), status: 'deleting' }), times: 1e9 });
         await expect(p2.deleteEndpoint(e2.id, { intervalMs: 0, timeoutMs: 0 })).rejects.toThrow(/timed out after 0 s waiting for delete of namespace nsticky: deleting/);
-        expect(ns).toBeTruthy();
+        // Its container would not go, so its namespace was not deleted.
+        expect(fake.state.namespaces.has(ns)).toBe(true);
     });
 
     it('reads a status it does not know as unknown; a regional id of a region that is not Scaleway\'s names nothing', async () => {
@@ -1511,10 +1516,9 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
             answer: () => json(200, { server: { ...fake.state.servers.get(`${zone}/${id}`), filesystems: [{ filesystem_id: fsId, state: 'attaching' }], allowed_actions: [] } }), times: 1e9,
         });
         await expect(p.api.fileSystemState(zone as ScalewayZone, id, fsId, 'available', { intervalMs: 0, timeoutMs: 20 })).rejects.toThrow(/still attaching, not available/);
-        const { fake: f2, p: p2 } = make();
+        const { p: p2 } = make();
         const s2 = await p2.waitUntilRunning((await p2.createServer({ name: 'gpu-2', offer: GPU_FS, region: 'fr-par-2' })).id, fast);
         await expect(p2.api.fileSystemState(s2.raw.zone, s2.raw.id, fsId, 'available', fast)).rejects.toThrow(/is no longer attached/);
-        expect(f2).toBeTruthy();
     });
 });
 

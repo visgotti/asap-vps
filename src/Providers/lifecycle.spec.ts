@@ -14,6 +14,7 @@ import { SSHService } from '../Core/SSHService';
 import { sshKeyFingerprint, toOpenSSHPublicKey } from '../Core/utils';
 import type { FakeApi } from '../testing/fakes/util';
 import { describeGpuLifecycle, fakeLifecycle, USER_DATA_FILE } from '../testing/lifecycle';
+import { RUN_PREFIX } from '../testing/live';
 import { CONTRACT_SUBJECTS } from '../testing/subjects';
 import type { SSHConnectOptions } from '../types';
 
@@ -69,7 +70,8 @@ afterAll(async () => {
     expect(ran.size).toBeGreaterThan(CONTRACT_SUBJECTS.length);
     for (const p of ran.values()) {
         await expect(p.createServer({ name: 'after-the-run', offer: 'any' })).rejects.toThrow(/is over: createServer is refused/);
-        await expect(p.listServers()).resolves.toEqual(expect.any(Array));
+        // Reading still works, and finds no server of a run left: each run's teardown took its own.
+        expect((await p.listServers()).filter((s) => s.name.startsWith(RUN_PREFIX))).toEqual([]);
     }
 });
 

@@ -158,7 +158,7 @@ describe('Lambda filesystems', () => {
         const fs = await p.createVolume({ name: 'models', region: 'us-east-1' });
         expect(fs).toMatchObject({ name: 'models', region: 'us-east-1', status: 'available', providerStatus: 'not in use', mountPath: '/lambda/nfs/models' });
         expect(fs.sizeGb).toBeUndefined();
-        expect(fs.createdAt).toBeGreaterThan(0);
+        expect(fs.createdAt).toBe(Date.parse(fs.raw.created));
         await expect(p.createVolume({ name: 'models', region: 'us-east-1' })).rejects.toThrow(/already exists/);
     });
 

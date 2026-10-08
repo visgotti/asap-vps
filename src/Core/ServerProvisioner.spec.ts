@@ -58,7 +58,7 @@ describe('ServerProvisioner', () => {
         expect(r.setupResults).toEqual([expect.objectContaining({ step: 'check-gpu', success: true })]);
         expect(SSHService.connect).toHaveBeenCalledWith(expect.objectContaining({ host: r.server.ip, port: 22, username: 'root', privateKey: 'PRIVATE' }));
         expect(shell.execCommand).toHaveBeenCalledWith('nvidia-smi -L');
-        expect(shell.dispose).toHaveBeenCalled();
+        expect(shell.dispose).toHaveBeenCalledTimes(1);
         expect(fake.calls.find((c) => c.method === 'POST' && c.path === '/v2/droplets')?.body.ssh_keys).toHaveLength(1);
         expect(await p.listSSHKeys()).toEqual([]);
     });
@@ -126,6 +126,7 @@ describe('ServerProvisioner', () => {
 
     it('a failed setup that keeps its server (deleteOnFailure false) says so, with the server and the key pair to log in with', async () => {
         const { p, fake } = digitalOcean();
+        const before = fake.liveServers();
         const [offer] = await p.listOffers({ kind: 'cpu' });
         (SSHService.connect as jest.Mock).mockRejectedValueOnce(new Error('connection refused'));
         const e = await new ServerProvisioner(p).provision({ serverOptions: { name: 'kept', offer }, deleteOnFailure: false, ...quick }, () => {}).catch((x) => x);
@@ -133,7 +134,7 @@ describe('ServerProvisioner', () => {
         expect(e).toMatchObject({ kept: true, sshKeyData: { privateKey: 'PRIVATE' }, cause: expect.objectContaining({ message: 'connection refused' }) });
         expect(e.message).toMatch(/connection refused \(server .* is kept, as deleteOnFailure is false/);
         expect((await p.getServer(e.server.id))?.status).toBe('running');
-        expect(fake.liveServers()).toBeGreaterThan(0);
+        expect(fake.liveServers()).toBe(before + 1);
         // DigitalOcean applies a key at creation only: the provider key goes, the server keeps it.
         expect(e.providerSshKeyId).toBeUndefined();
         expect(await p.listSSHKeys()).toEqual([]);
@@ -186,7 +187,8 @@ describe('ServerProvisioner', () => {
             expect(deleted.providerSshKeyId).toBeUndefined();
             expect(await keys(p)).toEqual([]);
             const kept = await new ServerProvisioner(p).provision({ serverOptions: { name: 'b', offer: 'L4-1-24G', region: 'pl-waw-2' }, sshKeyName: 'provisioned', cleanupProviderKey: false, ...quick }, () => {});
-            expect(kept.providerSshKeyId).toBeDefined();
+            // Kept: the provider holds exactly that key, the one named in the result.
+            expect((await keys(p)).map((k) => k.id)).toEqual([kept.providerSshKeyId]);
         });
 
         it('a server kept after a failure keeps its key too, as one it boots with: the error says which key to delete later', async () => {
@@ -251,7 +253,7 @@ describe('ServerProvisioner', () => {
             await expect(new ServerProvisioner(p).provision({ serverOptions: { name: 'x', offer }, ...quick }, (pipeline) => void pipeline.addStep({
                 name: 'explode', execute: async () => { throw new Error('step exploded'); },
             }))).rejects.toThrow('step exploded');
-            expect(shell.dispose).toHaveBeenCalled();
+            expect(shell.dispose).toHaveBeenCalledTimes(1);
             expect(fake.liveServers()).toBe(before);
             expect(await p.listSSHKeys()).toEqual([]);
         });

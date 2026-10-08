@@ -686,7 +686,8 @@ describe('RunPod serverless: load-balancing endpoints (plain HTTP workers, no Ru
         await p.createEndpoint({ name: 'a', container: { image: 'ghcr.io/acme/app:1', registryAuth: auth }, offer: 'cpu3c:2' });
         await p.createEndpoint({ name: 'b', container: { image: 'ghcr.io/acme/app:1', registryAuth: auth }, offer: 'cpu3c:2' });
         const [a, b] = posts(fake);
-        expect(a.registry).toBeTruthy();
+        // One login stored, the one both endpoints name.
+        expect([...fake.state.registries.keys()]).toEqual([a.registry]);
         expect(b.registry).toBe(a.registry);
         expect(fake.state.registries.get(a.registry)).toMatchObject({ username: 'bot', password: 'ghp_pull' });
     });

@@ -33,16 +33,21 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         const { provider } = subject.make();
         const offers = await provider.listOffers(GPU);
         expect(offers.length).toBeGreaterThan(0);
+        // The cheapest, field by field, as the fake's catalog record has it (subjects.ts says what each value comes from).
+        const { raw: _raw, ...cheapest } = offers[0];
+        expect(cheapest).toEqual(subject.cheapestGpuOffer);
+        // Each offer once.
+        expect(new Set(offers.map((o) => o.id)).size).toBe(offers.length);
         for (const o of offers) {
             expect(o.provider).toBe(provider.id);
-            expect(o.id).toBeTruthy();
-            expect(o.gpu).toBeTruthy();
+            expect(o.id).toMatch(/\S/);
+            expect(o.gpu).toMatch(/\S/);
             expect(['nvidia', 'amd']).toContain(o.vendor);
             expect(o.gpuCount).toBeGreaterThanOrEqual(1);
             expect(o.vramGb).toBeGreaterThan(0);
             expect(o.pricePerHour).toBeGreaterThan(0);
             expect(o.regions.length).toBeGreaterThan(0);
-            expect(o.interruptible).toBeFalsy();
+            expect(o.interruptible ?? false).toBe(false);
             expect(o.billing?.incrementSeconds).toBeGreaterThanOrEqual(1);
             expect(o.billing?.minimumSeconds).toBeGreaterThanOrEqual(0);
         }
@@ -104,7 +109,7 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         const createdAfter = Date.now();
         const created = await provider.createServer({ name: 'gpu-contract', offer, ...(await subject.extra(provider)) });
         expect(created).toMatchObject({ provider: provider.id, name: 'gpu-contract' });
-        expect(created.id).toBeTruthy();
+        expect(created.id).toMatch(/\S/);
         expect(['pending', 'running']).toContain(created.status);
         expect(fake.liveServers()).toBe(before + 1);
 
@@ -112,15 +117,15 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         expect(running).toMatchObject({ id: created.id, status: 'running', gpu: offer.gpu });
         expect(running.region).toBe(offer.regions[0]);
         if (provider.capabilities.compute.kind === 'vm') {
-            expect(running.ip).toBeTruthy();
-            expect(running.ssh).toEqual({ host: running.ip, port: 22, username: expect.any(String) });
+            expect(running.ip).toMatch(/^\d{1,3}(\.\d{1,3}){3}$/);
+            expect(running.ssh).toEqual({ host: running.ip, port: 22, username: subject.sshUser });
         }
         expect((await provider.getServer(created.id))?.status).toBe('running');
         expect((await provider.listServers()).find((s) => s.id === created.id)?.status).toBe('running');
 
-        // What it costs: its rate, the start of the run it bills (not before the create), in the provider's steps; an hour of it is an hour's price.
-        expect(running.pricePerHour).toBeGreaterThan(0);
-        expect(running.billing?.incrementSeconds).toBeGreaterThanOrEqual(1);
+        // What it costs: the offer's rate, billed as the offer said, from the start of the run (not before the create); an hour of it is an hour's price.
+        expect(running.pricePerHour).toBeCloseTo(offer.pricePerHour, 9);
+        expect(running.billing).toEqual(offer.billing);
         const billedFrom = running.billingStartedAt as number;
         expect(billedFrom).toBeGreaterThanOrEqual(createdAfter);
         expect(billedFrom).toBeLessThanOrEqual(Date.now() + 60_000);
@@ -181,11 +186,12 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         expect((await provider.waitForServer(s.id, (x) => x?.status === 'stopped', fast))?.status).toBe('stopped');
         // Stopped, it bills only its disk: no run bills at its rate. Where a stopped server bills in full, its run goes on.
         const whileStopped = await provider.getServerCost(s.id);
-        if (provider.capabilities.power.stoppedBilling === 'full') expect(whileStopped).not.toBeNull();
+        if (provider.capabilities.power.stoppedBilling === 'full') expect(whileStopped?.pricePerHour).toBeCloseTo(offer.pricePerHour, 9);
         else expect(whileStopped).toBeNull();
         await provider.startServer(s.id);
         expect((await provider.waitUntilRunning(s.id, fast)).status).toBe('running');
-        expect(await provider.getServerCost(s.id)).not.toBeNull();
+        // Running again, it bills at its rate again.
+        expect((await provider.getServerCost(s.id))?.pricePerHour).toBeCloseTo(offer.pricePerHour, 9);
         expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
     });
 
@@ -202,7 +208,7 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         const provider = requireCapability(subject.make().provider, 'sshKeys');
         const pub = testPublicKey('contract');
         const key = await provider.addSSHKey(pub, 'gpu-contract-key');
-        expect(key.id).toBeTruthy();
+        expect(String(key.id)).toMatch(/^\S+$/);
         expect(key.fingerprint).toBe(sshKeyFingerprint(pub));
         expect((await provider.listSSHKeys()).map((k) => k.id)).toContain(key.id);
         // Idempotent: the same key again is the same registration, whatever it is called.
@@ -288,7 +294,10 @@ describe('images where the platform has them', () => {
                 expect(supports(made, 'imageCopy')).toBe(false);
                 return;
             }
-            await expect(made.listImages()).resolves.toEqual(expect.any(Array));
+            // Each image listed is the provider's, with a status of the library's and the places it boots.
+            for (const i of await made.listImages()) {
+                expect([i.provider, ['pending', 'available', 'error', 'unknown'].includes(i.status), Array.isArray(i.regions)]).toEqual([made.id, true, true]);
+            }
             expect(['region', 'global']).toContain(made.capabilities.images.scope);
         });
     }
@@ -537,7 +546,7 @@ describe('container: one image to run, the same option on every platform', () =>
             if (vm) {
                 const userData = subject.userDataOf!(fake) ?? '';
                 // The caller's user data and the container's script, as one cloud-init document, the caller's first.
-                expect(rest.userData).toBeTruthy();
+                expect(rest.userData).toMatch(/\S/);
                 expect(userData).toMatch(/^Content-Type: multipart\/mixed; boundary="/);
                 expect(userData.indexOf(rest.userData!)).toBeLessThan(userData.indexOf('# asap-vps: the server\'s container'));
                 expect(userData).toContain(`'--env-file' '/etc/asap-vps/container.env' '-p' '8000:8000/tcp' $GPUS 'ghcr.io/acme/app:1' 'serve' '--port' '8000'`);
