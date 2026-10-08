@@ -24,7 +24,11 @@
     "test:live": "jest --config jest.live.config.js",
     "test:coverage": "jest --coverage",
     "scaleway:spec": "ts-node --transpile-only scripts/scaleway-spec-check.ts",
-    "api:spec": "ts-node --transpile-only scripts/api-spec-check.ts"
+    "api:spec": "ts-node --transpile-only scripts/api-spec-check.ts",
+    "docs:install": "npm install --prefix site",
+    "docs:dev": "npm run dev --prefix site",
+    "docs:build": "npm run build --prefix site",
+    "docs:check": "npm run typecheck --prefix site && npm run check --prefix site"
   },
   "dependencies": {
     "node-ssh": "^13.1.0"

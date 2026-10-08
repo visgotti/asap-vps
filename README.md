@@ -1,5 +1,7 @@
 Servers on any cloud, through one set of typed primitives: rent a VPS or a GPU server, log in over SSH, set it up, capture it as an image, delete it, the same way on every provider. Each provider is one class, and its type says exactly what it can do.
 
+**[Documentation, with a live sandbox](https://visgotti.github.io/asap-vps/)**: every code block is an editor with this library's real types (completions, hovers and errors, as in your own editor), and the runnable ones execute the library's code in your browser against in-memory fakes of each provider's API. Nothing is rented. The site is built from [`site/`](site) (see [Documentation site](#documentation-site)).
+
 | Provider | Class | Servers | Power (stop / start) | Restart | Logs | SSH keys | Images | Volumes | Serverless |
 |---|---|---|---|---|---|---|---|---|---|
 | DigitalOcean | `DigitalOcean` | VMs, with or without GPUs | yes (a stopped droplet bills in full) | yes | | yes | yes, per region, with copy and import from a URL | block, and shared (NFS) | |
@@ -59,6 +61,59 @@ await runpod.waitUntilRunning(server.id);
 await runpod.stopServer(server.id);
 await runpod.startServer(server.id);
 await runpod.deleteServerAndWait(server.id);
+```
+
+Each provider has its own shape, and its class has the methods that fit it. In a few lines each (the documentation has a runnable page for every one):
+
+**Scaleway**: zones (a server is `zone/uuid`), a Block volume attached to a running server, and a stop that frees the slot:
+
+```typescript
+import { Scaleway } from "asap-vps";
+
+const scaleway = new Scaleway({ apiKey: process.env.SCW_SECRET_KEY!, projectId: process.env.SCW_DEFAULT_PROJECT_ID! });
+const [offer] = await scaleway.listOffers({ kind: "cpu" });          // its regions are zones with stock
+const zone = offer.regions[0];
+const server = await scaleway.waitUntilRunning((await scaleway.createServer({ name: "api-1", offer, region: zone })).id);
+
+const disk = await scaleway.createVolume({ name: "pgdata", region: zone, sizeGb: 50 });
+await scaleway.attachVolume(disk.id, server.id);                     // onto the running server
+await scaleway.stopServer(server.id);                                // poweroff frees the slot: only volumes and IPs bill
+```
+
+**Lambda**: GPU VMs with exactly one SSH key at launch, a container run by Docker from the first boot, and no stop (so no `lambda.stopServer` to call):
+
+```typescript
+import { LambdaCloud } from "asap-vps";
+
+const lambda = new LambdaCloud(process.env.LAMBDA_API_KEY!);
+const key = await lambda.addSSHKey(publicKey, "laptop");
+const [offer] = await lambda.listOffers({ gpus: ["A10"] });
+
+const server = await lambda.createServer({
+  name: "worker-1", offer, sshKeyIds: [key.id],
+  container: { image: "ghcr.io/acme/worker:1", ports: ["8000/tcp"] },
+});
+await lambda.waitUntilRunning(server.id);
+```
+
+**Vast.ai**: every offer is one machine, a volume lives on a machine, and an image is a snapshot pushed to a registry of yours that boots on any machine:
+
+```typescript
+import { VastAI } from "asap-vps";
+
+const vast = new VastAI({
+  apiKey: process.env.VAST_API_KEY!,
+  snapshots: { server: "ghcr.io", repository: "acme/snapshots", username: "bot", password: process.env.GHCR_TOKEN! },
+});
+const [offer] = await vast.listOffers({ minVramGb: 16, minCudaVersion: "12.2" });   // each offer is one machine
+const machine = offer.regions.find((r) => r.startsWith("machine:"))!;
+
+const volume = await vast.createVolume({ name: "weights_v1", region: machine, sizeGb: 50 }); // lives on that machine
+const server = await vast.createServer({
+  name: "trainer", offer, image: "nvidia/cuda:12.8.1-base-ubuntu24.04", command: ["sleep", "infinity"], mounts: [{ volume, path: "/models" }],
+});
+await vast.waitUntilRunning(server.id);
+const image = await vast.createImage(server.id, { name: "trained-v1" });            // ghcr.io/acme/snapshots:trained-v1
 ```
 
 # Capabilities
@@ -379,6 +434,21 @@ src/testing/                    fakes of each platform's REST API, the contract 
 **A new capability** (object storage, firewalls, ...) is an interface in `src/capabilities.ts`, its traits in `CapabilityTraits`, an entry in `CapabilityInterfaces` and its methods in `CAPABILITY_METHODS`. Then the providers whose platforms have it implement and declare it. A provider with no servers at all extends `BaseProvider` instead of `ComputeProvider`.
 
 Specs sit next to the code they test.
+
+# Documentation site
+
+[`site/`](site) is the documentation, published to GitHub Pages: pages of markdown in [`site/src/content`](site/src/content), built with [esbuild](https://esbuild.github.io). Every `ts` block on it is a [Monaco](https://microsoft.github.io/monaco-editor/) editor that has this library's real declarations (`tsc` emits them from `src/`, and the editors resolve `asap-vps` to them, with Node's types), so completions, hovers, signature help and errors are the ones your editor gives you.
+
+A block's info string says what it is: `ts run` has a **Run** button that executes it in a Web Worker, `ts` is type-checked, `ts error` must fail to compile (it shows what the type system refuses), `ts static` is only highlighted. A run uses the library's own code, bundled with small shims for Node's built-ins, with `fetch` routed by each provider's real host to its fake (`src/testing/fakes`), `process.env` holding a key each fake accepts, and a virtual clock (a wait of ten seconds takes a moment but moves `Date.now()` ten seconds). Nothing leaves the page.
+
+```
+npm run docs:install   # once: the site has its own dependencies (esbuild, monaco-editor, marked, @noble/hashes, ...)
+npm run docs:dev       # build, serve on http://localhost:8765 and rebuild on change
+npm run docs:build     # site/dist
+npm run docs:check     # type-check the site, then every block of every page: each compiled against the declarations, each `run` executed in the sandbox, each `error` required to fail
+```
+
+`docs:check` is the docs' test suite, so a page cannot show code that no longer compiles or a run that no longer works; `site/scripts/e2e.mjs` repeats it in headless Chrome, against the built site. [.github/workflows/docs.yml](.github/workflows/docs.yml) runs the check and the build on every pull request that touches `site/` or `src/`, and deploys `master` to Pages (the repository's Settings, Pages, Source: GitHub Actions).
 
 # Running tests
 
