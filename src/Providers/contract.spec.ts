@@ -445,8 +445,15 @@ describe('volumes where the platform has them, each kind it makes', () => {
                 const provider = requireCapability(made, 'volumes');
                 const { offer, region } = await place(provider);
                 const elsewhere = subject.elsewhere!(region, kind);
-                // A kind made in one region only has nowhere else to be.
-                if (elsewhere === undefined) return;
+                // A kind made in one region only has nowhere else to be: asked for in another, it is refused, and nothing is made.
+                if (elsewhere === undefined) {
+                    const only = subject.oneRegion?.[kind];
+                    if (!only) throw new Error(`${subject.name}: no other region for a ${kind} volume, and no oneRegion entry saying how one is refused`);
+                    const volumes = (await provider.listVolumes()).length;
+                    await expect(provider.createVolume({ name: named('gpu-contract-far'), region: only.other, ...options })).rejects.toThrow(only.refusal);
+                    expect((await provider.listVolumes()).length).toBe(volumes);
+                    return;
+                }
                 const far = await provider.createVolume({ name: named('gpu-contract-far'), region: elsewhere, ...options });
                 expect(far.region).not.toBe(region);
                 const before = fake.liveServers();

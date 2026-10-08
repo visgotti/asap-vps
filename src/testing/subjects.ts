@@ -46,6 +46,8 @@ export type ContractSubject = {
     logLine?: RegExp,
     /** A region other than `region` where a volume of `kind` can be made (providers with volumes): a server in `region` cannot mount it; undefined where the kind is in one region only. */
     elsewhere?: (region: string, kind: 'block' | 'shared') => string | undefined,
+    /** For a kind made in one region only (elsewhere gives none): another region to ask for, and how the provider refuses it. */
+    oneRegion?: Partial<Record<'block' | 'shared', { other: string, refusal: RegExp }>>,
     /** Where the servers that mount a volume of `kind` go, where the cheapest GPU offer is no place for it (default: that offer, in its first region). */
     volumePlace?: (provider: AnyProvider, kind: 'block' | 'shared') => Promise<{ offer: Offer, region: string } | undefined>,
     /** A volume's name as the platform takes it, where it takes fewer characters than a test name has (default: as it is). */
@@ -190,6 +192,8 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         refused: { env: { MODE: 'probe' } },
         // File Storage is in Paris only: no other region to make one in.
         elsewhere: (zone, kind) => (kind === 'shared' ? undefined : zone === 'fr-par-2' ? 'pl-waw-2' : 'fr-par-2'),
+        // File Storage is in Paris only.
+        oneRegion: { shared: { other: 'nl-ams-1', refusal: /File Storage is in fr-par, not nl-ams/ } },
         // A filesystem: a GPU type that attaches one, in a Paris zone.
         volumePlace: async (p, kind) => {
             if (kind !== 'shared') return undefined;

@@ -664,9 +664,14 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
                         }
                     }
                 }
+                // It booted anew: a VM's boot id changed, a container wrote a boot mark it had not.
+                const [bootBefore, bootsBefore] = [s.bootId, s.boots?.size ?? 0];
                 if (vm) s.bootId = await newBoot(server);
                 s.server = await p.waitUntilRunning(server.id, t.wait);
                 if (!vm) await newContainerBoot(s.server);
+                if (vm) expect(s.bootId).not.toBe(bootBefore);
+                else expect(s.boots!.size).toBeGreaterThan(bootsBefore);
+                expect(s.server.status).toBe('running');
             }, t.timeouts.server);
         }
 
