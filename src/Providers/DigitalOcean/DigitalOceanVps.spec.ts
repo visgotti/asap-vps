@@ -101,6 +101,9 @@ describe('DigitalOcean as a VPS host', () => {
         const s = await lagged.createServer({ ...droplet, sshKeyIds: [key.id] });
         expect(fake.calls.slice(reads).filter((c) => c.method === 'POST' && c.path === '/v2/droplets').map((c) => c.body.ssh_keys)).toEqual([[key.id]]);
         await lagged.deleteServer(s.id);
+        // Its id as a string (all digits) is sent unread too, as the number DigitalOcean takes.
+        await lagged.deleteServer((await lagged.createServer({ ...droplet, sshKeyIds: [String(key.id)] })).id);
+        expect(fake.calls.slice(reads).filter((c) => c.method === 'POST' && c.path === '/v2/droplets').map((c) => c.body.ssh_keys)).toEqual([[key.id], [key.id]]);
         // A name has to be looked up: a list that does not show it yet refuses it, before anything is created.
         await expect(lagged.createServer({ ...droplet, sshKeyIds: ['just-added'] })).rejects.toBeInstanceOf(NotFoundError);
     });
@@ -129,6 +132,64 @@ describe('DigitalOcean as a VPS host', () => {
         await expect(vps.createServer({ ...droplet, region: 'sfo3', sshKeyIds: [key.id] })).rejects.toBeInstanceOf(CapacityError);
         expect(creates()).toBe(n + 1);
         expect(fake.liveServers()).toBe(before);
+    });
+
+    it('a reference that only looks like an id or an MD5 fingerprint is looked up: keys named with digits are found by name, and a fingerprint in another form is refused before anything is created', async () => {
+        const { fake, vps } = made();
+        const pub = testPublicKey();
+        const dated = await vps.addSSHKey(pub, '2024-laptop');
+        const numbered = await vps.addSSHKey(testPublicKey(), 'laptop-2');
+        const posts = () => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/droplets');
+        await vps.deleteServer((await vps.createServer({ ...droplet, sshKeyIds: ['2024-laptop', 'laptop-2'] })).id);
+        expect(posts().map((c) => c.body.ssh_keys)).toEqual([[dated.id, numbered.id]]);
+        // ssh-keygen's MD5 form, and a longer colon-separated hex one (a SHA-1, as some consoles show): not DigitalOcean's own form.
+        const md5 = sshKeyFingerprint(pub, 'md5');
+        for (const ref of [`MD5:${md5}`, `${md5}:0a:1b:2c:3d`]) {
+            await expect(vps.createServer({ ...droplet, sshKeyIds: [ref] })).rejects.toThrow(`digitalocean: no SSH key "${ref}" on the account (addSSHKey adds one)`);
+        }
+        expect(posts()).toHaveLength(1);
+    });
+
+    it('a create with a key that is refused for another reason is thrown at once; keys sent raw in providerOptions are DigitalOcean\'s to check, and never waited on', async () => {
+        const { fake, vps } = made();
+        const key = await vps.addSSHKey(testPublicKey(), 'known');
+        const posts = () => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/droplets').length;
+        await expect(vps.createServer({ ...droplet, sshKeyIds: [key.id], image: '424242' })).rejects.toThrow(/422 The image is not available in the requested region\./);
+        expect(posts()).toBe(1);
+        // Only keys this provider resolved (sshKeyIds) may be ones added moments ago.
+        await expect(vps.createServer({ ...droplet, providerOptions: { ssh_keys: [999_999] } })).rejects.toThrow(/422 999999 are invalid key identifiers for Droplet creation\./);
+        expect(posts()).toBe(2);
+    });
+
+    it('a key this provider added is its own while the account\'s list does not show it, for KEY_LAG_MS and no longer', async () => {
+        const { fake } = made();
+        let posts = 0;
+        // The account's list never shows new keys, and its duplicate check lets the same key in again.
+        const stale = (async (url: string, init?: RequestInit) => {
+            const path = new URL(url).pathname;
+            if ((init?.method ?? 'GET') === 'GET' && path === '/v2/account/keys') {
+                return new Response(JSON.stringify({ ssh_keys: [], links: {}, meta: { total: 0 } }), { status: 200, headers: { 'content-type': 'application/json' } });
+            }
+            if (init?.method === 'POST' && path === '/v2/account/keys') {
+                const body = JSON.parse(String(init.body));
+                return new Response(JSON.stringify({ ssh_key: { id: 7000 + ++posts, name: body.name, public_key: body.public_key, fingerprint: '' } }), { status: 201, headers: { 'content-type': 'application/json' } });
+            }
+            return fake.fetchImpl(url, init);
+        }) as typeof fetch;
+        const vps = new DigitalOcean({ apiKey: 'do-test', fetchImpl: stale, sleep: noSleep });
+        const pub = testPublicKey();
+        const t0 = Date.parse('2026-10-09T00:00:00Z');
+        const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+        try {
+            const first = await vps.addSSHKey(pub, 'a');
+            now.mockReturnValue(t0 + DigitalOcean.KEY_LAG_MS - 1);
+            expect((await vps.addSSHKey(pub, 'b')).id).toBe(first.id);
+            now.mockReturnValue(t0 + DigitalOcean.KEY_LAG_MS);
+            expect((await vps.addSSHKey(pub, 'c')).id).toBe(7002);
+            expect(posts).toBe(2);
+        } finally {
+            now.mockRestore();
+        }
     });
 
     it('a key the account does not hold is refused before anything is created; no key asked for, none sent', async () => {

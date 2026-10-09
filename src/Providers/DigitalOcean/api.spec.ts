@@ -6,7 +6,7 @@
 import { ProviderError } from '../../errors';
 import { fakeDigitalOcean } from '../../testing/fakes/digitalocean';
 import { json, testPublicKey } from '../../testing/fakes/util';
-import { DigitalOceanApi } from './api';
+import { DigitalOceanApi, sshKeyRef } from './api';
 import { DigitalOcean } from './DigitalOcean';
 
 const noSleep = async () => {};
@@ -40,6 +40,27 @@ describe('DigitalOceanApi', () => {
                 ? json(422, { id: 'unprocessable_entity', message: 'SSH Key is already in use on your account' }) : f(url, init)) as typeof fetch);
         await expect(unlisted.api.registerSSHKey(pub, 'laptop')).rejects.toMatchObject({ status: 422, message: expect.stringMatching(/already in use/) });
         await expect(api.registerSSHKey('not a key', 'x')).rejects.toMatchObject({ status: 422, message: expect.stringMatching(/Key invalid/) });
+    });
+
+    it('a list that names a next page forever is refused after 200 pages, not read without end', async () => {
+        let pages = 0;
+        const { api } = make({}, (f) => (async (url: string | URL | Request, init?: RequestInit) => {
+            if (new URL(String(url)).pathname !== '/v2/sizes') return f(url, init);
+            pages++;
+            return json(200, { sizes: [], links: { pages: { next: 'https://api.digitalocean.com/v2/sizes?page=2' } }, meta: { total: 1e9 } });
+        }) as typeof fetch);
+        const e = await api.all('/v2/sizes', 'sizes').catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e.message).toBe('digitalocean: /v2/sizes has more than 200 pages');
+        expect(pages).toBe(200);
+    });
+
+    it('a key reference a droplet create takes: all digits is an id, sent as a number; anything else (a fingerprint, a name) as it is', () => {
+        expect(sshKeyRef('5001')).toBe(5001);
+        expect(sshKeyRef(5001)).toBe(5001);
+        const md5 = '3b:21:6f:0a:9c:84:12:5e:77:d0:4a:b3:c8:19:e6:42';
+        expect(sshKeyRef(md5)).toBe(md5);
+        expect(sshKeyRef('laptop-2')).toBe('laptop-2');
     });
 
     it('a rate limit is a ProviderError worth sending again, after the client has waited it out a few times', async () => {

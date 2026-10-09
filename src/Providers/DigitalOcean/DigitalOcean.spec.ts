@@ -12,12 +12,37 @@
 import { execFileSync } from 'child_process';
 import type { ICompute } from '../../capabilities';
 import { REGION_TYPES } from '../../constants';
+import { containerBootScript } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
 import { fakeDigitalOcean } from '../../testing/fakes/digitalocean';
+import { json } from '../../testing/fakes/util';
 import { DigitalOcean } from './DigitalOcean';
 
 const noSleep = async () => {};
 const fast = { intervalMs: 0, timeoutMs: 5000 };
+
+/**
+ * A provider whose waits take no time and move its clock (Date.now) on by what
+ * they waited, each on record: a default timeout is reached at once. A wait
+ * that would never end stops at 10 000 pauses.
+ */
+function clocked(o: Parameters<typeof fakeDigitalOcean>[0] = {}, wrap: (f: typeof fetch) => typeof fetch = (f) => f) {
+    const fake = fakeDigitalOcean(o);
+    let now = Date.parse('2026-10-09T00:00:00Z');
+    const slept: number[] = [];
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const sleep = async (ms: number) => {
+        slept.push(ms);
+        if (slept.length > 10_000) throw new Error('a wait without end');
+        now += ms;
+    };
+    return { fake, slept, p: new DigitalOcean({ apiKey: 'do-test', fetchImpl: wrap(fake.fetchImpl), sleep }) };
+}
+
+/** A request as `METHOD path`, an action's id left out. */
+const asked = (c: { method: string, path: string }) => `${c.method} ${c.path}`.replace(/^GET \/v2\/actions\/\d+$/, 'GET /v2/actions/:id');
+
+afterEach(() => jest.restoreAllMocks());
 
 describe('DigitalOcean', () => {
     const make = (o: Parameters<typeof fakeDigitalOcean>[0] = {}) => {
@@ -56,6 +81,35 @@ describe('DigitalOcean', () => {
         expect(e).toBeInstanceOf(ProviderError);
         expect(e).not.toBeInstanceOf(CapacityError);
         expect(e.message).toMatch(/image is not available/);
+    });
+
+    it('reads a GPU count from a size id\'s "x<count>" (gpuCountOf); an id that is not a GPU size\'s, or names no count, has none', () => {
+        expect(['gpu-h100x8-640gb', 'gpu-mi300x1-192gb', 'gpu-4000adax1-20gb', 'gpu-b300x16-4608gb'].map((id) => DigitalOcean.gpuCountOf(id))).toEqual([8, 1, 1, 16]);
+        expect(['s-8vcpu-16gb', 'gpu-b300-288gb', 'eu-gpu-h100x8-640gb'].map((id) => DigitalOcean.gpuCountOf(id))).toEqual([undefined, undefined, undefined]);
+    });
+
+    it('gpuCount with an offer id is held to the count the id names: a plain size has none, and a GPU size whose id names no count cannot be checked; nothing is sent', async () => {
+        const { p, fake } = make();
+        await expect(p.createServer({ name: 'x8', offer: 'gpu-h100x8-640gb', region: 'nyc2', gpuCount: 1 }))
+            .rejects.toThrow('digitalocean: createServer option "gpuCount" 1: this offer has 8 GPU(s); pick an offer with 1');
+        await expect(p.createServer({ name: 'cpu', offer: 's-8vcpu-16gb', region: 'nyc1', gpuCount: 1 }))
+            .rejects.toThrow('digitalocean: createServer option "gpuCount" 1: this offer has 0 GPU(s); pick an offer with 1');
+        await expect(p.createServer({ name: 'b300', offer: 'gpu-b300-288gb', region: 'nyc2', gpuCount: 1 }))
+            .rejects.toThrow('digitalocean: createServer option "gpuCount" with an offer id (pass the offer itself, whose GPU count is fixed)');
+        expect(fake.calls).toEqual([]);
+        await expect(p.createServer({ name: 'x8', offer: 'gpu-h100x8-640gb', region: 'nyc2', gpuCount: 8 })).resolves.toMatchObject({ name: 'x8', offerId: 'gpu-h100x8-640gb' });
+    });
+
+    it('a container on a size named by its id gets the GPUs where the id is a GPU size\'s, its count named or not, and none on a plain size', async () => {
+        const { p, fake } = make();
+        // A GPU size whose id names no count.
+        fake.state.sizes.push({ slug: 'gpu-b300-288gb', price_hourly: 9.9, available: true, regions: ['nyc2'], vcpus: 32, memory: 262144, disk: 1000,
+            gpu_info: { count: 1, vram: { amount: 288, unit: 'gib' }, model: 'nvidia_b300' } });
+        const container = { image: 'busybox' };
+        for (const [offer, region, gpu] of [['s-8vcpu-16gb', 'nyc1', false], ['gpu-4000adax1-20gb', 'tor1', true], ['gpu-b300-288gb', 'nyc2', true]] as const) {
+            await p.createServer({ name: `c-${offer}`, offer, region, container });
+            expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/droplets').pop()?.body.user_data).toBe(containerBootScript(container, { gpu }));
+        }
     });
 
     it('a droplet needs a region, and a provider needs a key: nothing is sent without them', async () => {
@@ -142,6 +196,27 @@ describe('DigitalOcean API facts', () => {
         await p.stopServer(s.id);
         expect((await p.getServer(s.id))?.status).toBe('stopped');
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions')).map((c) => c.body.type)).toEqual(['shutdown', 'power_off']);
+    });
+
+    it('stopping a droplet that does not exist, or one deleted while it shuts down, is a NotFoundError that names it, and no power-off is asked for', async () => {
+        const fake = fakeDigitalOcean();
+        // Deleted (elsewhere) the moment its shutdown completes.
+        const deleting = (async (url: string, init?: RequestInit) => {
+            const r = await fake.fetchImpl(url, init);
+            const m = /^\/v2\/actions\/(\d+)$/.exec(new URL(url).pathname);
+            const a = m ? fake.state.actions.get(m[1]) : undefined;
+            if (a?.type === 'shutdown' && a.status === 'completed') fake.state.droplets.delete(String(a.dropletId));
+            return r;
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: deleting, sleep: noSleep });
+        const missing = await p.stopServer('999999').catch((x) => x);
+        expect(missing).toBeInstanceOf(NotFoundError);
+        expect(missing.message).toBe('digitalocean: no droplet 999999');
+        const s = await running(p, (await p.createServer({ name: 'gpu-5', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id);
+        const gone = await p.stopServer(s.id).catch((x) => x);
+        expect(gone).toBeInstanceOf(NotFoundError);
+        expect(gone.message).toBe(`digitalocean: droplet ${s.id} is gone`);
+        expect(fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions')).map((c) => c.body.type)).toEqual(['shutdown']);
     });
 
     it('defaults 8-GPU NVIDIA sizes to the 8-GPU image', async () => {
@@ -235,6 +310,51 @@ describe('DigitalOcean images (droplet snapshots)', () => {
         await p.deleteImage(img.id);
         expect(await p.getImage(img.id)).toBeNull();
         await expect(p.copyImage(img.id, ['nyc2'], fast)).rejects.toBeInstanceOf(NotFoundError);
+        await expect(p.copyImage(img.id, ['nyc2'], fast)).rejects.toThrow(`digitalocean: no image ${img.id}`);
+    });
+
+    it('an image deleted while it is copied is a NotFoundError that says so', async () => {
+        const fake = fakeDigitalOcean();
+        // Deleted (elsewhere) as soon as its transfer is asked for.
+        const deleting = (async (url: string, init?: RequestInit) => {
+            const r = await fake.fetchImpl(url, init);
+            const m = /^\/v2\/images\/(\d+)\/actions$/.exec(new URL(url).pathname);
+            if (init?.method === 'POST' && m) fake.state.images.delete(m[1]);
+            return r;
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: deleting, sleep: noSleep });
+        const { img } = await baked(p);
+        const e = await p.copyImage(img.id, ['nyc2'], fast).catch((x) => x);
+        expect(e).toBeInstanceOf(NotFoundError);
+        expect(e.message).toBe(`digitalocean: image ${img.id} disappeared while it was copied`);
+    });
+
+    it('the snapshot made is the droplet\'s newest of that name; one the droplet does not list, or an action that errors, is an error that says so', async () => {
+        const fake = fakeDigitalOcean();
+        let answer: 'unlisted' | 'errored' | undefined;
+        const wrapped = (async (url: string, init?: RequestInit) => {
+            const path = new URL(url).pathname;
+            if (answer === 'unlisted' && /^\/v2\/droplets\/\d+\/snapshots$/.test(path)) return json(200, { snapshots: [], links: {}, meta: { total: 0 } });
+            const m = /^\/v2\/actions\/(\d+)$/.exec(path);
+            if (answer === 'errored' && m && fake.state.actions.get(m[1])?.type === 'snapshot') return json(200, { action: { id: Number(m[1]), type: 'snapshot', status: 'errored' } });
+            return fake.fetchImpl(url, init);
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: wrapped, sleep: noSleep });
+        const s = await p.createServer({ name: 'bake-2', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
+        const older = await p.createImage(s.id, { name: 'nightly', ...fast });
+        // A day older, and listed first.
+        fake.state.images.get(older.id).created_at = '2026-01-01T00:00:00Z';
+        const newer = await p.createImage(s.id, { name: 'nightly', ...fast });
+        expect(newer.id).not.toBe(older.id);
+        expect(newer.id).toBe(String(Math.max(...[...fake.state.images.values()].filter((i) => i.name === 'nightly').map((i) => i.id))));
+        answer = 'unlisted';
+        const unlisted = await p.createImage(s.id, { name: 'ghost', ...fast }).catch((x) => x);
+        expect(unlisted).toBeInstanceOf(ProviderError);
+        expect(unlisted.message).toBe(`digitalocean: snapshot "ghost" of droplet ${s.id} completed but is not listed`);
+        answer = 'errored';
+        const errored = await p.createImage(s.id, { name: 'broken', ...fast }).catch((x) => x);
+        expect(errored).toBeInstanceOf(ProviderError);
+        expect(errored.message).toMatch(/^digitalocean: action \d+ \(snapshot\) errored$/);
     });
 
     it('an image whose nullable fields are null (as the spec allows) reads with no size, never a null one', async () => {
@@ -251,6 +371,17 @@ describe('DigitalOcean images (droplet snapshots)', () => {
         const { p } = make({ actionReads: 1_000_000 });
         const s = await p.createServer({ name: 'slow', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
         await expect(p.createImage(s.id, { name: 'never', intervalMs: 0, timeoutMs: 30 })).rejects.toThrow(/timed out/);
+    });
+
+    it('a snapshot waits 30 min by default, reading its action every 10 s, then is a timeout naming the action and what it saw last', async () => {
+        const { p, slept, fake } = clocked({ actionReads: 1e9 });
+        const s = await p.waitUntilRunning((await p.createServer({ name: 'slow', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id);
+        slept.length = 0;
+        const e = await p.createImage(s.id, { name: 'never' }).catch((x) => x);
+        const action = [...fake.state.actions.values()].find((a) => a.type === 'snapshot');
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e).toMatchObject({ code: 'timeout', message: `digitalocean: timed out after 1800 s waiting for action ${action.id}: snapshot in-progress` });
+        expect(slept).toEqual(Array(180).fill(10_000));
     });
 });
 
@@ -280,8 +411,20 @@ describe('DigitalOcean droplet actions: one at a time, its create the first', ()
     it('a pending event that outlasts the wait is a timeout, and the action is never started', async () => {
         const { fake, p } = make({ bootReads: 1e9 });
         const s = await p.createServer({ name: 'stuck', ...server });
-        await expect(p.createImage(s.id, { name: 'never', intervalMs: 0, timeoutMs: 30 })).rejects.toThrow(/timed out .* waiting for the droplet's pending event to end/);
+        const e = await p.createImage(s.id, { name: 'never', intervalMs: 0, timeoutMs: 30 }).catch((x) => x);
+        expect(e.message).toMatch(/timed out .* waiting for the droplet's pending event to end/);
+        expect(e).toMatchObject({ code: 'timeout', message: 'digitalocean: timed out after 0 s waiting for the droplet\'s pending event to end, to ask for {"type":"snapshot","name":"never"}' });
         expect([...fake.state.actions.values()].filter((x) => x.type === 'snapshot')).toEqual([]);
+    });
+
+    it('a volume attach waits 10 min by default for the droplet\'s pending event to end, asking every 5 s, then is a timeout that says so', async () => {
+        const { p, slept } = clocked({ bootReads: 1e9 });
+        const vol = await p.createVolume({ name: 'scratch', region: 'tor1', sizeGb: 10 });
+        const s = await p.createServer({ name: 'stuck', ...server });
+        const e = await p.attachVolume(vol.id, s.id).catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e).toMatchObject({ code: 'timeout', message: `digitalocean: timed out after 600 s waiting for the droplet's pending event to end, to ask for {"type":"attach","droplet_id":${s.id},"region":"tor1"}` });
+        expect(slept).toEqual(Array(120).fill(5000));
     });
 
     it('any other refusal of an action is thrown at once, asked once', async () => {
@@ -334,9 +477,26 @@ describe('DigitalOcean image import (a custom image from a URL)', () => {
         expect(await p.listImages()).toEqual(expect.not.arrayContaining([expect.objectContaining({ name: 'slow' })]));
     });
 
+    it('imports from an http or an ftp URL too', async () => {
+        const { fake, p } = make();
+        const urls = ['http://mirror.example.com/images/noble.qcow2', 'ftp://mirror.example.com/images/noble.qcow2'];
+        for (const url of urls) await expect(p.importImage({ name: 'noble', url, region: 'tor1', ...fast })).resolves.toMatchObject({ name: 'noble', status: 'available' });
+        expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/images').map((c) => c.body.url)).toEqual(urls);
+    });
+
+    it('waits an hour for an import by default, reading every 15 s; the timeout is the cause of the error, which says the import was deleted', async () => {
+        const { p, slept } = clocked({ importReads: 1e9 });
+        const e = await p.importImage({ name: 'slow', url: URL_OK, region: 'tor1' }).catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e.message).toBe(`digitalocean: import of slow from ${URL_OK}: digitalocean: timed out after 3600 s waiting for import of slow: NEW (the import was deleted)`);
+        expect(e.cause).toBeInstanceOf(ProviderError);
+        expect(e.cause).toMatchObject({ code: 'timeout', message: 'digitalocean: timed out after 3600 s waiting for import of slow: NEW' });
+        expect(slept).toEqual(Array(240).fill(15_000));
+    });
+
     it('refuses what is not a file URL before anything is sent', async () => {
         const { fake, p } = make();
-        for (const url of ['s3://bucket/key.qcow2', 'https://example.com', 'file:///tmp/disk.img', 'disk.qcow2']) {
+        for (const url of ['s3://bucket/key.qcow2', 'https://example.com', 'file:///tmp/disk.img', 'disk.qcow2', 'git+https://example.com/disk.img']) {
             await expect(p.importImage({ name: 'x', url, region: 'tor1', ...fast })).rejects.toThrow(/an image is imported from an http\(s\) or ftp URL of a file/);
         }
         expect(fake.calls.filter((c) => c.method === 'POST')).toEqual([]);
@@ -416,6 +576,120 @@ describe('DigitalOcean Block Storage volumes', () => {
         expect(xfs.raw.filesystem_type).toBe('xfs');
         // A dash is an underscore in the mount point (systemd's mount unit naming).
         expect(xfs.mountPath).toBe('/mnt/scratch_v2_a');
+    });
+
+    it('a name of up to 64 characters and a size of 1 to 16384 GiB are taken; a longer name, or one with a character DigitalOcean refuses after a valid start, is refused before anything is sent', async () => {
+        const { fake, p } = make();
+        for (const name of ['models_v2', 'models.v2', `a${'b'.repeat(64)}`]) {
+            await expect(p.createVolume({ name, region: 'tor1', sizeGb: 10 })).rejects.toThrow(`digitalocean: volume name "${name}": lowercase letters, digits and dashes, starting with a letter (at most 64)`);
+        }
+        expect(fake.calls.filter((c) => c.path === '/v2/volumes')).toEqual([]);
+        const made = [await p.createVolume({ name: `a${'b'.repeat(63)}`, region: 'tor1', sizeGb: 1 }), await p.createVolume({ name: 'big', region: 'tor1', sizeGb: 16384 })];
+        expect(made.map((v) => [v.name.length, v.sizeGb])).toEqual([[64, 1], [3, 16384]]);
+    });
+
+    it('an attach reads the volume and the droplet, then asks for it; an unknown volume or droplet is a NotFoundError that names it, and nothing is asked', async () => {
+        const { fake, p } = make();
+        const vol = await p.createVolume({ name: 'scratch', region: 'tor1', sizeGb: 10 });
+        const s = await p.waitUntilRunning((await p.createServer({ name: 'gpu-1', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id, fast);
+        const ghost = '00000000-0000-4000-8000-00000000beef';
+        const noVolume = await p.attachVolume(ghost, s.id, fast).catch((x) => x);
+        expect(noVolume).toBeInstanceOf(NotFoundError);
+        expect(noVolume.message).toBe(`digitalocean: no volume ${ghost}`);
+        const noDroplet = await p.attachVolume(vol.id, '999999', fast).catch((x) => x);
+        expect(noDroplet).toBeInstanceOf(NotFoundError);
+        expect(noDroplet.message).toBe('digitalocean: no droplet 999999');
+        expect(fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions'))).toEqual([]);
+        const before = fake.calls.length;
+        await p.attachVolume(vol.id, s.id, fast);
+        expect(fake.calls.slice(before).map(asked)).toEqual([`GET /v2/volumes/${vol.id}`, `GET /v2/droplets/${s.id}`, `POST /v2/volumes/${vol.id}/actions`, 'GET /v2/actions/:id', 'GET /v2/actions/:id']);
+        expect((await p.getVolume(vol.id))?.serverIds).toEqual([s.id]);
+    });
+
+    it('a volume DigitalOcean reads with droplet_ids null (as its spec allows) is attached to nothing: it is attached, detached (again: nothing to do), mounted at a create, and let go of', async () => {
+        const fake = fakeDigitalOcean();
+        // Each volume as read: droplet_ids null where it is attached to nothing.
+        const nulled = (async (url: string, init?: RequestInit) => {
+            const r = await fake.fetchImpl(url, init);
+            if ((init?.method ?? 'GET') !== 'GET' || !new URL(url).pathname.startsWith('/v2/volumes') || r.status !== 200) return r;
+            const body = await r.json() as { volume?: { droplet_ids: number[] | null }, volumes?: Array<{ droplet_ids: number[] | null }> };
+            const nul = <V extends { droplet_ids: number[] | null }>(v: V) => (v.droplet_ids?.length ? v : { ...v, droplet_ids: null });
+            return json(200, body.volume ? { volume: nul(body.volume) } : { ...body, volumes: body.volumes?.map(nul) });
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: nulled, sleep: noSleep });
+        const vol = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 10 });
+        expect((await p.getVolume(vol.id))?.raw).toMatchObject({ droplet_ids: null });
+        const s = await p.waitUntilRunning((await p.createServer({ name: 'gpu-1', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id, fast);
+        let before = fake.calls.length;
+        await p.attachVolume(vol.id, s.id, fast);
+        expect(fake.calls.slice(before).map(asked)).toEqual([`GET /v2/volumes/${vol.id}`, `GET /v2/droplets/${s.id}`, `POST /v2/volumes/${vol.id}/actions`, 'GET /v2/actions/:id', 'GET /v2/actions/:id']);
+        await p.detachVolume(vol.id, s.id, fast);
+        before = fake.calls.length;
+        await expect(p.detachVolume(vol.id, s.id, fast)).resolves.toBeUndefined();
+        expect(fake.calls.slice(before).map(asked)).toEqual([`GET /v2/volumes/${vol.id}`]);
+        const t = await p.createServer({ name: 'gpu-2', offer: 'gpu-4000adax1-20gb', region: 'tor1', mounts: [{ volume: vol.id }] });
+        expect(creates(fake).pop()?.volumes).toEqual([vol.id]);
+        expect(await p.deleteServerAndWait(t.id, fast)).toBe(true);
+        expect(await p.getVolume(vol.id)).toMatchObject({ status: 'available', serverIds: [] });
+    });
+
+    it('deleteServerAndWait: false for a droplet still there when the wait ends; one that cannot be read first is still deleted, and no volume waited for; a volume deleted meanwhile is not waited for', async () => {
+        const fake = fakeDigitalOcean();
+        let mode: 'kept' | 'unreadable' | 'volume deleted' | undefined;
+        let volumeId = '';
+        const wrapped = (async (url: string, init?: RequestInit) => {
+            const method = init?.method ?? 'GET';
+            const path = new URL(url).pathname;
+            const m = /^\/v2\/droplets\/(\d+)$/.exec(path);
+            // DigitalOcean takes the delete, and the droplet stays.
+            if (mode === 'kept' && m && method === 'DELETE') return new Response(null, { status: 204 });
+            // The droplet cannot be read while it is there.
+            if (mode === 'unreadable' && m && method === 'GET' && fake.state.droplets.has(m[1])) return json(500, { id: 'server_error', message: 'Server Error' });
+            const r = await fake.fetchImpl(url, init);
+            // Its volume, deleted (elsewhere) with it.
+            if (mode === 'volume deleted' && m && method === 'DELETE') fake.state.volumes.delete(volumeId);
+            return r;
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: wrapped, sleep: noSleep });
+        const o = { offer: 'gpu-4000adax1-20gb', region: 'tor1' };
+
+        const kept = await p.createServer({ name: 'kept', ...o });
+        mode = 'kept';
+        expect(await p.deleteServerAndWait(kept.id, { intervalMs: 0, timeoutMs: 20 })).toBe(false);
+
+        mode = 'unreadable';
+        const unreadable = await p.createServer({ name: 'unreadable', ...o });
+        const before = fake.calls.length;
+        expect(await p.deleteServerAndWait(unreadable.id, fast)).toBe(true);
+        expect(fake.calls.slice(before).filter((c) => c.path.startsWith('/v2/volumes'))).toEqual([]);
+
+        mode = undefined;
+        const vol = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 10 });
+        volumeId = vol.id;
+        const holder = await p.createServer({ name: 'holder', ...o, mounts: [{ volume: vol.id }] });
+        mode = 'volume deleted';
+        expect(await p.deleteServerAndWait(holder.id, fast)).toBe(true);
+        expect(fake.state.droplets.has(holder.id)).toBe(false);
+    });
+
+    it('a volume deleted while a gone droplet lets go of it is a NotFoundError that names it', async () => {
+        const fake = fakeDigitalOcean({ releaseReads: 1e9 });
+        let watched = '';
+        let reads = 0;
+        // Deleted (elsewhere) at the second read of the attach: while it waits for the volume to be let go of.
+        const wrapped = (async (url: string, init?: RequestInit) => {
+            if (watched && (init?.method ?? 'GET') === 'GET' && new URL(url).pathname === `/v2/volumes/${watched}` && ++reads === 2) fake.state.volumes.delete(watched);
+            return fake.fetchImpl(url, init);
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: wrapped, sleep: noSleep });
+        const vol = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 10 });
+        await p.deleteServer((await p.createServer({ name: 'gpu-1', offer: 'gpu-4000adax1-20gb', region: 'tor1', mounts: [{ volume: vol.id }] })).id);
+        const s = await p.waitUntilRunning((await p.createServer({ name: 'gpu-2', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id, fast);
+        watched = vol.id;
+        const e = await p.attachVolume(vol.id, s.id, fast).catch((x) => x);
+        expect(e).toBeInstanceOf(NotFoundError);
+        expect(e.message).toBe(`digitalocean: no volume ${vol.id}`);
+        expect(reads).toBe(2);
     });
 
     it('attached at create: the droplet reports it, it reports the droplet; deleting the droplet detaches it, and only then can it be deleted', async () => {
@@ -502,6 +776,7 @@ describe('DigitalOcean Block Storage volumes', () => {
         const generic: ICompute = p;
         await expect(generic.createServer({ ...o, mounts: [{ volume: vol, path: '/models' }] })).rejects.toThrow(NotSupportedError);
         await expect(p.createServer({ ...o, mounts: [{ volume: '00000000-0000-4000-8000-00000000beef' }] })).rejects.toThrow(NotFoundError);
+        await expect(p.createServer({ ...o, mounts: [{ volume: '00000000-0000-4000-8000-00000000beef' }] })).rejects.toThrow('digitalocean: no volume 00000000-0000-4000-8000-00000000beef');
         await expect(p.createServer({ ...o, mounts: [{ volume: far }] })).rejects.toThrow(/is in nyc1/);
         expect(creates(fake)).toEqual([]);
         await p.createServer({ ...o, mounts: [{ volume: vol }] });
@@ -563,6 +838,8 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
         await expect(p.createServer({ ...o, mounts: [{ volume: far.id }] })).rejects.toThrow(/share far is in atl1: a droplet in nyc2 cannot mount it/);
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id, path: 'data' }] })).rejects.toThrow(/mount path "data" is not absolute/);
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id }], providerOptions: { vpc_uuid: 'elsewhere' } })).rejects.toThrow(/vpc_uuid elsewhere is not a VPC of every share/);
+        await expect(p.createServer({ ...o, mounts: [{ volume: share.id }], providerOptions: { vpc_uuid: 'elsewhere' } }))
+            .rejects.toThrow(`digitalocean: vpc_uuid elsewhere is not a VPC of every share the droplet mounts (${share.raw.vpc_ids[0]})`);
         fake.state.shares.get(share.id).status = 'INACTIVE';
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id }] })).rejects.toThrow(/share models is INACTIVE: it is mounted once ACTIVE/);
         // In no VPC, which is no failure: it does not read as an error, as a share that FAILED does.
@@ -573,6 +850,7 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
         const other = await p.createVolume({ name: 'other', region: 'nyc2', sizeGb: 50, shared: true });
         fake.state.shares.get(other.id).vpc_ids = ['another-vpc'];
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id }, { volume: other.id }] })).rejects.toThrow(/have no VPC in common/);
+        await expect(p.createServer({ ...o, mounts: [{ volume: share.id }, { volume: other.id }] })).rejects.toThrow('digitalocean: the shares models, other have no VPC in common: a droplet is in one VPC');
         expect(creates(fake)).toEqual([]);
         // Hot: a share is mounted over the network, not attached.
         const s = await p.waitUntilRunning((await p.createServer(o)).id, fast);
@@ -580,6 +858,87 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
         // Nor detached: a detach that did nothing must not say it is done. A volume that is neither kind is still no error.
         await expect(p.detachVolume(share.id, s.id, fast)).rejects.toThrow(/detaching a shared volume/);
         await expect(p.detachVolume('00000000-0000-4000-8000-00000000dead', s.id, fast)).resolves.toBeUndefined();
+    });
+
+    it('a droplet that mounts two shares joins the VPC they share (the one asked for, when they share it); a refusal names the VPCs they share, or says they share none', async () => {
+        const { fake, p } = make();
+        const vpc = fake.state.vpcs.find((v) => v.region === 'nyc2')!.id;
+        const second = '00000000-0000-4000-9000-0000000000aa';
+        fake.state.vpcs.push({ id: second, name: 'second-nyc2', region: 'nyc2', default: false });
+        const models = await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 50, shared: true, providerOptions: { vpc_ids: [vpc, second] } });
+        const data = await p.createVolume({ name: 'data', region: 'nyc2', sizeGb: 50, shared: true, providerOptions: { vpc_ids: [vpc, second] } });
+        const o = { offer: 'gpu-6000adax1-48gb', region: 'nyc2', mounts: [{ volume: models.id }, { volume: data.id }] };
+        await p.createServer({ ...o, name: 'x' });
+        await p.createServer({ ...o, name: 'y', providerOptions: { vpc_uuid: second } });
+        expect(creates(fake).map((c) => c.vpc_uuid)).toEqual([vpc, second]);
+        await expect(p.createServer({ ...o, name: 'z', providerOptions: { vpc_uuid: 'elsewhere' } }))
+            .rejects.toThrow(`digitalocean: vpc_uuid elsewhere is not a VPC of every share the droplet mounts (${vpc}, ${second})`);
+        fake.state.shares.get(data.id).vpc_ids = ['another-vpc'];
+        await expect(p.createServer({ ...o, name: 'z', providerOptions: { vpc_uuid: vpc } }))
+            .rejects.toThrow(`digitalocean: vpc_uuid ${vpc} is not a VPC of every share the droplet mounts (they share none)`);
+        await expect(p.createServer({ ...o, name: 'z' })).rejects.toThrow('digitalocean: the shares models, data have no VPC in common: a droplet is in one VPC');
+        expect(creates(fake)).toHaveLength(2);
+    });
+
+    it('a share DigitalOcean still lists as DELETED is gone: not listed, not found', async () => {
+        const { fake, p } = make();
+        const [a, b] = [await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 50, shared: true }), await p.createVolume({ name: 'data', region: 'nyc2', sizeGb: 50, shared: true })];
+        fake.state.shares.get(a.id).status = 'DELETED';
+        expect((await p.listVolumes()).map((v) => v.id)).toEqual([b.id]);
+        fake.state.shares.get(b.id).status = 'DELETED';
+        expect(await p.getVolume(b.id)).toBeNull();
+    });
+
+    it('a share of the most DigitalOcean makes, 32768 GB, is made', async () => {
+        const { p } = make();
+        await expect(p.createVolume({ name: 'huge', region: 'nyc2', sizeGb: 32768, shared: true })).resolves.toMatchObject({ sizeGb: 32768, status: 'available' });
+    });
+
+    it('a share that fails, or disappears, while it is made is an error that says so, and nothing is left', async () => {
+        const fake = fakeDigitalOcean();
+        let fate: 'FAILED' | 'gone' = 'FAILED';
+        const wrapped = (async (url: string, init?: RequestInit) => {
+            const r = await fake.fetchImpl(url, init);
+            if (init?.method === 'POST' && new URL(url).pathname === '/v2/nfs' && r.status === 201) {
+                const { share } = await r.clone().json() as { share: { id: string } };
+                if (fate === 'gone') fake.state.shares.delete(share.id);
+                else fake.state.shares.get(share.id).status = 'FAILED';
+            }
+            return r;
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: wrapped, sleep: noSleep });
+        const failed = await p.createVolume({ name: 'broken', region: 'nyc2', sizeGb: 50, shared: true, ...fast }).catch((x) => x);
+        expect(failed).toBeInstanceOf(ProviderError);
+        expect(failed.message).toBe('digitalocean: share broken is FAILED, not ACTIVE');
+        expect(fake.state.shares.size).toBe(0);
+        fate = 'gone';
+        const gone = await p.createVolume({ name: 'vanished', region: 'nyc2', sizeGb: 50, shared: true, ...fast }).catch((x) => x);
+        expect(gone).toBeInstanceOf(NotFoundError);
+        expect(gone.message).toBe('digitalocean: share vanished disappeared while it was made');
+        expect(fake.state.shares.size).toBe(0);
+    });
+
+    it('waits 10 min by default for a share to be made, reading every 5 s; one that is not made by then is deleted', async () => {
+        const { fake, p, slept } = clocked({ shareReads: 1e9 });
+        const e = await p.createVolume({ name: 'slow', region: 'nyc2', sizeGb: 50, shared: true }).catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e).toMatchObject({ code: 'timeout', message: 'digitalocean: timed out after 600 s waiting for share slow: CREATING' });
+        expect(slept).toEqual(Array(120).fill(5000));
+        expect(fake.state.shares.size).toBe(0);
+    });
+
+    it('waits 5 min by default for a share to go, reading every 3 s, then is a timeout that says what it saw', async () => {
+        let ignored = false;
+        // DigitalOcean takes the delete, and the share stays.
+        const { p, slept } = clocked({}, (f) => (async (url: string, init?: RequestInit) =>
+            (ignored && init?.method === 'DELETE' && new URL(url).pathname.startsWith('/v2/nfs/') ? new Response(null, { status: 204 }) : f(url, init))) as typeof fetch);
+        const share = await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 50, shared: true });
+        ignored = true;
+        slept.length = 0;
+        const e = await p.deleteVolume(share.id).catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e).toMatchObject({ code: 'timeout', message: 'digitalocean: timed out after 300 s waiting for delete of share models: ACTIVE' });
+        expect(slept).toEqual(Array(100).fill(3000));
     });
 
     it('a size out of bounds, or a region with no default VPC, is refused before anything is made; one that fails to become ACTIVE is deleted, and its failure thrown', async () => {
