@@ -84,6 +84,16 @@ export class TransportError extends Error {
 }
 
 /**
+ * An error's message as another error of the same provider quotes it: without
+ * that provider's own `<provider>: ` in front, which the quoting error says
+ * once already. Any other error's message is quoted as it is.
+ */
+export function quotedMessage(e: unknown, provider: string): string {
+    const message = e instanceof Error ? e.message : String(e);
+    return message.startsWith(`${provider}: `) ? message.slice(provider.length + 2) : message;
+}
+
+/**
  * A failure safe to try again as it is: a read or idempotent request that got
  * no answer or a temporary error, or a rate limit (refused before anything was
  * done). Never a create that may have done its work.

@@ -1,9 +1,16 @@
 // What asap-vps throws: each error named for its class, so a caller (or a log)
 // can tell them apart, and which of them are worth trying again.
 
-import { AuthError, CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError, QuotaError, TransportError } from './errors';
+import { AuthError, CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError, QuotaError, quotedMessage, TransportError } from './errors';
 
 describe('errors', () => {
+    it('quotedMessage quotes an error of the same provider without its prefix, which the quoting error says once already; any other as it is', () => {
+        expect(quotedMessage(new ProviderError('scaleway', 'DELETE /x -> 403 denied'), 'scaleway')).toBe('DELETE /x -> 403 denied');
+        expect(quotedMessage(new ProviderError('runpod', 'gone'), 'scaleway')).toBe('runpod: gone');
+        expect(quotedMessage(new TypeError('fetch failed'), 'scaleway')).toBe('fetch failed');
+        expect(quotedMessage('scaleway: said as a string', 'scaleway')).toBe('said as a string');
+    });
+
     it('each is named for its class and is a ProviderError whose message begins with the provider', () => {
         const errors = [
             new ProviderError('acme', 'boom'), new CapacityError('acme', 'no L4 left'), new QuotaError('acme', 'GPU quota is 0'),

@@ -24,7 +24,7 @@ import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilit
 import { ComputeProvider, ResolvedMount } from '../../Core/ComputeProvider';
 import { randomBytes } from 'crypto';
 import { filterOffers, findSSHKey, isKind, pickSSHKeys, S3Client, stageDownload, urlSource } from '../../Core/utils';
-import { CapacityError, NotFoundError, NotSupportedError, ProviderError } from '../../errors';
+import { CapacityError, NotFoundError, NotSupportedError, ProviderError, quotedMessage } from '../../errors';
 import type {
     CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, Server,
     ServerImage, ServerListOptions, Volume, WaitOptions,
@@ -149,7 +149,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const { blocks: mounts, files } = await this.splitMounts(this.mountsOf(o.mounts));
         const zone = this.zoneFor(o, resolved.region, imageRef?.zone, mounts);
         const type = await this.typeOf(zone, resolved.id, resolved.offer);
-        this.checkFileSystems(zone, type, files.map((x) => x.fs));
+        this.checkFileSystems(zone, type, resolved.id, files.map((x) => x.fs));
         this.checkFixedGpuCount(o, gpuOf(type)?.count ?? 0);
         if (o.diskGb !== undefined && !(o.diskGb > 0)) throw new ProviderError(this.id, 'diskGb must be a size in GB above 0');
         if (o.sshKeyIds?.length) pickSSHKeys(await this.api.listSSHKeys(), o.sshKeyIds, this.id);
@@ -514,7 +514,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
             // A filesystem: attached (the Instance mounts it with virtiofs: `mount -t virtiofs <id> <path>`), and tagged at its mountPath.
             // One the server holds already is no further one: it is not counted against what its type takes.
             if (!s.filesystems?.some((x) => x.filesystem_id === f.id)) {
-                this.checkFileSystems(s.zone, await this.typeOf(s.zone, s.commercial_type), [f], s.filesystems?.length ?? 0);
+                this.checkFileSystems(s.zone, await this.typeOf(s.zone, s.commercial_type), s.commercial_type, [f], s.filesystems?.length ?? 0);
                 await this.api.attachServerFileSystem(s.zone, s.id, f.id);
             }
             await this.api.fileSystemState(s.zone, s.id, f.id, 'available', o);
@@ -702,14 +702,14 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         return { blocks, files };
     }
 
-    /** Refuses filesystems a server in `zone` of `type` cannot attach: of another region, or more than its type takes (`has` it holds already). */
-    private checkFileSystems(zone: ScalewayZone, type: ScalewayServerType, files: ScalewayFileSystem[], has = 0): void {
+    /** Refuses filesystems a server in `zone` of `type` (named `name`) cannot attach: of another region, or more than its type takes (`has` it holds already). */
+    private checkFileSystems(zone: ScalewayZone, type: ScalewayServerType, name: string, files: ScalewayFileSystem[], has = 0): void {
         if (!files.length) return;
         const away = files.find((f) => f.region !== regionOfZone(zone));
         if (away) throw new ProviderError(this.id, `filesystem ${away.name} is in ${away.region}: an Instance in ${zone} cannot attach it`);
         const most = type.capabilities?.max_file_systems ?? 0;
         if (files.length + has > most) {
-            throw new NotSupportedError(this.id, `${files.length + has} filesystems on ${type.alt_names?.[0] ?? 'this type'} (it attaches ${most}: types with max_file_systems, e.g. POP2, L4, L40S, H100)`);
+            throw new NotSupportedError(this.id, `${files.length + has} filesystems on ${name} (it attaches ${most}: types with max_file_systems, e.g. POP2, L4, L40S, H100)`);
         }
     }
 
@@ -796,7 +796,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         try {
             await cleanup();
         } catch (failed) {
-            throw new ProviderError(this.id, `${(e as Error).message}; and ${what}, made for it, is not deleted (${(failed as Error).message}): it stays, and bills, until deleted`,
+            throw new ProviderError(this.id, `${quotedMessage(e, this.id)}; and ${what}, made for it, is not deleted (${quotedMessage(failed, this.id)}): it stays, and bills, until deleted`,
                 { code: 'left_behind', cause: e });
         }
         throw e;

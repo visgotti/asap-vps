@@ -19,7 +19,7 @@
 //     Project at boot to every server created in it.
 
 import { ApiClient, HttpResult, pollUntil, RequestInfo, S3Client } from '../../Core/utils';
-import { AuthError, CapacityError, falseIfNotFound, isRetriable, NotFoundError, nullIfNotFound, ProviderError, QuotaError } from '../../errors';
+import { AuthError, CapacityError, falseIfNotFound, isRetriable, NotFoundError, nullIfNotFound, ProviderError, QuotaError, quotedMessage } from '../../errors';
 import type { InitializedSSHKeyData, WaitOptions } from '../../types';
 import { fillPath, queryString, SCALEWAY_ENDPOINTS, ScalewayEndpoint } from './endpoints';
 import { imageVolumes, isUuid, mountedVolumeIds, parseZonedId, parseZones, SCALEWAY_ID, scalewayErrorText, toSSHKey, zonedId } from './mappers';
@@ -277,7 +277,7 @@ export class ScalewayApi extends ApiClient {
             try {
                 await this.deleteServer(zone, created.id);
             } catch (cleanup) {
-                throw new ProviderError(this.id, `${(e as Error).message}; and server ${zonedId(zone, created.id)}, made but not started, is not deleted (${(cleanup as Error).message}): it bills until deleted`,
+                throw new ProviderError(this.id, `${quotedMessage(e, this.id)}; and server ${zonedId(zone, created.id)}, made but not started, is not deleted (${quotedMessage(cleanup, this.id)}): it bills until deleted`,
                     { code: 'left_behind', cause: e });
             }
             throw e;
@@ -352,7 +352,7 @@ export class ScalewayApi extends ApiClient {
             // A failure that lasts (no rights for Block Storage: an AuthError) goes as it is; one that may look
             // transient is not, as the server it belonged to is gone: nothing retries it.
             if (!isRetriable(cause)) throw cause;
-            throw new ProviderError(this.id, `server ${zonedId(zone, id)} is deleted, but its ${left.join(', ')} ${left.length > 1 ? 'are' : 'is'} not: it bills until deleted (${(cause as Error).message})`,
+            throw new ProviderError(this.id, `server ${zonedId(zone, id)} is deleted, but its ${left.join(', ')} ${left.length > 1 ? 'are' : 'is'} not: it bills until deleted (${quotedMessage(cause, this.id)})`,
                 { code: 'left_behind', cause });
         }
         let state = 'unread';
@@ -605,7 +605,7 @@ export class ScalewayApi extends ApiClient {
             }
         }
         if (left.length) {
-            throw new ProviderError(this.id, `image ${zonedId(zone, id)} is deleted, but its snapshot(s) ${left.join(', ')} are not: they bill until deleted (${(cause as Error).message})`, { code: 'snapshot_left', cause });
+            throw new ProviderError(this.id, `image ${zonedId(zone, id)} is deleted, but its snapshot(s) ${left.join(', ')} are not: they bill until deleted (${quotedMessage(cause, this.id)})`, { code: 'snapshot_left', cause });
         }
         return true;
     }

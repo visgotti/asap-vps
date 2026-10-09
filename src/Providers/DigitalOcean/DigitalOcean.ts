@@ -15,7 +15,7 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider } from '../../Core/ComputeProvider';
 import { filterOffers, findSSHKey, pickSSHKeys, pollUntil, sshKeyFingerprint, timeLeft } from '../../Core/utils';
-import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, QuotaError } from '../../errors';
+import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, QuotaError, quotedMessage } from '../../errors';
 import type {
     CreateServerOptions, CreateVolumeOptions, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerImage, ServerListOptions, Volume,
     WaitOptions,
@@ -281,7 +281,7 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         } catch (e) {
             // Still importing when the wait ran out: deleted, so it is not left to bill.
             await this.deleteImage(String(image.id)).catch(() => undefined);
-            throw new ProviderError(this.id, `import of ${o.name} from ${o.url}: ${(e as Error).message} (the import was deleted)`, { cause: e });
+            throw new ProviderError(this.id, `import of ${o.name} from ${o.url}: ${quotedMessage(e, this.id)} (the import was deleted)`, { cause: e });
         }
         if (done.status !== 'available') throw new ProviderError(this.id, `import of ${o.name} from ${o.url} failed: ${done.error_message || done.status}`);
         return toImage(done);

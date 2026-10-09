@@ -1418,6 +1418,8 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         const kept = p2.createEndpoint({ name: 'kept', container: WHOAMI, intervalMs: 0, timeoutMs: 20 });
         await expect(kept).rejects.toThrow(/waiting for endpoint kept: creating; and namespace kept \(fr-par\/[0-9a-f-]{36}, with its container\), made for it, is not deleted \(.*insufficient permissions.*\)/);
         await expect(kept).rejects.toMatchObject({ code: 'left_behind' });
+        // It names its provider once, though it quotes two of that provider's errors.
+        expect(((await kept.catch((x) => x)) as Error).message.match(/scaleway: /g)).toEqual(['scaleway: ']);
     });
 
     it('a container that is never gone, or a namespace that is never gone, is a timeout that says so', async () => {
@@ -1542,7 +1544,7 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
         const share = await shareOf(p);
         const o = { name: 'x', offer: GPU_FS, region: 'fr-par-2' };
         await expect(p.createServer({ ...o, offer: 'DEV1-S', mounts: [{ volume: share }] }))
-            .rejects.toThrow(/^scaleway: 1 filesystems on this type \(it attaches 0: types with max_file_systems, e\.g\. POP2, L4, L40S, H100\) is not supported$/);
+            .rejects.toThrow(/^scaleway: 1 filesystems on DEV1-S \(it attaches 0: types with max_file_systems, e\.g\. POP2, L4, L40S, H100\) is not supported$/);
         await expect(p.createServer({ ...o, region: 'pl-waw-2', mounts: [{ volume: share }] })).rejects.toThrow(/filesystem models is in fr-par: an Instance in pl-waw-2 cannot attach it/);
         await expect(p.createServer({ ...o, mounts: [{ volume: 'fr-par/00000000-0000-4000-8000-0000000000aa' }] })).rejects.toThrow(/no filesystem/);
         await expect(p.createServer({ ...o, mounts: [{ volume: share, path: 'models' }] })).rejects.toThrow(/mount path "models" is not absolute/);
@@ -1571,7 +1573,7 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
         const [b, c] = [await shareOf(p, 'b'), await shareOf(p, 'c')];
         await p.attachVolume(share.id, s.id, fast);
         await p.attachVolume(b.id, s.id, fast);
-        await expect(p.attachVolume(c.id, s.id, fast)).rejects.toThrow(/3 filesystems on .*it attaches 2/);
+        await expect(p.attachVolume(c.id, s.id, fast)).rejects.toThrow(/^scaleway: 3 filesystems on L40S-1-48G \(it attaches 2: /);
         // One of the two it holds, asked for again: no third, and nothing to send.
         await expect(p.attachVolume(b.id, s.id, fast)).resolves.toBeUndefined();
         expect(fake.calls.filter((c) => c.path.endsWith('/attach-filesystem'))).toHaveLength(3);
@@ -1858,7 +1860,7 @@ describe('Scaleway waits given no wait options: each its own default', () => {
             });
             const e = await p.createVolume({ name: 'slow', region: 'pl-waw-2', sizeGb: 20 }).catch((x) => x);
             expect(e).toMatchObject({ code: 'left_behind' });
-            expect(e.message).toMatch(/timed out after 300 s waiting for volume pl-waw-2\/([0-9a-f-]{36}): creating; and volume pl-waw-2\/\1, made for it, is not deleted \(scaleway: block volume pl-waw-2\/\1 is still creating: it cannot be deleted yet\): it stays, and bills, until deleted$/);
+            expect(e.message).toMatch(/timed out after 300 s waiting for volume pl-waw-2\/([0-9a-f-]{36}): creating; and volume pl-waw-2\/\1, made for it, is not deleted \(block volume pl-waw-2\/\1 is still creating: it cannot be deleted yet\): it stays, and bills, until deleted$/);
             expect(slept).toEqual(waits(300, 2000));
         });
     });

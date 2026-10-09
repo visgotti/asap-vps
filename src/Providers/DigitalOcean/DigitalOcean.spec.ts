@@ -488,7 +488,7 @@ describe('DigitalOcean image import (a custom image from a URL)', () => {
         const { p, slept } = clocked({ importReads: 1e9 });
         const e = await p.importImage({ name: 'slow', url: URL_OK, region: 'tor1' }).catch((x) => x);
         expect(e).toBeInstanceOf(ProviderError);
-        expect(e.message).toBe(`digitalocean: import of slow from ${URL_OK}: digitalocean: timed out after 3600 s waiting for import of slow: NEW (the import was deleted)`);
+        expect(e.message).toBe(`digitalocean: import of slow from ${URL_OK}: timed out after 3600 s waiting for import of slow: NEW (the import was deleted)`);
         expect(e.cause).toBeInstanceOf(ProviderError);
         expect(e.cause).toMatchObject({ code: 'timeout', message: 'digitalocean: timed out after 3600 s waiting for import of slow: NEW' });
         expect(slept).toEqual(Array(240).fill(15_000));

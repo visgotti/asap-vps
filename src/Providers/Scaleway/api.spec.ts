@@ -402,6 +402,8 @@ describe('servers', () => {
         expect(fake.liveServers()).toBe(before.servers + 1);
         const left = [...fake.state.servers.values()].find((s) => s.name === 'stuck');
         expect(e.message).toMatch(new RegExp(`no power.*server pl-waw-2/${left.id}, made but not started, is not deleted \\(.*no delete\\)`));
+        // It names its provider once, though it quotes two of that provider's errors.
+        expect(e.message.match(/scaleway: /g)).toEqual(['scaleway: ']);
     });
 
     it('a server that is started but cannot be read is reported as starting', async () => {
@@ -456,7 +458,7 @@ describe('servers', () => {
         fake.intercept((r) => r.method === 'DELETE' && r.path === `/instance/v1/zones/nl-ams-1/volumes/${local}`, { answer: () => json(500, { message: 'internal error' }) });
         await expect(api.deleteServer('nl-ams-1', s.id)).rejects.toMatchObject({
             name: 'ProviderError', code: 'left_behind',
-            message: `scaleway: server nl-ams-1/${s.id} is deleted, but its local volume ${local} is not: it bills until deleted (scaleway: DELETE /instance/v1/zones/nl-ams-1/volumes/${local} -> 500 internal error)`,
+            message: `scaleway: server nl-ams-1/${s.id} is deleted, but its local volume ${local} is not: it bills until deleted (DELETE /instance/v1/zones/nl-ams-1/volumes/${local} -> 500 internal error)`,
         });
     });
 
