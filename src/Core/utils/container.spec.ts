@@ -301,4 +301,32 @@ describe('cloudInitParts: several parts, run by cloud-init in order', () => {
         expect([...doc.matchAll(/Content-Type: (text\/[a-z-]+);/g)].map((m) => m[1])).toEqual(['text/cloud-config', 'text/x-shellscript', 'text/x-shellscript']);
         expect(doc.indexOf('echo two')).toBeLessThan(doc.indexOf('echo three'));
     });
+
+    it('a part is a MIME document only when it begins with its headers: a script that prints one is a script', () => {
+        const script = '#!/bin/sh\necho "Content-Type: text/plain"\n';
+        expect(cloudInitParts([script, '#!/bin/sh\necho b'])).toBe([
+            'Content-Type: multipart/mixed; boundary="==asap-vps-container=="', 'MIME-Version: 1.0', '',
+            '--==asap-vps-container==', 'Content-Type: text/x-shellscript; charset="utf-8"', 'MIME-Version: 1.0', '', script,
+            '--==asap-vps-container==', 'Content-Type: text/x-shellscript; charset="utf-8"', 'MIME-Version: 1.0', '', '#!/bin/sh\necho b',
+            '--==asap-vps-container==--', '',
+        ].join('\n'));
+    });
+
+    it('a MIME document goes in without the "From " line a mailbox puts first: its headers begin the part', () => {
+        const theirs = 'Content-Type: multipart/mixed; boundary="b1"\nMIME-Version: 1.0\n\n--b1\nContent-Type: text/cloud-config\n\n#cloud-config\nruncmd: []\n--b1--\n';
+        expect(cloudInitParts([`From nobody Wed Oct  7 2026\n${theirs}`, '#!/bin/sh\necho b'])).toBe([
+            'Content-Type: multipart/mixed; boundary="==asap-vps-container=="', 'MIME-Version: 1.0', '',
+            '--==asap-vps-container==', theirs.replace(/\n+$/, ''),
+            '--==asap-vps-container==', 'Content-Type: text/x-shellscript; charset="utf-8"', 'MIME-Version: 1.0', '', '#!/bin/sh\necho b',
+            '--==asap-vps-container==--', '',
+        ].join('\n'));
+    });
+
+    it('its boundary is the first of ==asap-vps-container==, then -2, -3, ... that no part contains', () => {
+        const boundary = (doc: string) => /boundary="([^"]+)"/.exec(doc)![1];
+        const one = cloudInitParts(['#!/bin/sh\necho a', '#!/bin/sh\necho b'])!;
+        const two = cloudInitParts([one, '#!/bin/sh\necho c'])!;
+        const three = cloudInitParts([two, '#!/bin/sh\necho d'])!;
+        expect([boundary(one), boundary(two), boundary(three)]).toEqual(['==asap-vps-container==', '==asap-vps-container-2==', '==asap-vps-container-3==']);
+    });
 });

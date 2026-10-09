@@ -1,4 +1,4 @@
-import { canonicalGpu } from './gpus';
+import { canonicalGpu, gpuName, gpuVendor } from './gpus';
 
 describe('gpus', () => {
     it('one name per model whatever the provider calls it', () => {
@@ -16,5 +16,14 @@ describe('gpus', () => {
         expect(canonicalGpu('something new')).toBeNull();
         // Look-alikes stay apart: an Ampere A2000 is not an RTX 2000 Ada, and Lambda's Turing RTX 6000 (24 GB) is neither Ada nor A6000.
         expect([canonicalGpu('NVIDIA RTX A2000')?.name, canonicalGpu('RTX 6000 (24 GB)')]).toEqual([undefined, null]);
+    });
+
+    it('gpuName: the canonical name, else the provider\'s own, trimmed; nothing is an empty name', () => {
+        expect([gpuName('NVIDIA L40S'), gpuName('  Some New GPU '), gpuName(null), gpuName(undefined)]).toEqual(['L40S', 'Some New GPU', '', '']);
+    });
+
+    it('gpuVendor: the model\'s vendor, else AMD by its marks, else NVIDIA', () => {
+        expect([gpuVendor('mi300x'), gpuVendor('NVIDIA H100 80GB HBM3'), gpuVendor('Radeon Pro W7900'), gpuVendor('AMD Instinct MI210'), gpuVendor('Quadro P4000'), gpuVendor(null)])
+            .toEqual(['amd', 'nvidia', 'amd', 'amd', 'nvidia', 'nvidia']);
     });
 });

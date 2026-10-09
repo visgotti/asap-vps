@@ -1,4 +1,47 @@
-import { pollUntil, timeLeft } from './async';
+import { asyncTimeout, pollUntil, retryInvoke, timeLeft } from './async';
+
+describe('asyncTimeout and retryInvoke: real waits, on a fake clock', () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it('asyncTimeout resolves true once its time has passed, and not before', async () => {
+        let resolved: unknown = 'pending';
+        void asyncTimeout(1000).then((v) => { resolved = v; });
+        await jest.advanceTimersByTimeAsync(999);
+        expect(resolved).toBe('pending');
+        await jest.advanceTimersByTimeAsync(1);
+        expect(resolved).toBe(true);
+    });
+
+    it('retryInvoke tries again timeBetween apart, and fails at once after its last try, with that try\'s error', async () => {
+        const start = Date.now();
+        const tries: number[] = [];
+        let outcome: unknown = 'pending';
+        void retryInvoke(async () => {
+            tries.push(Date.now() - start);
+            throw new Error(`refused ${tries.length}`);
+        }, 1000, 3).then((v) => { outcome = v; }, (e: Error) => { outcome = e.message; });
+        await jest.advanceTimersByTimeAsync(2000);
+        // No wait after the last try: it has failed by the time the third try is made.
+        expect([tries, outcome]).toEqual([[0, 1000, 2000], 'refused 3']);
+    });
+
+    it('retryInvoke answers with the first try that succeeds', async () => {
+        let n = 0;
+        const answer = retryInvoke(async () => {
+            if (++n < 2) throw new Error('not yet');
+            return 'connected';
+        }, 500, 3);
+        await jest.advanceTimersByTimeAsync(500);
+        await expect(answer).resolves.toBe('connected');
+        expect(n).toBe(2);
+    });
+
+    it('retryInvoke with no tries, or tries whose failures say nothing, says it could not invoke', async () => {
+        await expect(retryInvoke(async () => 'never called', 1000, 0)).rejects.toThrow(new Error('Can not invoke without failing.'));
+        await expect(retryInvoke(async () => { throw new Error(''); }, 0, 1)).rejects.toThrow(new Error('Can not invoke without failing.'));
+    });
+});
 
 describe('pollUntil', () => {
     const noSleep = async () => {};

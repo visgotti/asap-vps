@@ -66,6 +66,28 @@ describe('http', () => {
         expect(e).toMatchObject({ retriable: false, message: expect.stringMatching(/POST https:\/\/x\/a: the answer \(200\) was cut off: terminated/) });
     });
 
+    it('waits as long as a refusal\'s Retry-After says, in seconds or as a date, never past a minute; else 1 s, then 2, then 4', async () => {
+        /** What http slept before its next try, the first answer a 429 (or a read\'s 503) with this Retry-After. */
+        const waited = async (retryAfter?: string, status = 429) => {
+            const slept: number[] = [];
+            let n = 0;
+            const fetchImpl = (async () => (n++ === 0
+                ? new Response(null, { status, headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter } })
+                : new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }))) as unknown as typeof fetch;
+            await http('https://x/a', { fetchImpl, sleep: async (ms) => { slept.push(ms); } });
+            return slept;
+        };
+        expect([await waited('3'), await waited('0.5', 503), await waited('600'), await waited(), await waited('soon')]).toEqual([[3000], [500], [60_000], [1000], [1000]]);
+        // An HTTP date: the time from now until then.
+        jest.spyOn(Date, 'now').mockReturnValue(Date.parse('Fri, 09 Oct 2026 12:00:00 GMT'));
+        try {
+            expect([await waited('Fri, 09 Oct 2026 12:00:10 GMT'), await waited('Fri, 09 Oct 2026 11:59:00 GMT'), await waited('Fri, 09 Oct 2026 13:00:00 GMT')])
+                .toEqual([[10_000], [0], [60_000]]);
+        } finally {
+            jest.restoreAllMocks();
+        }
+    });
+
     it('a failed request names no credential', async () => {
         const s = scripted(['net']);
         const e = await http('https://x/a?api_key=SECRET', { method: 'POST', fetchImpl: s.fetchImpl, sleep }).catch((x) => x);
@@ -79,6 +101,7 @@ describe('http', () => {
         expect(errorText({ id: 'unprocessable_entity', message: 'Size is not available in this region.' })).toBe('Size is not available in this region.');
         expect(errorText({ error: { code: 'global/quota-exceeded', message: 'Quota exceeded.' } })).toBe('Quota exceeded.');
         expect(errorText({ success: false, error: 'no_such_ask', msg: 'error 410/3907' })).toBe('error 410/3907');
+        expect([errorText(null), errorText(undefined), errorText('')]).toEqual(['', '', '']);
     });
 });
 

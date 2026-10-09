@@ -6,7 +6,7 @@
 import { CapabilityDescriptor, requireCapability, supports } from '../capabilities';
 import { MACHINE_TYPES, REGION_TYPES } from '../constants';
 import { NotSupportedError, ProviderError, TransportError } from '../errors';
-import type { CreateServerOptions, Offer, Server, WaitOptions } from '../types';
+import type { CreateServerOptions, Offer, Server, Volume, VolumeMount, WaitOptions } from '../types';
 import { ComputeProvider, EnumTranslations } from './ComputeProvider';
 import { ApiClient } from './utils';
 
@@ -24,8 +24,8 @@ class ScriptedProvider extends ComputeProvider {
     /** What the last create named, in the platform's names. */
     created?: { region?: string, image?: string };
 
-    constructor(private readonly script: Array<Partial<Server> | null | Error>) {
-        super(new ApiClient({ apiKey: 'k', sleep: async () => {} }, 'https://api.example.com', 'scripted'));
+    constructor(private readonly script: Array<Partial<Server> | null | Error>, sleep: (ms: number) => Promise<unknown> = async () => {}) {
+        super(new ApiClient({ apiKey: 'k', sleep }, 'https://api.example.com', 'scripted'));
     }
 
     async listOffers(): Promise<Offer[]> {
@@ -60,6 +60,14 @@ class ScriptedProvider extends ComputeProvider {
         return this.api.request('GET', path);
     }
 
+    fixedGpus(o: CreateServerOptions, known: number | undefined) {
+        this.checkFixedGpuCount(o, known);
+    }
+
+    mounts(m: VolumeMount[]) {
+        return this.mountsOf(m);
+    }
+
     private server(o: Partial<Server>): Server {
         return { provider: this.id, id: 's1', name: 'n', status: 'pending', providerStatus: 'x', raw: {}, ...o };
     }
@@ -85,6 +93,14 @@ describe('ComputeProvider', () => {
     it('times out with the last state it saw', async () => {
         await expect(new ScriptedProvider([{ status: 'pending', providerStatus: 'booting' }]).waitForServer('s1', () => false, { intervalMs: 0, timeoutMs: 20 }))
             .rejects.toThrow(/timed out .* pending \(booting\)/);
+    });
+
+    it('times out saying the server was gone at the last read, or that no read got an answer', async () => {
+        const now = { intervalMs: 0, timeoutMs: 0 };
+        await expect(new ScriptedProvider([null]).waitForServer('s1', () => false, now))
+            .rejects.toMatchObject({ code: 'timeout', message: 'scripted: timed out after 0 s waiting for server s1: gone' });
+        await expect(new ScriptedProvider([new TransportError('reset')]).waitForServer('s1', () => true, now))
+            .rejects.toMatchObject({ code: 'timeout', message: 'scripted: timed out after 0 s waiting for server s1: never read' });
     });
 
     it('deletes again until the server is verified gone, and says so when it never is', async () => {
@@ -124,6 +140,36 @@ describe('ComputeProvider', () => {
             throw new ProviderError('scripted', '502', { retriable: true });
         };
         await expect(q.deleteServerAndWait('s1', fast)).resolves.toBe(true);
+    });
+
+    it('a read that fails while it deletes is read again when it may be transient; any other failure is thrown', async () => {
+        const blip = new ScriptedProvider([new TransportError('reset'), null]);
+        await expect(blip.deleteServerAndWait('s1', fast)).resolves.toBe(true);
+        expect([blip.deletes, blip.reads]).toEqual([2, 2]);
+        const badKey = new ProviderError('scripted', 'bad key', { status: 401 });
+        const denied = new ScriptedProvider([badKey, null]);
+        await expect(denied.deleteServerAndWait('s1', fast)).rejects.toBe(badKey);
+        expect([denied.deletes, denied.reads]).toEqual([1, 1]);
+    });
+
+    it('without a timeout of its own, deletes for five minutes, 5 s apart, each delete given the time left; the timeout says how long it tried', async () => {
+        // A clock that moves only when the provider sleeps.
+        let now = Date.parse('2026-10-09T12:00:00Z');
+        jest.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+            const refusal = new ProviderError('scripted', 'locked', { status: 409 });
+            const p = new ScriptedProvider([{ status: 'running' }], async (ms) => { now += ms; });
+            p.deleteServer = async (_id, o = {}) => {
+                p.deleteOptions.push(o);
+                throw refusal;
+            };
+            await expect(p.deleteServerAndWait('s1')).rejects.toMatchObject({
+                code: 'timeout', cause: refusal, message: 'scripted: server s1 is not deleted after 300 s: the delete kept failing (scripted: locked)',
+            });
+            expect(p.deleteOptions).toEqual(Array.from({ length: 61 }, (_, i) => ({ timeoutMs: 300_000 - i * 5000 })));
+        } finally {
+            jest.restoreAllMocks();
+        }
     });
 
     it('gives each delete the time left, so a provider whose delete waits waits no longer than the caller allows', async () => {
@@ -168,6 +214,48 @@ describe('ComputeProvider', () => {
         await p.createServer({ name: 'n', offer });
         expect(p.created?.region).toBe(REGION_TYPES.NYC);
         await expect(p.createServer({ name: 'n', offer: { ...offer, provider: 'other' } })).rejects.toThrow(/is other's, not scripted's/);
+    });
+
+    it('a create needs an offer; one with stock nowhere is no capacity, unless a region is asked for', async () => {
+        const p = new ScriptedProvider([]);
+        const offer: Offer = { provider: 'scripted', id: 'o', gpu: 'L4', vendor: 'nvidia', gpuCount: 1, vramGb: 24, pricePerHour: 1, regions: [], raw: {} };
+        const none = 'scripted: createServer needs an offer (an offer from listOffers, or its id)';
+        for (const missing of ['', undefined, { ...offer, id: '' }]) {
+            await expect(p.createServer({ name: 'n', offer: missing as CreateServerOptions['offer'] })).rejects.toMatchObject({ name: 'ProviderError', message: none });
+        }
+        await expect(p.createServer({ name: 'n', offer })).rejects.toMatchObject({
+            name: 'CapacityError', message: 'scripted: offer o has no stock anywhere right now: pick an offer with regions, or ask for a region',
+        });
+        await p.createServer({ name: 'n', offer, region: 'par-2' });
+        expect(p.created).toEqual({ region: 'par-2', image: undefined });
+    });
+
+    it('a provider with no names for the library\'s enums refuses every member of them', async () => {
+        class Unmapped extends ScriptedProvider {
+            protected readonly enums: EnumTranslations = {};
+        }
+        const p = new Unmapped([]);
+        await expect(p.createServer({ name: 'n', offer: 'o', image: MACHINE_TYPES.UBUNTU_24 }))
+            .rejects.toMatchObject({ name: 'NotSupportedError', message: `scripted: image "${MACHINE_TYPES.UBUNTU_24}" (MACHINE_TYPES has no scripted image by that name) is not supported` });
+        await expect(p.createServer({ name: 'n', offer: 'o', region: REGION_TYPES.PARIS }))
+            .rejects.toMatchObject({ name: 'NotSupportedError', message: `scripted: region "${REGION_TYPES.PARIS}" (REGION_TYPES has no scripted region by that name) is not supported` });
+    });
+
+    it('a GPU count may be given only as the offer\'s own: an offer id whose count is unknown, or another count, is refused', () => {
+        const p = new ScriptedProvider([]);
+        expect(() => p.fixedGpus({ name: 'n', offer: 'o', gpuCount: 2 }, undefined))
+            .toThrow(new NotSupportedError('scripted', 'createServer option "gpuCount" with an offer id (pass the offer itself, whose GPU count is fixed)'));
+        expect(() => p.fixedGpus({ name: 'n', offer: 'o', gpuCount: 2 }, 1))
+            .toThrow(new NotSupportedError('scripted', 'createServer option "gpuCount" 2: this offer has 1 GPU(s); pick an offer with 2'));
+        expect(() => p.fixedGpus({ name: 'n', offer: 'o', gpuCount: 2 }, 2)).not.toThrow();
+        expect(() => p.fixedGpus({ name: 'n', offer: 'o' }, undefined)).not.toThrow();
+    });
+
+    it('reads mounts: each volume\'s id, the volume when one was passed, and its path; a mount without a volume is refused', () => {
+        const p = new ScriptedProvider([]);
+        const volume: Volume = { provider: 'scripted', id: 'v2', name: 'data', region: 'par-1', shared: false, status: 'available', providerStatus: 'available', raw: {} };
+        expect(p.mounts([{ volume: 'v1' }, { volume, path: '/data' } as VolumeMount])).toEqual([{ id: 'v1' }, { id: 'v2', volume, path: '/data' }]);
+        expect(() => p.mounts([{ volume: '' }])).toThrow(new ProviderError('scripted', 'a mount needs a volume (a volume from listVolumes or createVolume, or its id)'));
     });
 
     it('says what it can do: supports() narrows to a declared capability, requireCapability() names one it lacks', () => {

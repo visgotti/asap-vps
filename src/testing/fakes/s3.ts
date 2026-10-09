@@ -6,8 +6,9 @@
 // its hash, its content-length exact; the ETag its MD5), read whole or by a
 // `range` (206), listed page by page, deleted; and multipart uploads as S3
 // has them: begun, parts put (numbered 1..maxParts, each ETag its MD5),
-// completed (the parts in order, each but the last at least minPartSize,
-// their ETags matching) or aborted.
+// completed (an XML list of the parts, in order, each but the last at least
+// minPartSize, their ETags matching) or aborted. Each call is recorded, with
+// its Content-Type.
 
 import { createHash } from 'crypto';
 import { signS3, UNSIGNED_PAYLOAD } from '../../Core/utils/s3';
@@ -30,7 +31,7 @@ export function fakeS3(o: {
     const faults = { corruptNextPart: false };
     /** When each bucket was made (ISO 8601). */
     const created = new Map<string, string>();
-    const calls: Array<{ method: string, path: string, query: string, payloadHash: string, duplex?: string, range?: string }> = [];
+    const calls: Array<{ method: string, path: string, query: string, payloadHash: string, duplex?: string, range?: string, contentType?: string }> = [];
     const xml = (status: number, body: string) => new Response(`<?xml version="1.0" encoding="UTF-8"?>${body}`, { status, headers: { 'content-type': 'application/xml' } });
     const error = (status: number, code: string) => xml(status, `<Error><Code>${code}</Code><Message>${code} &amp; more</Message></Error>`);
     const fetchImpl = (async (input: string | URL | Request, init: RequestInit & { duplex?: string } = {}) => {
@@ -38,7 +39,10 @@ export function fakeS3(o: {
         const method = init.method ?? 'GET';
         const headers = init.headers as Record<string, string>;
         const payloadHash = headers['x-amz-content-sha256'];
-        calls.push({ method, path: url.pathname, query: url.search, payloadHash, duplex: init.duplex, ...(headers.range ? { range: headers.range } : {}) });
+        calls.push({
+            method, path: url.pathname, query: url.search, payloadHash, duplex: init.duplex,
+            ...(headers.range ? { range: headers.range } : {}), ...(headers['content-type'] ? { contentType: headers['content-type'] } : {}),
+        });
         // The signature, recomputed from what was sent.
         const unsigned = Object.fromEntries(Object.entries(headers).filter(([k]) => !['authorization', 'x-amz-date', 'x-amz-content-sha256'].includes(k)));
         const amz = headers['x-amz-date'] ?? '';
@@ -106,6 +110,10 @@ export function fakeS3(o: {
                 return new Response(null, { status: 204 });
             }
             if (method === 'POST') {
+                // The XML the S3 API reference gives for CompleteMultipartUpload, and nothing else (white space only between
+                // its elements): else S3's MalformedXML, "not well-formed or did not validate against our published schema".
+                const xmlBody = new TextDecoder().decode(body).replace(/^<\?xml[^>]*\?>/, '').replace(/>\s+</g, '><').trim();
+                if (!/^<CompleteMultipartUpload>(<Part><PartNumber>\d+<\/PartNumber><ETag>[^<]*<\/ETag><\/Part>)+<\/CompleteMultipartUpload>$/.test(xmlBody)) return error(400, 'MalformedXML');
                 const listed = [...new TextDecoder().decode(body).matchAll(/<Part><PartNumber>(\d+)<\/PartNumber><ETag>([^<]*)<\/ETag><\/Part>/g)].map((m) => ({ n: Number(m[1]), etag: m[2] }));
                 if (!listed.length || listed.some((p, i) => i > 0 && p.n <= listed[i - 1].n)) return error(400, 'InvalidPartOrder');
                 for (const [i, p] of listed.entries()) {

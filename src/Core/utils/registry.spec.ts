@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { fakeRegistry } from '../../testing/fakes/registry';
 import { copyRegistryImage, deleteRegistryImage, DOCKER_HUB, parseImageRef, RegistryClient, registryAuthName, registryHost, registryOf } from './registry';
 
@@ -228,6 +229,89 @@ describe('RegistryClient and copyRegistryImage', () => {
         const failing = (async () => new Response('busy', { status: 502 })) as typeof fetch;
         await expect(new RegistryClient(DST, push, failing, sleep).tags('ns/app')).rejects.toThrow(/tags of dst\.example\/ns\/app: 502 busy/);
     });
+
+    it('a request the network never gets through names its URL without the query, and what the network said when it said anything', async () => {
+        const dst = fakeRegistry(DST, { users: { pusher: 'secret' } });
+        dst.push('ns/app', 'v1');
+        const sleep = async () => {};
+        // The token endpoint unreachable: its URL carries the service and scope, which the error leaves out.
+        const noAuth = (async (input: string | URL | Request, init?: RequestInit) => {
+            if (new URL(String(input)).host === `auth.${DST}`) throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+            return dst.fetchImpl(input, init);
+        }) as typeof fetch;
+        await expect(new RegistryClient(DST, push, noAuth, sleep).tags('ns/app')).rejects.toThrow(new Error(`registry ${DST}: GET https://auth.${DST}/token: fetch failed (ECONNREFUSED)`));
+        const hungUp = (async () => {
+            throw new Error('socket hang up');
+        }) as typeof fetch;
+        await expect(new RegistryClient(DST, push, hungUp, sleep).tags('ns/app')).rejects.toThrow(new Error(`registry ${DST}: GET https://${DST}/v2/ns/app/tags/list: socket hang up`));
+    });
+
+    it('without a sleep of its own, waits a real second before sending again', async () => {
+        jest.useFakeTimers();
+        try {
+            const dst = fakeRegistry(DST, { users: { pusher: 'secret' } });
+            dst.push('ns/app', 'v1');
+            let sent = 0;
+            const busyOnce = (async (input: string | URL | Request, init?: RequestInit) => (sent++ === 0 ? new Response(null, { status: 503 }) : dst.fetchImpl(input, init))) as typeof fetch;
+            const tags = new RegistryClient(DST, push, busyOnce).tags('ns/app');
+            await jest.advanceTimersByTimeAsync(999);
+            expect(sent).toBe(1);
+            await jest.advanceTimersByTimeAsync(1);
+            await expect(tags).resolves.toEqual(['v1']);
+            // The 503, then the request again: refused for a token, the token, and the request with it.
+            expect(sent).toBe(4);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('a refusal whose body cannot be read is its status alone', async () => {
+        const dst = fakeRegistry(DST, { users: { pusher: 'secret' } });
+        /** An answer whose body breaks before it is read (a reset mid-body). */
+        const broken = (status: number) => new Response(new ReadableStream({ start(ctl) { ctl.error(new TypeError('terminated')); } }), { status });
+        const tokenCut = (async (input: string | URL | Request, init?: RequestInit) => (new URL(String(input)).host === `auth.${DST}` ? broken(401) : dst.fetchImpl(input, init))) as typeof fetch;
+        await expect(new RegistryClient(DST, push, tokenCut).tags('ns/app')).rejects.toThrow(new Error(`registry ${DST}: the token for ns/app (pull) was refused: 401 `));
+        const readCut = (async (input: string | URL | Request, init?: RequestInit) => (new URL(String(input)).host === DST ? broken(403) : dst.fetchImpl(input, init))) as typeof fetch;
+        await expect(new RegistryClient(DST, push, readCut).tags('ns/app')).rejects.toThrow(new Error(`tags of ${DST}/ns/app: 403 `));
+    });
+
+    it('a manifest that names no media type is the type the registry serves it as; a digest no header gives is the SHA-256 of its bytes', async () => {
+        const dst = fakeRegistry(DST, { users: { pusher: 'secret' } });
+        // A registry that sends no Docker-Content-Digest (the OCI distribution spec has it optional).
+        const undigested = (async (input: string | URL | Request, init?: RequestInit) => {
+            const r = await dst.fetchImpl(input, init);
+            const headers = new Headers(r.headers);
+            headers.delete('docker-content-digest');
+            return new Response(r.body, { status: r.status, headers });
+        }) as typeof fetch;
+        const c = new RegistryClient(DST, push, undigested);
+        const docker = 'application/vnd.docker.distribution.manifest.v2+json';
+        const bytes = Buffer.from(JSON.stringify({ schemaVersion: 2, config: { digest: 'sha256:' + 'c'.repeat(64) }, layers: [] }));
+        const sha256 = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+        expect(await c.putManifest('ns/app', 'v1', { mediaType: docker, bytes })).toBe(sha256);
+        const m = (await c.manifest('ns/app', 'v1'))!;
+        expect([m.mediaType, m.digest, Buffer.from(m.bytes)]).toEqual([docker, sha256, bytes]);
+        // A HEAD that gives no digest: the manifest is read for it (each first request of a scope is answered 401, then sent with its token).
+        expect(await c.digest('ns/app', 'v1')).toBe(sha256);
+        expect(dst.calls.filter((x) => x.path === '/v2/ns/app/manifests/v1').map((x) => x.method)).toEqual(['PUT', 'PUT', 'GET', 'GET', 'HEAD', 'GET']);
+        // Gone between that HEAD and the read: none.
+        const vanishing = (async (input: string | URL | Request, init?: RequestInit) => (init?.method === 'HEAD' ? new Response(null, { status: 200 }) : new Response(null, { status: 404 }))) as typeof fetch;
+        expect(await new RegistryClient(DST, push, vanishing).digest('ns/app', 'v1')).toBeNull();
+    });
+
+    it('a repository whose tag list is null has no tags', async () => {
+        // What distribution's registry answers for a repository whose last tag was deleted.
+        const nullTags = (async () => Response.json({ name: 'ns/app', tags: null })) as typeof fetch;
+        expect(await new RegistryClient(DST, undefined, nullTags).tags('ns/app')).toEqual([]);
+    });
+
+    it('an index entry whose manifest is not there is an error that names it', async () => {
+        const src = fakeRegistry(SRC, { publicRepos: ['acme/app'] });
+        src.seed('acme/app', '1');
+        // The seeded index lists a linux/arm64 manifest it does not hold.
+        await expect(new RegistryClient(SRC, undefined, src.fetchImpl).imageManifest('acme/app', '1', { os: 'linux', architecture: 'arm64' }))
+            .rejects.toThrow(new Error(`image ${SRC}/acme/app@sha256:${'a'.repeat(64)} is listed but not there`));
+    });
 });
 
 describe('deleteRegistryImage: an image, every tag of it, through the Registry API or Scaleway\'s own', () => {
@@ -264,8 +348,9 @@ describe('deleteRegistryImage: an image, every tag of it, through the Registry A
             calls.push({ method: init?.method ?? 'GET', path: `${u.pathname}${u.search}`, token: new Headers(init?.headers).get('x-auth-token') });
             const p = u.pathname.replace('/registry/v1/regions/nl-ams', '');
             if (p === '/namespaces') return Response.json({ namespaces: [{ id: 'ns-other', name: 'teamx' }, { id: 'ns-1', name: 'team' }] });
-            if (p === '/images') return Response.json({ images: u.searchParams.get('namespace_id') === 'ns-1' ? [{ id: 'img-1', name: 'snaps' }] : [] });
+            if (p === '/images') return Response.json({ images: u.searchParams.get('namespace_id') === 'ns-1' ? [{ id: 'img-1', name: 'snaps' }, { id: 'img-2', name: 'tools/snaps' }] : [] });
             if (p === '/images/img-1/tags') return Response.json({ tags });
+            if (p === '/images/img-2/tags') return Response.json({ tags: [{ id: 't9', name: 'v1', digest: 'sha256:c' }] });
             if (init?.method === 'DELETE' && /^\/tags\/t\d$/.test(p)) return new Response(null, { status: 204 });
             return new Response('{"message":"no route"}', { status: 404 });
         }) as typeof fetch;
@@ -276,10 +361,22 @@ describe('deleteRegistryImage: an image, every tag of it, through the Registry A
         expect(await deleteRegistryImage('rg.nl-ams.scw.cloud/team/snaps:none', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: scw })).toBe(false);
         expect(await deleteRegistryImage('rg.nl-ams.scw.cloud/team/other:v1', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: scw })).toBe(false);
         expect(await deleteRegistryImage('rg.nl-ams.scw.cloud/nobody/snaps:v1', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: scw })).toBe(false);
-        // Scaleway refusing says what it said.
+        // An image whose name has a path of its own (`docker push rg.nl-ams.scw.cloud/team/tools/snaps:v1`): looked up by all of it.
+        calls.length = 0;
+        expect(await deleteRegistryImage('rg.nl-ams.scw.cloud/team/tools/snaps:v1', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: scw })).toBe(true);
+        expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+            'GET /registry/v1/regions/nl-ams/namespaces?name=team&page_size=100',
+            'GET /registry/v1/regions/nl-ams/images?namespace_id=ns-1&name=tools%2Fsnaps&page_size=100',
+            'GET /registry/v1/regions/nl-ams/images/img-2/tags?page_size=100',
+            'DELETE /registry/v1/regions/nl-ams/tags/t9?force=true',
+        ]);
+        // Scaleway refusing says what it said; an answer it cut off, its status.
         const denied = (async () => new Response('{"message":"permission denied"}', { status: 403 })) as typeof fetch;
         await expect(deleteRegistryImage('rg.nl-ams.scw.cloud/team/snaps:v1', { username: 'nologin', password: 'bad' }, { fetchImpl: denied }))
             .rejects.toThrow('Scaleway registry GET /namespaces: 403 {"message":"permission denied"}');
+        const cut = (async () => new Response(new ReadableStream({ start(ctl) { ctl.error(new TypeError('terminated')); } }), { status: 503 })) as typeof fetch;
+        await expect(deleteRegistryImage('rg.nl-ams.scw.cloud/team/snaps:v1', { username: 'nologin', password: 'scw-secret' }, { fetchImpl: cut }))
+            .rejects.toThrow(new Error('Scaleway registry GET /namespaces: 503 '));
     });
 });
 

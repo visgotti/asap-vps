@@ -98,6 +98,96 @@ describe('S3Client, against a fake S3 that checks every signature', () => {
         const wrongKey = new S3Client({ endpoint, region: 'fr-par', credentials: { accessKey: 'SCWKEY', secretKey: 'other' }, fetchImpl: s3.fetchImpl });
         await expect(wrongKey.createBucket('b')).rejects.toMatchObject({ status: 403, code: 'SignatureDoesNotMatch' });
     });
+
+    /** The fake S3, but for the requests `answer` answers itself. */
+    const answering = (answer: (method: string, path: string, init?: RequestInit) => Response | undefined) => {
+        const credentials = { accessKey: 'SCWKEY', secretKey: 'secret' };
+        const s3 = fakeS3({ region: 'fr-par', credentials });
+        const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => answer(init?.method ?? 'GET', new URL(String(input)).pathname, init) ?? s3.fetchImpl(input, init)) as typeof fetch;
+        return { s3, c: new S3Client({ endpoint, region: 'fr-par', credentials, fetchImpl, sleep: async () => {} }) };
+    };
+    /** What a call was refused with: its S3Error's status, code and message (any other failure as it is). */
+    const refusal = (p: Promise<unknown>) => p.then(() => 'not refused', (e: Error) => (e instanceof S3Error ? [e.status, e.code, e.message] : e));
+    /** An answer whose body breaks before it is read (a reset mid-body). */
+    const broken = (status: number) => new Response(new ReadableStream({ start(ctl) { ctl.error(new TypeError('terminated')); } }), { status });
+    const accessDenied = () => new Response('<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>', { status: 403 });
+
+    it('each call S3 refuses is an S3Error that names the call', async () => {
+        // A HEAD's answer has no body: its status says it all.
+        const { c } = answering((method) => (method === 'HEAD' ? new Response(null, { status: 403 }) : accessDenied()));
+        expect(await Promise.all([
+            refusal(c.headBucket('b')), refusal(c.headObject('b', 'k')), refusal(c.getObject('b', 'k')), refusal(c.deleteObject('b', 'k')),
+            refusal(c.listBuckets()), refusal(c.listObjects('b')), refusal(c.deleteBucket('b')), refusal(c.putObject('b', 'k', new Uint8Array([1]))),
+        ])).toEqual([
+            [403, undefined, 'bucket b: 403'], [403, undefined, 'b/k: 403'], [403, 'AccessDenied', 'b/k: 403 AccessDenied Access Denied'],
+            [403, 'AccessDenied', 'delete of b/k: 403 AccessDenied Access Denied'], [403, 'AccessDenied', 'the buckets: 403 AccessDenied Access Denied'],
+            [403, 'AccessDenied', 'objects of b: 403 AccessDenied Access Denied'], [403, 'AccessDenied', 'delete of bucket b: 403 AccessDenied Access Denied'],
+            [403, 'AccessDenied', 'upload of b/k: 403 AccessDenied Access Denied'],
+        ]);
+    });
+
+    it('a bucket name another account has is refused, not taken for ours; a refusal not in S3\'s XML is its first 200 characters, one that cannot be read its status', async () => {
+        const taken = answering((method) => (method === 'PUT'
+            ? new Response('<Error><Code>BucketAlreadyExists</Code><Message>The requested bucket name is not available.</Message></Error>', { status: 409 }) : undefined));
+        expect(await refusal(taken.c.createBucket('b'))).toEqual([409, 'BucketAlreadyExists', 'bucket b: 409 BucketAlreadyExists The requested bucket name is not available.']);
+        const page = 'x'.repeat(300);
+        const proxy = answering(() => new Response(page, { status: 403 }));
+        expect(await refusal(proxy.c.putObject('b', 'k', new Uint8Array([1])))).toEqual([403, undefined, `upload of b/k: 403  ${page.slice(0, 200)}`]);
+        const cut = answering(() => broken(409));
+        expect(await refusal(cut.c.createBucket('b'))).toEqual([409, undefined, 'bucket b: 409']);
+        expect(await refusal(cut.c.deleteBucket('b'))).toEqual([409, undefined, 'delete of bucket b: 409']);
+    });
+
+    it('asks whether a bucket is there with a HEAD', async () => {
+        const { s3, c } = answering(() => undefined);
+        await c.createBucket('b');
+        expect([await c.headBucket('b'), await c.headBucket('nope')]).toEqual([true, false]);
+        expect(s3.calls.map((x) => `${x.method} ${x.path}`)).toEqual(['PUT /b', 'HEAD /b', 'HEAD /nope']);
+    });
+
+    it('a listing that never ends is refused after 1000 pages', async () => {
+        let pages = 0;
+        const { c } = answering(() => {
+            pages++;
+            return new Response('<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>', { status: 200 });
+        });
+        await expect(c.listObjects('b')).rejects.toThrow(new Error('the bucket b lists more than 1000 pages'));
+        expect(pages).toBe(1000);
+    });
+
+    it('stageObject: an object not there is NoSuchKey at once; one sent without a body, or whose download breaks every time, an error that says so', async () => {
+        const { s3, c } = answering(() => undefined);
+        await c.createBucket('b');
+        expect(await refusal(c.stageObject('b', 'none'))).toEqual([404, 'NoSuchKey', 'b/none: no such object']);
+        expect(s3.calls.filter((x) => x.method === 'GET').map((x) => x.path)).toEqual(['/b/none']);
+        const empty = answering((method) => (method === 'GET' ? new Response(null, { status: 200 }) : undefined));
+        await expect(empty.c.stageObject('b', 'k')).rejects.toThrow(new Error('b/k: no body'));
+        const cut = answering((method) => (method === 'GET' ? new Response(new ReadableStream({
+            start(ctl) {
+                ctl.enqueue(new Uint8Array(8));
+                ctl.error(Object.assign(new TypeError('terminated'), { cause: { code: 'UND_ERR_SOCKET' } }));
+            },
+        }), { status: 200 }) : undefined));
+        await expect(cut.c.stageObject('b', 'k')).rejects.toThrow(new Error(`${endpoint} GET /b/k: terminated (UND_ERR_SOCKET)`));
+    });
+
+    it('objectSource: a range answered whole (200) is taken only when it is the whole object; any other answer but 206 is refused', async () => {
+        const text = '0123456789'.repeat(10);
+        let answer: (() => Response) | undefined;
+        const { c } = answering((method, _path, init) => ((init?.headers as Record<string, string> | undefined)?.range && answer ? answer() : undefined));
+        await c.createBucket('b');
+        await c.putObject('b', 'k', new TextEncoder().encode(text));
+        const source = (await c.objectSource('b', 'k'))!;
+        const read = async (start: number, end: number) => new TextDecoder().decode(await new Response(await source.range(start, end)).arrayBuffer());
+        expect(await read(10, 19)).toBe('0123456789');
+        // A server that ignores the range: the whole object, which is what was asked for only as 0-99.
+        answer = () => new Response(text, { status: 200 });
+        expect(await read(0, 99)).toBe(text);
+        expect(await refusal(read(0, 49))).toEqual([200, undefined, `b/k bytes 0-49: 200  ${text}`]);
+        expect(await refusal(read(50, 99))).toEqual([200, undefined, `b/k bytes 50-99: 200  ${text}`]);
+        answer = accessDenied;
+        expect(await refusal(read(0, 99))).toEqual([403, 'AccessDenied', 'b/k bytes 0-99: 403 AccessDenied Access Denied']);
+    });
 });
 
 describe('S3Client retries what the network or S3 fails', () => {
@@ -140,6 +230,23 @@ describe('S3Client retries what the network or S3 fails', () => {
         await expect(flaky([500, 500, 500, 500]).c.createBucket('b')).rejects.toMatchObject({ status: 500, code: 'SlowDown' });
     });
 
+    it('without a sleep of its own, waits a real second before sending again', async () => {
+        jest.useFakeTimers();
+        try {
+            const s3 = fakeS3({ region: 'fr-par', credentials });
+            let sent = 0;
+            const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => (sent++ === 0 ? new Response(null, { status: 503 }) : s3.fetchImpl(url, init))) as typeof fetch;
+            const made = new S3Client({ endpoint, region: 'fr-par', credentials, fetchImpl }).createBucket('b');
+            await jest.advanceTimersByTimeAsync(999);
+            expect(sent).toBe(1);
+            await jest.advanceTimersByTimeAsync(1);
+            await made;
+            expect([sent, s3.buckets.has('b')]).toEqual([2, true]);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
     it('a staged file is uploaded again from its start, and a download made again, where the network breaks it', async () => {
         const { s3, c } = flaky([]);
         await c.createBucket('b');
@@ -177,6 +284,9 @@ describe('stageDownload: a file downloaded to a temporary one, hashed on the way
         try {
             const breaking = answer(() => new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new Uint8Array(1024)); c.error(new Error('connection reset')); } }));
             await expect(stageDownload('https://files.example/disk.qcow2', breaking, { dir })).rejects.toThrow(/connection reset/);
+            // A refusal: its status (and its status text, when the server gives one).
+            await expect(stageDownload('https://files.example/disk.qcow2', (async () => new Response('gone', { status: 404 })) as unknown as typeof fetch, { dir }))
+                .rejects.toThrow(new Error('https://files.example/disk.qcow2: 404'));
             expect(readdirSync(dir)).toEqual([]);
             // A directory that is not there: the file cannot be written (as on a full disk), and the write stream's error is heard.
             await expect(stageDownload('https://files.example/disk.qcow2', answer(() => new Uint8Array(2048)), { dir: join(dir, 'missing') })).rejects.toMatchObject({ code: 'ENOENT' });
@@ -300,21 +410,37 @@ describe('S3Client.upload: a source in parts, several at a time, never held whol
         });
     });
 
-    it('a part too big to hold in memory waits in a temporary file, and is sent from it', async () => {
-        const { s3, c } = make({ memoryPart: 512 });
-        await c.createBucket('b');
-        const data = bytes(3 * KiB);
-        await c.upload('b', 'disk', memory(data).source);
-        expect(Buffer.from(s3.buckets.get('b')!.get('disk')!)).toEqual(Buffer.from(data));
-        const parts = s3.calls.filter((x) => x.method === 'PUT' && /partNumber=/.test(x.query));
-        expect(parts.every((x) => x.payloadHash === UNSIGNED_PAYLOAD && x.duplex === 'half')).toBe(true);
+    it('a part too big to hold in memory waits in a temporary file, read once, sent from it, and removed once sent', async () => {
+        // The temporary files go where os.tmpdir() says: a directory of this test's own, looked into at each part's PUT.
+        const dir = mkdtempSync(join(tmpdir(), 'asap-vps-parts-test-'));
+        jest.spyOn(require('os') as typeof import('os'), 'tmpdir').mockReturnValue(dir);
+        const seen = new Set<string>();
+        try {
+            const { s3, c } = make({ memoryPart: 512, wrap: (inner) => (async (url: string | URL | Request, init?: RequestInit) => {
+                if (init?.method === 'PUT' && /partNumber=/.test(String(url))) for (const f of readdirSync(dir)) seen.add(f);
+                return inner(url, init);
+            }) as typeof fetch });
+            await c.createBucket('b');
+            const data = bytes(3 * KiB);
+            const m = memory(data);
+            await c.upload('b', 'disk', m.source);
+            expect(Buffer.from(s3.buckets.get('b')!.get('disk')!)).toEqual(Buffer.from(data));
+            const parts = s3.calls.filter((x) => x.method === 'PUT' && /partNumber=/.test(x.query));
+            expect(parts.every((x) => x.payloadHash === UNSIGNED_PAYLOAD && x.duplex === 'half')).toBe(true);
+            // Each part read once, into a file of its own, which is gone once the part is sent.
+            expect(m.reads).toEqual(['0-1023', '1024-2047', '2048-3071']);
+            expect([seen.size, readdirSync(dir)]).toEqual([3, []]);
+        } finally {
+            jest.restoreAllMocks();
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     it('an upload that fails is aborted: S3 keeps no part of it; a completion S3 answers with an error in a 200 is a failure too', async () => {
         const refusing = make({ wrap: (inner) => (async (url: string | URL | Request, init?: RequestInit) => (init?.method === 'PUT' && /partNumber=3/.test(String(url))
             ? new Response('<Error><Code>AccessDenied</Code><Message>no</Message></Error>', { status: 403 }) : inner(url, init))) as typeof fetch });
         await refusing.c.createBucket('b');
-        await expect(refusing.c.upload('b', 'disk', memory(bytes(4 * KiB)).source)).rejects.toMatchObject({ status: 403, code: 'AccessDenied' });
+        await expect(refusing.c.upload('b', 'disk', memory(bytes(4 * KiB)).source)).rejects.toMatchObject({ status: 403, code: 'AccessDenied', message: 'upload of b/disk part 3 (memory): 403 AccessDenied no' });
         expect([refusing.s3.uploads.size, refusing.s3.buckets.get('b')!.has('disk')]).toEqual([0, false]);
         // Aborted once no part is still on its way: the abort is the upload's last request.
         const ofUpload = refusing.s3.calls.filter((x) => /uploadId=/.test(x.query)).map((x) => x.method);
@@ -329,7 +455,132 @@ describe('S3Client.upload: a source in parts, several at a time, never held whol
         await silent.c.createBucket('b');
         await expect(silent.c.upload('b', 'disk', memory(bytes(2 * KiB + 1)).source)).rejects.toThrow(/S3 gave no UploadId/);
         // A bucket that is not there: S3's answer to the upload's start.
-        await expect(refusing.c.upload('missing', 'disk', memory(bytes(2 * KiB + 1)).source)).rejects.toMatchObject({ status: 404, code: 'NoSuchBucket' });
+        await expect(refusing.c.upload('missing', 'disk', memory(bytes(2 * KiB + 1)).source))
+            .rejects.toMatchObject({ status: 404, code: 'NoSuchBucket', message: 'multipart upload of missing/disk: 404 NoSuchBucket NoSuchBucket & more' });
+    });
+
+    it('an object goes up with its content type: a single PUT carries it, a multipart upload gives it at its start and completes in XML', async () => {
+        const { s3, c } = make();
+        await c.createBucket('b');
+        await c.putObject('b', 'raw', new Uint8Array([1]));
+        await c.upload('b', 'default', memory(bytes(10)).source);
+        await c.upload('b', 'small', memory(bytes(500)).source, 'application/x-qemu-disk');
+        await onDisk(bytes(500), async (path) => {
+            await c.upload('b', 'local', fileSource(path, 500), 'application/x-qemu-disk');
+        });
+        await c.upload('b', 'big', memory(bytes(2 * KiB + 1)).source, 'application/x-qemu-disk');
+        const of = (key: string) => s3.calls.filter((x) => x.path === `/b/${key}`).map((x) => [x.method, x.query.replace(/=[0-9a-f]{24}/, '=<id>'), x.contentType]);
+        expect([of('raw'), of('default'), of('small'), of('local')]).toEqual([
+            [['PUT', '', 'application/octet-stream']], [['PUT', '', 'application/octet-stream']], [['PUT', '', 'application/x-qemu-disk']], [['PUT', '', 'application/x-qemu-disk']],
+        ]);
+        const big = of('big');
+        expect([big[0], big[big.length - 1]]).toEqual([['POST', '?uploads=', 'application/x-qemu-disk'], ['POST', '?uploadId=<id>', 'application/xml']]);
+        expect(big.slice(1, -1).sort()).toEqual([
+            ['PUT', '?partNumber=1&uploadId=<id>', undefined], ['PUT', '?partNumber=2&uploadId=<id>', undefined], ['PUT', '?partNumber=3&uploadId=<id>', undefined],
+        ]);
+    });
+
+    it('parts go up `concurrency` at a time, and once one fails no worker takes another', async () => {
+        let inFlight = 0;
+        let most = 0;
+        /** Holds each part a turn of the event loop (the parts sent together are in flight together), and refuses part `refuse`. */
+        const held = (refuse?: number) => (inner: typeof fetch) => (async (url: string | URL | Request, init?: RequestInit) => {
+            const part = /partNumber=(\d+)/.exec(String(url))?.[1];
+            if (init?.method !== 'PUT' || !part) return inner(url, init);
+            if (Number(part) === refuse) return new Response('<Error><Code>AccessDenied</Code><Message>no</Message></Error>', { status: 403 });
+            most = Math.max(most, ++inFlight);
+            await new Promise((r) => setImmediate(r));
+            inFlight--;
+            return inner(url, init);
+        }) as typeof fetch;
+        const all = make({ wrap: held() });
+        await all.c.createBucket('b');
+        await all.c.upload('b', 'disk', memory(bytes(6 * KiB)).source);
+        expect(most).toBe(2);
+        const refusing = make({ wrap: held(1) });
+        await refusing.c.createBucket('b');
+        const m = memory(bytes(6 * KiB));
+        await expect(refusing.c.upload('b', 'disk', m.source)).rejects.toMatchObject({ status: 403, code: 'AccessDenied' });
+        // The part on its way when the first was refused is let finish; no other is read.
+        expect(m.reads).toEqual(['0-1023', '1024-2047']);
+    });
+
+    it('a completion S3 refuses is an S3Error with its status, code and message: S3\'s XML, else its first 200 characters, else its status alone', async () => {
+        let completion = () => new Response(null, { status: 200 });
+        const { c } = make({ wrap: (inner) => (async (url: string | URL | Request, init?: RequestInit) => (init?.method === 'POST' && /uploadId=/.test(String(url))
+            ? completion() : inner(url, init))) as typeof fetch });
+        await c.createBucket('b');
+        const upload = () => c.upload('b', 'disk', memory(bytes(2 * KiB + 1)).source).then(() => 'completed', (e: S3Error) => [e.status, e.code, e.message]);
+        completion = () => new Response('<Error><Code>InternalError</Code><Message>try again</Message></Error>', { status: 200 });
+        expect(await upload()).toEqual([500, 'InternalError', 'completion of b/disk: 200 InternalError try again']);
+        completion = () => new Response('x'.repeat(300), { status: 400 });
+        expect(await upload()).toEqual([400, undefined, `completion of b/disk: 400  ${'x'.repeat(200)}`]);
+        completion = () => new Response(null, { status: 400 });
+        expect(await upload()).toEqual([400, undefined, 'completion of b/disk: 400']);
+    });
+
+    it('the answer to an abort is let go of, whatever S3 says in it', async () => {
+        let released = false;
+        const { c } = make({ wrap: (inner) => (async (url: string | URL | Request, init?: RequestInit) => {
+            if (init?.method === 'PUT' && /partNumber=2/.test(String(url))) return new Response('<Error><Code>AccessDenied</Code><Message>no</Message></Error>', { status: 403 });
+            // An upload S3 no longer has: its abort answered 404 NoSuchUpload, with a body.
+            if (init?.method === 'DELETE' && /uploadId=/.test(String(url))) return new Response(new ReadableStream({ cancel() { released = true; } }), { status: 404 });
+            return inner(url, init);
+        }) as typeof fetch });
+        await c.createBucket('b');
+        await expect(c.upload('b', 'disk', memory(bytes(2 * KiB + 1)).source)).rejects.toMatchObject({ status: 403, code: 'AccessDenied' });
+        expect(released).toBe(true);
+    });
+
+    it('a part streamed from disk is closed with its PUT: one the network drops four times is the network\'s error, one S3 refuses S3\'s', async () => {
+        const closed: number[] = [];
+        let opened = 0;
+        /** A file on disk that gives a first chunk, then nothing until its reader lets it go: whether it was let go shows. */
+        const disk: ByteSource = {
+            size: 500, what: 'disk.qcow2', local: true,
+            range: async () => {
+                const n = ++opened;
+                return new ReadableStream<Uint8Array>({ start(ctl) { ctl.enqueue(new Uint8Array(100)); }, pull: () => new Promise(() => {}), cancel() { closed.push(n); } });
+            },
+        };
+        const dropping = make({ wrap: (inner) => (async (url: string | URL | Request, init?: RequestInit) => {
+            if (init?.method === 'PUT' && new URL(String(url)).pathname === '/b/disk') throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+            return inner(url, init);
+        }) as typeof fetch });
+        await dropping.c.createBucket('b');
+        await expect(dropping.c.upload('b', 'disk', disk)).rejects.toThrow(new Error(`${endpoint} PUT /b/disk: fetch failed (ECONNRESET)`));
+        await new Promise((r) => setImmediate(r));
+        expect(closed).toEqual([1, 2, 3, 4]);
+        const refusing = make({ wrap: (inner) => (async (url: string | URL | Request, init?: RequestInit) => (init?.method === 'PUT' && new URL(String(url)).pathname === '/b/disk'
+            ? new Response('<Error><Code>AccessDenied</Code><Message>no</Message></Error>', { status: 403 }) : inner(url, init))) as typeof fetch });
+        await refusing.c.createBucket('b');
+        await onDisk(bytes(500), async (path) => {
+            expect(await refusing.c.upload('b', 'disk', fileSource(path, 500)).then(() => 'stored', (e: S3Error) => [e.status, e.code, e.message]))
+                .toEqual([403, 'AccessDenied', `upload of b/disk (${path}): 403 AccessDenied no`]);
+        });
+    });
+
+    it('a PUT S3 answers without an ETag is taken as the MD5 sent; one whose ETag is another MD5 is sent again, then is BadDigest', async () => {
+        const etagless = make({ wrap: (inner) => (async (url: string | URL | Request, init?: RequestInit) => {
+            const r = await inner(url, init);
+            return init?.method === 'PUT' ? new Response(r.body, { status: r.status }) : r;
+        }) as typeof fetch });
+        await etagless.c.createBucket('b');
+        const small = bytes(500);
+        expect(await etagless.c.upload('b', 'small', memory(small).source)).toBe(`"${md5(small)}"`);
+        // Each part's ETag in the completion is the MD5 sent, which S3 checks.
+        const big = bytes(3 * KiB);
+        await etagless.c.upload('b', 'big', memory(big).source);
+        expect(Buffer.from(etagless.s3.buckets.get('b')!.get('big')!)).toEqual(Buffer.from(big));
+        const zeros = `"${'0'.repeat(32)}"`;
+        const lying = make({ wrap: (inner) => (async (url: string | URL | Request, init?: RequestInit) => {
+            const r = await inner(url, init);
+            return init?.method === 'PUT' ? new Response(r.body, { status: r.status, headers: { etag: zeros } }) : r;
+        }) as typeof fetch });
+        await lying.c.createBucket('b');
+        expect(await lying.c.upload('b', 'small', memory(small).source).then(() => 'stored', (e: S3Error) => [e.status, e.code, e.message]))
+            .toEqual([500, 'BadDigest', `upload of b/small (memory): S3 stored other bytes (ETag ${zeros}, MD5 sent ${md5(small)})`]);
+        expect(lying.s3.calls.filter((x) => x.path === '/b/small').length).toBe(4);
     });
 
     it('copies an object across two S3s (regions) by its ranges, and uploads a file from disk by its ranges', async () => {
@@ -369,8 +620,15 @@ describe('S3Client.upload: a source in parts, several at a time, never held whol
         expect(await urlSource('https://files.example/disk.qcow2', (async () => { throw new TypeError('fetch failed'); }) as unknown as typeof fetch)).toBeNull();
         // A server that stops serving ranges: an error, not the whole file read as a part.
         const fickle = (await urlSource('https://files.example/disk.qcow2', server({ ranges: true, rangeStatus: 200 })))!;
-        await expect(fickle.range(0, 99)).rejects.toMatchObject({ status: 502, code: 'RangeRefused' });
+        await expect(fickle.range(0, 99)).rejects.toMatchObject({ status: 502, code: 'RangeRefused', message: 'https://files.example/disk.qcow2: bytes 0-99: 200' });
         const busy = (await urlSource('https://files.example/disk.qcow2', server({ ranges: true, rangeStatus: 503 })))!;
         await expect(busy.range(0, 99)).rejects.toMatchObject({ status: 503 });
+        const failing = (await urlSource('https://files.example/disk.qcow2', server({ ranges: true, rangeStatus: 500 })))!;
+        await expect(failing.range(0, 99)).rejects.toMatchObject({ status: 500, code: 'RangeRefused' });
+        // One that answers a range with no body at all: the same refusal.
+        const bodiless = (await urlSource('https://files.example/disk.qcow2', (async (_url: string | URL | Request, init?: RequestInit) => (init?.method === 'HEAD'
+            ? new Response(null, { status: 200, headers: { 'content-length': '3000', 'accept-ranges': 'bytes' } }) : new Response(null, { status: 416 }))) as unknown as typeof fetch))!;
+        const e = await bodiless.range(0, 99).catch((x) => x);
+        expect([e instanceof S3Error, e.status, e.code, e.message]).toEqual([true, 502, 'RangeRefused', 'https://files.example/disk.qcow2: bytes 0-99: 416']);
     });
 });

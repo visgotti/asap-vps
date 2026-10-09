@@ -5,6 +5,12 @@
 
 import { createHash } from 'crypto';
 
+/** The manifest types a registry takes: an index (several platforms) or one image's manifest, OCI or Docker. */
+const MANIFEST_TYPES = [
+    'application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json',
+    'application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json',
+];
+
 /**
  * A registry as Docker Hub, ghcr.io and Scaleway's answer: a 401 with a Bearer
  * challenge, a token for a repository and scope (anonymous pulls where
@@ -77,6 +83,12 @@ export function fakeRegistry(host: string, o: {
         // manifests
         if (method === 'PUT') {
             const bytes = new Uint8Array(init.body as Buffer);
+            // A manifest is pushed as its Content-Type, which must be its mediaType where it names one (OCI distribution spec,
+            // "Pushing Manifests"); the registry reads it as that type and refuses one it cannot (MANIFEST_INVALID).
+            const named = (JSON.parse(Buffer.from(bytes).toString('utf8')) as { mediaType?: string }).mediaType;
+            if (!MANIFEST_TYPES.includes(headers['content-type']) || (named !== undefined && named !== headers['content-type'])) {
+                return new Response('{"errors":[{"code":"MANIFEST_INVALID"}]}', { status: 400 });
+            }
             repoOf(manifests, repo).set(sha(bytes), { type: headers['content-type'], bytes });
             repoOf(tags, repo).set(rest, sha(bytes));
             return new Response(null, { status: 201, headers: { 'docker-content-digest': sha(bytes) } });
@@ -90,6 +102,9 @@ export function fakeRegistry(host: string, o: {
             return new Response(null, { status: 202 });
         }
         if (!found) return new Response(null, { status: 404 });
+        // Served only as a type the request's Accept lists (OCI distribution spec, "Pulling manifests"): distribution's
+        // registry answers 404 for an OCI manifest or index a client did not say it takes.
+        if (!(headers.accept ?? '').split(',').map((t) => t.trim()).includes(found.type)) return new Response('{"errors":[{"code":"MANIFEST_UNKNOWN"}]}', { status: 404 });
         return new Response(Buffer.from(found.bytes), { status: 200, headers: { 'content-type': found.type, 'docker-content-digest': digest! } });
     }) as typeof fetch;
     /** Seeds an image: its config, one layer, its manifest, and an index that lists it for linux/amd64 (and arm64). */
