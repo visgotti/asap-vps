@@ -3,7 +3,7 @@
 // default), never NaN or a crash, and a status word it adds later reads as
 // 'unknown'.
 
-import { toCpuOffer, toEndpoint, toOffer, toServer, toServerlessCpuOffer, toServerlessGpuOffer } from './mappers';
+import { toCpuOffer, toEndpoint, toOffer, toServer, toServerlessCpuOffer, toServerlessGpuOffer, toSSHKey } from './mappers';
 import type { RunPodCpuType, RunPodEndpoint, RunPodGpuType, RunPodPod } from './types';
 
 const gpu = (o: Partial<RunPodGpuType> = {}) => ({ id: 'NVIDIA L4', secure: true, community: true, price: { secure: 0.4, community: 0.3, serverless: 0.5 }, ...o }) as RunPodGpuType;
@@ -22,6 +22,12 @@ describe('RunPod GPU and CPU offers', () => {
         expect(toOffer(gpu({ id: 'Acme Z9' }), 1, 'SECURE')).toMatchObject({ gpu: 'Acme Z9', vramGb: 0 });
     });
 
+    it('an offer\'s CUDA version is the newest its type has free, by number, whatever order the catalog lists them in', () => {
+        const cudaVersions = [{ version: '12.4', available: true }, { version: '12.10', available: true }, { version: '13.0', available: false },
+            { version: 'twelve', available: true }, { version: '12.9', available: true }];
+        expect(toOffer(gpu({ cudaVersions }), 1, 'SECURE')?.cudaVersion).toBe('12.10');
+    });
+
     it('a CPU flavor with no secure price is no offer; with no data centers, no stock', () => {
         expect(toCpuOffer(cpu({ price: { securePerVcpu: 0 } } as Partial<RunPodCpuType>), 4)).toBeNull();
         expect(toCpuOffer(cpu(), 4)).toMatchObject({ id: 'cpu3c:4', pricePerHour: 0.08, memoryGb: 8, regions: [] });
@@ -36,6 +42,14 @@ describe('RunPod GPU and CPU offers', () => {
         expect(toServerlessCpuOffer(cpu(), 1)).toBeNull();
         expect(toServerlessCpuOffer(cpu({ price: { securePerVcpu: 0.02 } } as Partial<RunPodCpuType>), 4)).toBeNull();
         expect(toServerlessCpuOffer(cpu(), 4)).toMatchObject({ pricePerHour: 0.12, raw: { vcpuCount: 4 } });
+    });
+
+    it('serverless: a GPU type is offered in the data centers with stock only, at a price above 0; no price at all is none', () => {
+        const pooled = (o: Partial<RunPodGpuType>) => toServerlessGpuOffer(gpu({ pool: 'ADA_24', ...o }));
+        expect(pooled({ dataCenters: [{ id: 'US-TX-3', availability: 'HIGH' }, { id: 'EU-RO-1', availability: 'NONE' }] })?.regions).toEqual(['US-TX-3']);
+        expect(pooled({ price: { secure: 0.4, community: 0.3, serverless: 0 } })).toBeNull();
+        expect(pooled({ price: undefined } as Partial<RunPodGpuType>)).toBeNull();
+        expect(toServerlessCpuOffer(cpu({ price: undefined } as Partial<RunPodCpuType>), 4)).toBeNull();
     });
 });
 
@@ -54,6 +68,10 @@ describe('RunPod pods', () => {
         const s = toServer(pod({ runtime: { ports: [{ private: 8888 }, { private: 22, public: 40022, ip: '194.68.245.10', type: 'tcp' }] } } as Partial<RunPodPod>));
         expect(s.ports).toEqual([{ privatePort: 8888, protocol: 'tcp' }, { privatePort: 22, publicPort: 40022, ip: '194.68.245.10', protocol: 'tcp' }]);
         expect(s.ip).toBe('194.68.245.10');
+        // Not even as a key without a value.
+        expect(s.ports?.[0]).toStrictEqual({ privatePort: 8888, protocol: 'tcp' });
+        // A tcp port with an address but no public port yet is no address of the server's.
+        expect(toServer(pod({ runtime: { ports: [{ private: 22, public: null, ip: '194.68.245.10', type: 'tcp' }] } } as Partial<RunPodPod>)).ip).toBeUndefined();
     });
 
     it('billed from its last start while it is not stopped; a date RunPod garbles is no date', () => {
@@ -61,6 +79,12 @@ describe('RunPod pods', () => {
         expect(toServer(pod({ startedAt: at, createdAt: at })).billingStartedAt).toBe(Date.parse(at));
         expect(toServer(pod({ status: 'EXITED', startedAt: at })).billingStartedAt).toBeUndefined();
         expect(toServer(pod({ startedAt: 'soon', createdAt: 'yesterday' }))).toMatchObject({ billingStartedAt: undefined, createdAt: undefined });
+    });
+});
+
+describe('RunPod keys', () => {
+    it('a line of the key list this parser cannot read is no key (null): nothing addresses it', () => {
+        expect(toSSHKey('ssh-ed25519 not-base64! old-laptop')).toBeNull();
     });
 });
 

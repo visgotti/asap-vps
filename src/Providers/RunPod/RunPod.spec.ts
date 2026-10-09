@@ -18,6 +18,8 @@ import { RunPod } from './RunPod';
 const noSleep = async () => {};
 const fast = { intervalMs: 0, timeoutMs: 5000 };
 const last = <T>(a: T[]): T | undefined => a[a.length - 1];
+/** An answer as RunPod's API (or a worker) sends one: JSON, with its status. */
+const answer = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
 describe('RunPod', () => {
     const make = (cloud?: 'SECURE' | 'COMMUNITY') => {
@@ -149,6 +151,33 @@ describe('RunPod', () => {
         await expect(p.restartServer(s.id)).rejects.toThrow(/409/);
     });
 
+    it('starting a pod RunPod does not have is a NotFoundError, and no action is sent', async () => {
+        const { p, fake } = make();
+        const e = await p.startServer('pod_gone').catch((x) => x);
+        expect([e.constructor.name, e.message]).toEqual(['NotFoundError', 'runpod: pod pod_gone not found']);
+        expect(fake.calls.filter((c) => c.method === 'POST')).toEqual([]);
+    });
+
+    it('only a 409 means an action is done already, and only when the pod is where the action would put it', async () => {
+        const fake = fakeRunPod();
+        // A key that may read but not act: RunPod answers its actions 403.
+        let readOnly = false;
+        const p = new RunPod({ apiKey: 'rp-test', sleep: noSleep, fetchImpl: (async (url: string, init?: RequestInit) => (readOnly && init?.method === 'POST' && /\/action$/.test(new URL(url).pathname)
+            ? answer(403, { title: 'Forbidden', status: 403, detail: 'this API key cannot act on pods' }) : fake.fetchImpl(url, init))) as typeof fetch });
+        const s = await p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: 'img' });
+        await p.waitUntilRunning(s.id, fast);
+        await p.stopServer(s.id);
+        readOnly = true;
+        // Stopped already, but the key is told it cannot act.
+        const refused = await p.stopServer(s.id).catch((x) => x);
+        expect([refused?.constructor.name, refused?.status]).toEqual(['AuthError', 403]);
+        readOnly = false;
+        // A stop of a pod in ERROR: RunPod's 409, and the pod is not stopped.
+        fake.state.pods.get(s.id).status = 'ERROR';
+        const stuck = await p.stopServer(s.id).catch((x) => x);
+        expect([stuck?.constructor.name, stuck?.message]).toEqual(['ProviderError', `runpod: POST /v2/pods/${s.id}/action -> 409 cannot stop a pod that is ERROR`]);
+    });
+
     it('adds a key by writing the whole list back, once', async () => {
         const { p, fake } = make();
         const pub = testPublicKey('me');
@@ -234,6 +263,40 @@ describe('RunPod', () => {
         await expect(p.deleteSSHKey('nope')).resolves.toBe(false);
     });
 
+    it('a write RunPod refuses is not sent again; one it fails with any server error is, each time from a fresh read', async () => {
+        for (const [status, writes, waits] of [[422, 1, []], [500, 3, [1000, 2000]]] as const) {
+            const fake = fakeRunPod();
+            let sent = 0;
+            const failing = (async (url: string | URL | Request, init?: RequestInit) => (init?.method === 'PUT' && ++sent
+                ? answer(status, { title: 'Error', status, detail: 'refused' }) : fake.fetchImpl(url, init))) as typeof fetch;
+            const slept: number[] = [];
+            const p = new RunPod({ apiKey: 'rp-test', fetchImpl: failing, sleep: async (ms) => void slept.push(ms) });
+            await expect(p.addSSHKey(testPublicKey('k'), 'k')).rejects.toMatchObject({ status });
+            expect([status, sent, slept]).toEqual([status, writes, waits]);
+        }
+    });
+
+    it('a key added with no name is its bare line', async () => {
+        const { p, fake } = make();
+        const pub = testPublicKey('its-own-comment');
+        const bare = pub.split(' ').slice(0, 2).join(' ');
+        const k = await p.addSSHKey(pub, '');
+        expect(fake.state.keys).toEqual([bare]);
+        expect([k.publicKey, k.name]).toEqual([bare, '']);
+    });
+
+    it('a line of the key list this parser cannot read is left out of the list, and kept on the account', async () => {
+        const { p, fake } = make();
+        // A line RunPod's pattern takes, whose key is not base64.
+        const odd = 'ssh-ed25519 not-base64! old-laptop';
+        const laptop = testPublicKey('laptop');
+        fake.state.keys = [odd, laptop];
+        expect((await p.listSSHKeys()).map((k) => k.name)).toEqual(['laptop']);
+        const added = await p.addSSHKey(testPublicKey('new'), 'new');
+        expect(await p.deleteSSHKey(added.id)).toBe(true);
+        expect(fake.state.keys).toEqual([odd, laptop]);
+    });
+
     it('reads log lines from the event stream, dropping a partial event', () => {
         const sse = 'id: 1\ndata: {"ts":"t","source":"container","line":"ready"}\n\nid: 2\ndata: {"line":"hal';
         expect(sseLogLines(sse)).toEqual(['ready']);
@@ -290,6 +353,8 @@ describe('RunPod API facts', () => {
     it('pods take no UDP: refused before anything is sent', async () => {
         const { p, fake } = make();
         await expect(p.createServer({ name: 'u', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['9000/udp'] })).rejects.toBeInstanceOf(NotSupportedError);
+        await expect(p.createServer({ name: 'u', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8080/tcp', '9000/UDP'] }))
+            .rejects.toThrow(/^runpod: createServer option "ports" with udp is not supported$/);
         expect(created(fake)).toHaveLength(0);
     });
 
@@ -304,6 +369,14 @@ describe('RunPod API facts', () => {
         expect(running.ssh).toEqual({ host: '194.68.245.10', port: 40022, username: 'root' });
         await p.createServer({ name: 'ssh2', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['22/tcp'], sshKeyIds: [key.id] });
         expect(created(fake)[1].body.ports).toEqual(['22/tcp']);
+        // Added to no ports at all, and to a port that only ends in 22; not to 22/tcp among others.
+        const ports = async (asked?: string[]) => {
+            await p.createServer({ name: 'ssh3', offer: 'NVIDIA RTX A5000', image: 'img', ...(asked ? { ports: asked } : {}), sshKeyIds: [key.id] });
+            return last(created(fake))?.body.ports;
+        };
+        expect(await ports()).toEqual(['22/tcp']);
+        expect(await ports(['8022/tcp'])).toEqual(['8022/tcp', '22/tcp']);
+        expect(await ports(['22/tcp', '8888/http'])).toEqual(['22/tcp', '8888/http']);
     });
 
     it('sshKeyIds authorize exactly those keys (RunPod would put every account key there), and an unknown id is refused', async () => {
@@ -317,6 +390,10 @@ describe('RunPod API facts', () => {
         await expect(p.createServer({ name: 'k3', offer: 'NVIDIA RTX A5000', image: 'img', sshKeyIds: [mine.id], env: { PUBLIC_KEY: 'x' } }))
             .rejects.toThrow(/not both/);
         expect(created(fake)).toHaveLength(1);
+        // Several keys: one a line, as authorized_keys holds them.
+        const other = await p.addSSHKey(testPublicKey('ci2'), 'ci2');
+        await p.createServer({ name: 'k4', offer: 'NVIDIA RTX A5000', image: 'img', sshKeyIds: [mine.id, other.id] });
+        expect(last(created(fake))?.body.env).toEqual({ PUBLIC_KEY: `${mine.publicKey}\n${other.publicKey}` });
     });
 
     it('an http port\'s address is RunPod\'s proxy network, never the server\'s ip', async () => {
@@ -334,7 +411,9 @@ describe('RunPod API facts', () => {
         const s = await p.createServer({ name: 'r', offer: 'NVIDIA RTX A5000', image: 'img' });
         await p.waitUntilRunning(s.id, fast);
         await p.stopServer(s.id);
-        await expect(p.startServer(s.id)).rejects.toBeInstanceOf(CapacityError);
+        const e = await p.startServer(s.id).catch((x) => x);
+        expect(e).toBeInstanceOf(CapacityError);
+        expect(e.message).toBe(`runpod: pod ${s.id} resumed without a GPU (its host has none free now): stopped it again`);
         expect(fake.state.pods.get(s.id).status).toBe('EXITED');
     });
 
@@ -360,6 +439,97 @@ describe('RunPod API facts', () => {
         const e = await q.restartServer('pod_x').catch((x) => x);
         expect(e).toBeInstanceOf(ProviderError);
         expect(e).not.toBeInstanceOf(CapacityError);
+    });
+
+    it('a host with no GPU free is no capacity however RunPod words it: one GPU or several, "not enough free" or "no free/available"', async () => {
+        let detail = '';
+        const { p } = make({}, undefined, (f) => (async (url: string, init?: RequestInit) => (init?.method === 'POST' && new URL(url).pathname.endsWith('/action')
+            ? answer(400, { title: 'Bad Request', status: 400, detail }) : f(url, init))) as typeof fetch);
+        for (detail of ['not enough free GPU on the host machine', 'no free GPU on this host', 'no available GPUs']) {
+            const e = await p.restartServer('pod_x').catch((x) => x);
+            expect([detail, e.constructor.name]).toEqual([detail, 'CapacityError']);
+        }
+    });
+
+    it('the log stream stays open: the window closing ends the read with what arrived; a stream that breaks before is a retriable error', async () => {
+        // An open stream, as RunPod's is: fetch errors the body when its request is aborted (the Fetch standard's "abort fetch").
+        let breaks = false;
+        const { p } = make({}, undefined, (f) => (async (url: string, init?: RequestInit) => {
+            if (!new URL(url).pathname.endsWith('/logs')) return f(url, init);
+            const signal = init?.signal;
+            const body = new ReadableStream<Uint8Array>({
+                start(c) {
+                    c.enqueue(new TextEncoder().encode('data: {"source":"container","line":"ready"}\n\n'));
+                    if (breaks) c.error(new TypeError('terminated'));
+                    signal?.addEventListener('abort', () => c.error(signal.reason));
+                },
+            });
+            return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+        }) as typeof fetch);
+        const s = await p.createServer({ name: 'logs', offer: 'NVIDIA RTX A5000', image: 'img' });
+        expect(await p.getServerLogs(s.id, { windowMs: 20 })).toBe('ready');
+        breaks = true;
+        const e = await p.getServerLogs(s.id, { windowMs: 5000 }).catch((x) => x);
+        expect([e.constructor.name, e.message, e.retriable, e.cause?.constructor.name, e.cause?.message])
+            .toEqual(['ProviderError', `runpod: logs of pod ${s.id}: terminated`, true, 'TypeError', 'terminated']);
+    });
+
+    it('a log read RunPod fails with a body that is not JSON, or is cut off, is its failure all the same', async () => {
+        let body: () => BodyInit = () => 'upstream connect error';
+        const { p } = make({}, undefined, (f) => (async (url: string, init?: RequestInit) => (new URL(url).pathname.endsWith('/logs')
+            ? new Response(body(), { status: 503, headers: { 'content-type': 'text/plain' } }) : f(url, init))) as typeof fetch);
+        const s = await p.createServer({ name: 'logs', offer: 'NVIDIA RTX A5000', image: 'img' });
+        const read = `runpod: GET /v2/pods/${s.id}/logs?source=container&tail=1000 -> 503`;
+        const e = await p.getServerLogs(s.id).catch((x) => x);
+        expect([e.constructor.name, e.message, e.status, e.retriable]).toEqual(['ProviderError', `${read} upstream connect error`, 503, true]);
+        body = () => new ReadableStream({ start: (c) => c.error(new TypeError('terminated')) });
+        const cut = await p.getServerLogs(s.id).catch((x) => x);
+        expect([cut.constructor.name, cut.message, cut.status, cut.retriable]).toEqual(['ProviderError', `${read} `, 503, true]);
+    });
+
+    it('a refusal is read by its status first: a rate limit or server error stays one (retriable when a read outlasts its retries), whatever its text says; a 403 means "this pool" only at a pod\'s create', async () => {
+        let refuse: (method: string, path: string) => Response | undefined = () => undefined;
+        const { p } = make({}, undefined, (f) => (async (url: string, init?: RequestInit) => refuse(init?.method ?? 'GET', new URL(url).pathname) ?? f(url, init)) as typeof fetch);
+        const s = await p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: 'img' });
+        const failure = async (what: Promise<unknown>) => {
+            const e = await what.then(() => undefined, (x: ProviderError) => x);
+            return [e?.constructor.name, e?.status, e?.retriable];
+        };
+        for (const status of [429, 500]) {
+            refuse = (m, path) => (path === '/v2/network-volumes' ? answer(status, { title: 'Error', status, detail: 'try again later' }) : undefined);
+            expect([status, ...await failure(p.listVolumes())]).toEqual([status, 'ProviderError', status, true]);
+        }
+        // Words that read like "not found" or "no capacity", in a server error (one sent once: a create, an action), say nothing of either.
+        refuse = (m, path) => (m === 'POST' && path === '/v2/pods' ? answer(500, { title: 'Error', status: 500, detail: 'dial tcp: lookup scheduler: no such host' }) : undefined);
+        expect(await failure(p.createServer({ name: 'y', offer: 'NVIDIA RTX A5000', image: 'img' }))).toEqual(['ProviderError', 500, false]);
+        refuse = (m, path) => (m === 'POST' && path.endsWith('/action') ? answer(500, { title: 'Error', status: 500, detail: 'not enough free GPUs on the host machine' }) : undefined);
+        expect(await failure(p.restartServer(s.id))).toEqual(['ProviderError', 500, false]);
+        // A read-only key, refused a volume.
+        refuse = (m, path) => (m === 'POST' && path === '/v2/network-volumes' ? answer(403, { title: 'Forbidden', status: 403, detail: 'read-only API key' }) : undefined);
+        expect(await failure(p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 10 }))).toEqual(['AuthError', 403, false]);
+    });
+
+    it('an answer that leaves out its rows, or its pages, reads as none: nothing made up, no crash', async () => {
+        // What each read's answer is left without.
+        let strip: (path: string, body: any) => void = () => undefined;
+        const { p } = make({}, undefined, (f) => (async (url: string, init?: RequestInit) => {
+            const r = await f(url, init);
+            if ((init?.method ?? 'GET') !== 'GET' || r.status !== 200) return r;
+            const body = await r.json();
+            strip(new URL(url).pathname + new URL(url).search, body);
+            return answer(200, body);
+        }) as typeof fetch);
+        strip = (path, body) => ['pods', 'endpoints', 'networkVolumes', 'pagination'].forEach((k) => delete body[k]);
+        expect(await p.listServers()).toEqual([]);
+        expect(await p.listEndpoints()).toEqual([]);
+        expect(await p.listVolumes()).toEqual([]);
+        // The CPU catalog without its flavors; then a vCPU count's stock without them.
+        for (const perCount of [false, true]) {
+            strip = (path, body) => {
+                if (path.startsWith('/v2/catalog/cpus') && path.includes('vcpuCount=') === perCount) delete body.cpus;
+            };
+            expect([perCount, await p.listOffers({ kind: 'cpu' }), await p.listEndpointOffers({ kind: 'cpu' })]).toEqual([perCount, [], []]);
+        }
     });
 
     it('logs: the container\'s own lines (not RunPod\'s), the last `tail` of them, at most 5000; a refused key is an AuthError', async () => {
@@ -391,6 +561,9 @@ describe('RunPod API facts', () => {
         expect(e).toBeInstanceOf(ProviderError);
         expect(e).not.toBeInstanceOf(CapacityError);
         expect(e.message).toMatch(/additional properties 'bogus' not allowed/);
+        // Every reason, in RunPod's order.
+        const two = await p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: 'img', providerOptions: { bogus: 1, other: 2 } }).catch((x) => x);
+        expect(two.message).toBe("runpod: POST /v2/pods -> 422 Request validation failed. ($: additional properties 'bogus' not allowed; $: additional properties 'other' not allowed)");
     });
 
     it('sizes go as whole GB (the API takes integers)', async () => {
@@ -502,9 +675,12 @@ describe('RunPod network volumes and registry logins', () => {
         const other = await p.createVolume({ name: 'more', region: 'US-TX-3', sizeGb: 10 });
         const o = { name: 'x', offer, image: IMAGE };
         await expect(p.createServer({ ...o, mounts: [{ volume: vol }, { volume: other }] })).rejects.toThrow(NotSupportedError);
+        await expect(p.createServer({ ...o, mounts: [{ volume: vol }, { volume: other }] }))
+            .rejects.toThrow(/^runpod: createServer option "mounts" with more than one volume \(a pod mounts one network volume\) is not supported$/);
         await expect(p.createServer({ ...o, mounts: [{ volume: vol }], volume: { sizeGb: 20, path: '/data' } })).rejects.toThrow(/"mounts" and "volume"/);
         await expect(p.createServer({ ...o, mounts: [{ volume: vol, path: 'models' }] })).rejects.toThrow(/not absolute/);
         await expect(p.createServer({ ...o, mounts: [{ volume: 'vol_missing' }] })).rejects.toThrow(NotFoundError);
+        await expect(p.createServer({ ...o, mounts: [{ volume: 'vol_missing' }] })).rejects.toThrow(/^runpod: no network volume vol_missing$/);
         await expect(p.createServer({ ...o, region: 'EU-RO-1', mounts: [{ volume: vol.id }] })).rejects.toThrow(/is in US-TX-3/);
         expect(podBodies(fake)).toEqual([]);
     });
@@ -513,6 +689,8 @@ describe('RunPod network volumes and registry logins', () => {
         const { fake, p } = make();
         await expect(p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 9 })).rejects.toThrow(/10-4096 GB, not 9/);
         await expect(p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 4097 })).rejects.toThrow(/10-4096 GB/);
+        // The bounds themselves are sizes RunPod takes.
+        expect((await p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 4096 })).sizeGb).toBe(4096);
         await expect(p.createVolume({ name: 'v', region: 'XX-NOWHERE-1', sizeGb: 10 })).rejects.toThrow(ProviderError);
         const fast = await p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 100, providerOptions: { type: 'HIGH_PERFORMANCE' } });
         expect(fast.raw).toMatchObject({ size: 100, type: 'HIGH_PERFORMANCE', dataCenter: 'US-TX-3' });
@@ -571,6 +749,28 @@ describe('RunPod network volumes and registry logins', () => {
         const bad = new RunPod({ apiKey: 'rp-test', fetchImpl: (async (url: string, init?: RequestInit) => (init?.method === 'POST' && String(url).endsWith('/v2/registries')
             ? new Response(JSON.stringify({ title: 'Error', status: 400, detail: 'registry name taken by nobody' }), { status: 400 }) : fake.fetchImpl(url, init))) as typeof fetch, sleep: noSleep });
         await expect(bad.createServer({ name: 'c', offer, image: 'ghcr.io/acme/worker:1', registryAuth: { username: 'v', password: 'w' } })).rejects.toThrow(/taken by nobody/);
+    });
+
+    it('a 409 to storing a login is that race too; a server error is thrown, and the login it stored serves the next create', async () => {
+        const fake = fakeRunPod();
+        // Each POST /v2/registries stores the login, then is answered `status` (409: another create stored it just before; 500: it took, and the answer failed).
+        let status: number | undefined = 409;
+        const fetchImpl = (async (url: string, init?: RequestInit) => {
+            if (!status || init?.method !== 'POST' || !String(url).endsWith('/v2/registries')) return fake.fetchImpl(url, init);
+            const body = JSON.parse(String(init.body));
+            fake.state.registries.set(`reg_${status}`, { id: `reg_${status}`, name: body.name, username: body.username, password: body.password });
+            return answer(status, { title: 'Error', status, detail: status === 409 ? 'a registry with this name already exists' : 'internal error' });
+        }) as typeof fetch;
+        const p = new RunPod({ apiKey: 'rp-test', fetchImpl, sleep: noSleep });
+        const [offer] = await p.listOffers();
+        const create = (name: string, username: string) => p.createServer({ name, offer, image: 'ghcr.io/acme/worker:1', registryAuth: { username, password: 'p' } });
+        expect((await create('a', 'u')).raw.registry).toBe('reg_409');
+        status = 500;
+        const e = await create('b', 'v').catch((x) => x);
+        expect([e.constructor.name, e.status]).toEqual(['ProviderError', 500]);
+        status = undefined;
+        expect((await create('c', 'v')).raw.registry).toBe('reg_500');
+        expect([...fake.state.registries.keys()].sort()).toEqual(['reg_409', 'reg_500']);
     });
 
     it('registryAuth or providerOptions.registry, not both', async () => {
@@ -654,6 +854,54 @@ describe('RunPod serverless: load-balancing endpoints (plain HTTP workers, no Ru
         expect((await p.listEndpointOffers({ includeUnavailable: true })).map((o) => o.id)).toContain('NVIDIA L4');
     });
 
+    it('each kind reads only its own catalog, and a CPU flavor is offered only at the vCPU counts it is rented in', async () => {
+        const { fake, p } = make();
+        const read = async (kind: 'cpu' | 'gpu') => {
+            const before = fake.calls.length;
+            const ids = (await p.listEndpointOffers({ kind, includeUnavailable: true })).map((o) => o.id).sort();
+            return { ids, catalogs: [...new Set(fake.calls.slice(before).map((c) => c.path.split('?')[0]))] };
+        };
+        expect(await read('cpu')).toEqual({ ids: ['cpu3c:16', 'cpu3c:2', 'cpu3c:32', 'cpu3c:4', 'cpu3c:8', 'cpu5g:4', 'cpu5g:8'], catalogs: ['/v2/catalog/cpus'] });
+        expect((await read('gpu')).catalogs).toEqual(['/v2/catalog/gpus']);
+    });
+
+    it('workers equally cheap are listed fewest vCPUs first, whatever order RunPod lists its flavors in', async () => {
+        // Two flavors, the bigger first: cpuA at 8 vCPUs costs what cpuB does at 4.
+        const flavors = [
+            { id: 'cpuA', name: 'A', group: 'Gen 5', vcpu: { min: 8, max: 8 }, ramGbPerVcpu: 2, price: { securePerVcpu: 0.02, serverlessPerVcpu: 0.01 } },
+            { id: 'cpuB', name: 'B', group: 'Gen 5', vcpu: { min: 2, max: 4 }, ramGbPerVcpu: 2, price: { securePerVcpu: 0.04, serverlessPerVcpu: 0.02 } },
+        ];
+        const catalog = (async () => answer(200, { cpus: flavors.map((c) => ({ ...c, availability: 'HIGH', dataCenters: [{ id: 'US-TX-3', availability: 'HIGH' }] })) })) as typeof fetch;
+        const p = new RunPod({ apiKey: 'rp-test', fetchImpl: catalog, sleep: noSleep });
+        expect((await p.listEndpointOffers({ kind: 'cpu' })).map((o) => [o.id, o.pricePerHour])).toEqual([['cpuB:2', 0.04], ['cpuB:4', 0.08], ['cpuA:8', 0.08]]);
+    });
+
+    it('with no offer named and nothing in stock, an endpoint is no capacity, and nothing is sent', async () => {
+        const fake = fakeRunPod();
+        // Every data center of both catalogs out of stock.
+        const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+            const r = await fake.fetchImpl(url, init);
+            if (!new URL(String(url)).pathname.startsWith('/v2/catalog/')) return r;
+            const body = await r.json();
+            for (const t of [...(body.gpus ?? []), ...(body.cpus ?? [])]) for (const d of t.dataCenters ?? []) d.availability = 'NONE';
+            return answer(200, body);
+        }) as typeof fetch;
+        const p = new RunPod({ apiKey: 'rp-test', fetchImpl, sleep: noSleep });
+        const e = await p.createEndpoint({ name: 'none', container: WHOAMI }).catch((x) => x);
+        expect([e.constructor.name, e.message]).toEqual(['CapacityError', 'runpod: no serverless worker of any kind is in stock right now']);
+        expect(posts(fake)).toEqual([]);
+    });
+
+    it('takes the bounds as they are (ports 1 and 65535, PORT and PORT_HEALTH equal to the port, as many workers at least as at most, idle timeouts of 1 and 3600 s); a region is where the workers run', async () => {
+        const { fake, p } = make();
+        const e = await p.createEndpoint({ name: 'top', container: { ...WHOAMI, env: { PORT: '65535', PORT_HEALTH: '65535' } }, offer: 'cpu3c:2', port: 65535,
+            minWorkers: 2, maxWorkers: 2, idleTimeoutSeconds: 3600, region: 'US-TX-3' });
+        expect(posts(fake).pop()).toMatchObject({ env: { PORT: '65535', PORT_HEALTH: '65535' }, ports: ['65535/http'], workers: { min: 2, max: 2, idleTimeout: 3600 }, dataCenterIds: ['US-TX-3'] });
+        expect(e).toMatchObject({ port: 65535, minWorkers: 2, maxWorkers: 2, idleTimeoutSeconds: 3600, region: 'US-TX-3' });
+        await p.createEndpoint({ name: 'low', container: WHOAMI, offer: 'cpu3c:2', port: 1, idleTimeoutSeconds: 1 });
+        expect(posts(fake).pop()).toMatchObject({ ports: ['1/http'], workers: { min: 0, max: 1, idleTimeout: 1 } });
+    });
+
     it('a CPU endpoint: the image serves HTTP on its port (PORT, PORT_HEALTH and an http port set), scaling on requests from zero', async () => {
         const { fake, p } = make();
         const e = await p.createEndpoint({ name: 'whoami', container: { ...WHOAMI, env: { GREETING: 'hi' }, command: ['--port', '80'] }, offer: 'cpu3c:2', idleTimeoutSeconds: 5 });
@@ -704,8 +952,19 @@ describe('RunPod serverless: load-balancing endpoints (plain HTTP workers, no Ru
             [{ name: 'x', container: WHOAMI, offer: 'cpu3c:2', port: 70000 }, /bad port/],
             [{ name: 'x', container: WHOAMI, offer: 'NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb' }, /in no serverless pool/],
             [{ name: 'x', container: WHOAMI, offer: 'NVIDIA H200' }, /no GPU type "NVIDIA H200"/],
+            [{ name: 'x', container: WHOAMI, offer: 'cpu3c:2', port: 0 }, /^runpod: bad port 0$/],
+            [{ name: 'x', container: WHOAMI, offer: 'cpu3c:2', port: 80.5 }, /^runpod: bad port 80\.5$/],
+            [{ name: 'x', container: WHOAMI, offer: 'cpu3c:2', port: 65536 }, /^runpod: bad port 65536$/],
+            [{ name: 'x', container: { ...WHOAMI, env: { PORT_HEALTH: '9000' } }, offer: 'cpu3c:2' }, /^runpod: env\.PORT_HEALTH is the endpoint's port: pass port \(9000\), not env\.PORT_HEALTH$/],
+            [{ name: 'x', container: WHOAMI, offer: 'cpu3c:2', minWorkers: -1 }, /^runpod: workers: 0 <= minWorkers <= maxWorkers, maxWorkers >= 1 \(not -1 and 1\)$/],
+            [{ name: 'x', container: WHOAMI, offer: 'cpu3c:2', minWorkers: 0.5 }, /^runpod: workers: 0 <= minWorkers <= maxWorkers, maxWorkers >= 1 \(not 0\.5 and 1\)$/],
+            [{ name: 'x', container: WHOAMI, offer: 'cpu3c:2', idleTimeoutSeconds: 3601 }, /^runpod: idleTimeoutSeconds is 1-3600, not 3601$/],
+            [{ name: 'x', container: WHOAMI, offer: 'cpu3c:6' }, /^runpod: a serverless CPU worker has a power-of-two vCPU count from 2, not 6$/],
+            [{ name: 'x', container: { ...WHOAMI, registryAuth: { username: 'u', password: 'p' } }, offer: 'cpu3c:2', providerOptions: { registry: 'reg_1' } },
+                /^runpod: pass registryAuth or providerOptions\.registry, not both$/],
         ];
         for (const [o, why] of refused) await expect(p.createEndpoint(o)).rejects.toThrow(why);
+        expect(fake.state.registries.size).toBe(0);
         const theirs = { ...(await p.listEndpointOffers())[0], provider: 'vast' };
         await expect(p.createEndpoint({ name: 'x', container: WHOAMI, offer: theirs })).rejects.toThrow(/vast's, not runpod's/);
         expect(posts(fake)).toEqual([]);
@@ -722,10 +981,38 @@ describe('RunPod serverless: load-balancing endpoints (plain HTTP workers, no Ru
         expect(sent.every((c) => c.auth === 'Bearer rp-test' && c.headers?.['x-trace'] === 't1')).toBe(true);
         // By id too; a record whose url says elsewhere is still sent to RunPod's host, made from its id.
         expect((await p.requestEndpoint(e.id, 'api', { intervalMs: 0 })).status).toBe(200);
+        // A path without its slash is given one.
+        expect(await (await p.requestEndpoint(e.id, 'api?y=2', { intervalMs: 0 })).json()).toMatchObject({ path: '/api', query: '?y=2' });
         await p.requestEndpoint({ ...e, url: 'https://evil.example.com' }, '/api', { intervalMs: 0 });
         expect(fake.calls.some((c) => c.host === 'evil.example.com')).toBe(false);
         await expect(p.requestEndpoint('../x', '/api')).rejects.toThrow(/bad endpoint id/);
+        // An id that would put another host in the URL is refused before anything is sent.
+        await expect(p.requestEndpoint('evil.example.com?', '/api')).rejects.toThrow(/^runpod: bad endpoint id "evil\.example\.com\?"$/);
+        expect(fake.calls.some((c) => c.host === 'evil.example.com')).toBe(false);
         await expect(p.requestEndpoint({ ...e, provider: 'scaleway' }, '/api')).rejects.toThrow(/scaleway's, not runpod's/);
+    });
+
+    it('only RunPod\'s cold answers are waited out (502-504, and a 400 that says no worker is available); any other answer is the workers\' own', async () => {
+        const fake = fakeRunPod({ coldRequests: 0 });
+        // What the workers' host answers next, before the fake's warm worker does.
+        let script: Response[] = [];
+        let sent = 0;
+        const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+            if (!new URL(String(url)).host.endsWith('.api.runpod.ai')) return fake.fetchImpl(url, init);
+            sent++;
+            return script.shift() ?? fake.fetchImpl(url, init);
+        }) as typeof fetch;
+        const p = new RunPod({ apiKey: 'rp-test', fetchImpl, sleep: noSleep });
+        const e = await p.createEndpoint({ name: 'w', container: WHOAMI, offer: 'cpu3c:2' });
+        const request = async (answers: Response[]) => {
+            [script, sent] = [answers, 0];
+            const r = await p.requestEndpoint(e, '/api', { intervalMs: 0 });
+            return [r.status, sent];
+        };
+        expect(await request([502, 503, 504].map((status) => new Response('', { status })))).toEqual([200, 4]);
+        // The workers' own refusal, and an answer of theirs that happens to say the words.
+        expect(await request([answer(400, { error: 'bad prompt' })])).toEqual([400, 1]);
+        expect(await request([answer(200, { status: 'no workers available in the job pool' })])).toEqual([200, 1]);
     });
 
     it('a redirect from the workers is answered, never followed: nothing of the request goes where it points', async () => {
