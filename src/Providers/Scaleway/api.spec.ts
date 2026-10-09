@@ -448,6 +448,18 @@ describe('servers', () => {
         expect(await api.getServer('nl-ams-1', s.id)).toBeNull();
     });
 
+    it('a stopped server\'s one local volume that will not delete is named alone, with the failure that kept it', async () => {
+        const { fake, api } = await made();
+        const s = await api.launchServer('nl-ams-1', launching('one-disk', true));
+        await stop(api, 'nl-ams-1', s.id);
+        const local = Object.values((await api.getServer('nl-ams-1', s.id))!.volumes)[0].id;
+        fake.intercept((r) => r.method === 'DELETE' && r.path === `/instance/v1/zones/nl-ams-1/volumes/${local}`, { answer: () => json(500, { message: 'internal error' }) });
+        await expect(api.deleteServer('nl-ams-1', s.id)).rejects.toMatchObject({
+            name: 'ProviderError', code: 'left_behind',
+            message: `scaleway: server nl-ams-1/${s.id} is deleted, but its local volume ${local} is not: it bills until deleted (scaleway: DELETE /instance/v1/zones/nl-ams-1/volumes/${local} -> 500 internal error)`,
+        });
+    });
+
     it('a stopped server has no terminate: it is deleted as it is, and the volumes it keeps are deleted too (local ones through the Instance API, Block Storage ones through their own)', async () => {
         const { fake, api } = await made();
         const before = fake.liveVolumes();

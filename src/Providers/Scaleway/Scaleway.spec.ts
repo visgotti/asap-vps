@@ -8,6 +8,9 @@
 // volumes, which then bill until deleted; poweroff releases the GPU; images are
 // zone-bound snapshots; SSH keys belong to a Project.
 
+import { mkdtempSync, readdirSync, rmSync } from 'fs';
+import * as os from 'os';
+import { join } from 'path';
 import { ICompute, requireCapability, supports } from '../../capabilities';
 import { sshKeyFingerprint } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
@@ -215,6 +218,10 @@ describe('Scaleway createServer', () => {
         const [none, big, odd] = creates(fake).map((c) => c.body.volumes);
         expect(none).toBeUndefined();
         expect(big).toEqual({ 0: { volume_type: 'sbs_volume', size: 100_000_000_000 } });
+        // A root volume made for the server is its own: no tag names it as the caller's.
+        expect(creates(fake)[1].body).toEqual({
+            name: 'big', commercial_type: 'L4-1-24G', image: GPU_IMAGE, project: FAKE_SCALEWAY_PROJECT, dynamic_ip_required: true, boot_type: 'local', protected: false, volumes: big,
+        });
         expect(odd[0].size % 512).toBe(0);
         expect(odd[0].size).toBeGreaterThan(20_499_999_000);
         expect(odd[0].size).toBeLessThan(20_500_001_000);
@@ -250,7 +257,7 @@ describe('Scaleway createServer', () => {
     it('needs a zone (the offer\'s first with stock, or the one given), one that exists, and one of its own zones', async () => {
         const { p, fake } = make({}, { zones: 'fr-par-2,pl-waw-2' });
         await expect(p.createServer({ name: 'x', offer: 'L4-1-24G' })).rejects.toThrow(/needs a zone/);
-        await expect(p.createServer({ name: 'x', offer: 'L4-1-24G', region: 'fr-par-7' })).rejects.toThrow(/unknown Scaleway zone "fr-par-7"/);
+        await expect(p.createServer({ name: 'x', offer: 'L4-1-24G', region: 'fr-par-7' })).rejects.toThrow(/unknown Scaleway zone "fr-par-7" \(zones: fr-par-2, pl-waw-2\)$/);
         // A server in a zone this provider does not list would not be listed, deleted by a teardown, or found by a sweep.
         await expect(p.createServer({ name: 'x', offer: 'DEV1-S', region: 'nl-ams-1' })).rejects.toThrow(/not one of this provider's zones \(fr-par-2, pl-waw-2\)/);
         expect(creates(fake)).toHaveLength(0);
@@ -335,6 +342,7 @@ describe('Scaleway servers', () => {
         expect(e).toBeInstanceOf(ProviderError);
         expect(e).toMatchObject({ code: 'left_behind', retriable: false });
         expect(e.message).toContain(`block volume ${root}`);
+        expect(e.message).toContain(`is deleted, but its block volume ${root} is not: it bills until deleted`);
         expect(await p.getServer(s.id)).toBeNull();
         expect(fake.state.volumes.has(root)).toBe(true);
     });
@@ -489,7 +497,7 @@ describe('Scaleway stop, start, restart', () => {
         }
     });
 
-    it('a server that does not stop in ten minutes is reported as what it still is, not waited for forever', async () => {
+    it('a server that does not stop in ten minutes is reported as what it still is, not waited for forever, by a stop and by a start alike', async () => {
         // A clock the waits advance: ten minutes pass at once.
         let offset = 0;
         const real = Date.now.bind(Date);
@@ -499,6 +507,9 @@ describe('Scaleway stop, start, restart', () => {
             const p = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep: async (ms) => { offset += ms; } });
             const s = await running(p);
             await expect(p.stopServer(s.id)).rejects.toMatchObject({ code: 'timeout', message: expect.stringMatching(new RegExp(`timed out after 600 s waiting for server ${s.id} to stop: stopping`)) });
+            // Still stopping: a start waits as long for it to finish, says what it still is, and powers nothing on.
+            await expect(p.startServer(s.id)).rejects.toMatchObject({ code: 'timeout', message: `scaleway: timed out after 600 s waiting for server ${s.id} to finish stopping: stopping` });
+            expect(actions(fake)).toEqual(['poweron', 'poweroff']);
         } finally {
             clock.mockRestore();
         }
@@ -562,6 +573,27 @@ describe('Scaleway images', () => {
         expect(fake.state.images.get(second.id.split('/')[1]).creation_date <= fake.state.images.get(third.id.split('/')[1]).creation_date).toBe(true);
     });
 
+    it('the image it finds by name is the server\'s own of that name: a newer one of another server, or of another name, is not it', async () => {
+        const { p, fake, s } = await stopped({ noTaskHref: true });
+        const before = new Set(fake.state.images.keys());
+        // Made by the time it is looked for, and newer: the same name from another server, another name from this one.
+        const others: Array<[string, string, string]> = [
+            ['00000000-0000-4000-8000-0000000b0001', 'nightly', '00000000-0000-4000-8000-00000000dead'], ['00000000-0000-4000-8000-0000000b0002', 'weekly', s.id.split('/')[1]],
+        ];
+        fake.intercept(isBackup, {
+            after: () => {
+                for (const [id, name, from] of others) {
+                    fake.state.images.set(id, { id, name, arch: 'x86_64', from_server: from, organization: FAKE_SCALEWAY_PROJECT, project: FAKE_SCALEWAY_PROJECT, public: false,
+                        root_volume: null, extra_volumes: {}, state: 'available', tags: [], zone: 'pl-waw-2', creation_date: '2099-01-01T00:00:00Z', modification_date: '2099-01-01T00:00:00Z', left: 0 });
+                }
+            }, times: 1,
+        });
+        const image = await p.createImage(s.id, { name: 'nightly', ...fast });
+        const made = [...fake.state.images.keys()].filter((id) => !before.has(id) && !others.some(([other]) => other === id));
+        expect(made.map((id) => `pl-waw-2/${id}`)).toEqual([image.id]);
+        expect(image).toMatchObject({ name: 'nightly', status: 'available' });
+    });
+
     it('an image it cannot find is an error (the backup did not say which, and none is named so)', async () => {
         const { p, fake, s } = await stopped({ noTaskHref: true });
         fake.intercept(isBackup, { after: () => fake.state.images.clear() });
@@ -572,6 +604,7 @@ describe('Scaleway images', () => {
         const gone = await stopped();
         gone.fake.intercept(isBackup, { after: () => gone.fake.state.images.clear() });
         await expect(gone.p.createImage(gone.s.id, { name: 'gone', ...fast })).rejects.toBeInstanceOf(NotFoundError);
+        await expect(gone.p.createImage(gone.s.id, { name: 'gone', ...fast })).rejects.toThrow(/^scaleway: image pl-waw-2\/[0-9a-f-]{36} disappeared while it was made$/);
         const failed = await stopped({ imageFails: true });
         await expect(failed.p.createImage(failed.s.id, { name: 'failed', ...fast })).rejects.toThrow(/of server .* ended in an error/);
         // Nothing is left billing: the image that failed is deleted, its snapshots with it.
@@ -729,6 +762,7 @@ describe('Scaleway images', () => {
         raw.root_volume = null;
         await expect(p.copyImage(image.id, ['fr-par-2'], fast)).rejects.toThrow(/has no root volume/);
         await expect(p.copyImage('pl-waw-2/00000000-0000-4000-8000-0000000000ee', ['fr-par-2'], fast)).rejects.toBeInstanceOf(NotFoundError);
+        await expect(p.copyImage('pl-waw-2/00000000-0000-4000-8000-0000000000ee', ['fr-par-2'], fast)).rejects.toThrow(/^scaleway: no image pl-waw-2\/00000000-0000-4000-8000-0000000000ee$/);
         await expect(make().p.copyImage(image.id, ['fr-par-2'], fast)).rejects.toBeInstanceOf(NotFoundError);
     });
 
@@ -921,7 +955,9 @@ describe('Scaleway volumes (Block Storage)', () => {
         const { fake, p } = make();
         await expect(p.createVolume({ name: 'v', region: 'mars-1', sizeGb: 20 })).rejects.toThrow(/unknown Scaleway zone/);
         await expect(p.createVolume({ name: 'v', region: 'pl-waw-2', sizeGb: 0.5 })).rejects.toThrow(/at least 1 GB/);
-        await expect(make({}, { projectId: undefined }).p.createVolume({ name: 'v', region: 'pl-waw-2', sizeGb: 20 })).rejects.toMatchObject({ code: 'project_required' });
+        await expect(make({}, { projectId: undefined }).p.createVolume({ name: 'v', region: 'pl-waw-2', sizeGb: 20 })).rejects.toMatchObject({
+            code: 'project_required', message: 'scaleway: a Scaleway Project is needed to create a volume: pass projectId (SCW_DEFAULT_PROJECT_ID; the console shows it under Project settings)',
+        });
         fake.intercept((r) => r.method === 'GET' && /\/block\/v1\/zones\/pl-waw-2\/volumes\/[^/]+$/.test(r.path), { times: 1, answer: (r) => json(404, { type: 'not_found', message: `volume ${r.path} is not found` }) });
         await expect(volume(p)).rejects.toThrow(/disappeared while it was made/);
         fake.intercept((r) => r.method === 'GET' && /\/block\/v1\/zones\/pl-waw-2\/volumes\/[^/]+$/.test(r.path), { times: 1, answer: (r) => json(200, { ...blockVolume(fake, `x/${r.path.split('/').pop()}`), status: 'error' }) });
@@ -1002,6 +1038,8 @@ describe('Scaleway volumes (Block Storage)', () => {
         const o = { name: 'gpu', offer };
         const generic: ICompute = p;
         await expect(generic.createServer({ ...o, mounts: [{ volume: v, path: '/models' }] })).rejects.toThrow(NotSupportedError);
+        await expect(generic.createServer({ ...o, mounts: [{ volume: v, path: '/models' }] }))
+            .rejects.toThrow(/^scaleway: a mount path \(Scaleway attaches a volume as a disk: the server formats and mounts it\) is not supported$/);
         await expect(p.createServer({ ...o, mounts: [{ volume: 'models' }] })).rejects.toThrow(/is not a volume id/);
         await expect(p.createServer({ ...o, mounts: [{ volume: far.id.split('/')[1] }] })).rejects.toThrow(/no volume .* in pl-waw-2/);
         await expect(p.createServer({ ...o, region: 'pl-waw-2', mounts: [{ volume: far }] })).rejects.toThrow(/is in fr-par-2, not pl-waw-2/);
@@ -1092,15 +1130,35 @@ describe('Scaleway volumes attached to a server that runs (volumeAttach)', () =>
         expect(await p.getVolume(v.id)).toMatchObject({ status: 'available', serverIds: [] });
         expect((await p.getServer(s.id))!.raw.tags).toEqual([]);
         const detaches = () => fake.calls.filter((c) => c.method === 'POST' && /\/detach-volume$/.test(c.path)).length;
-        const sent = detaches();
+        const patches = () => fake.calls.filter((c) => c.method === 'PATCH').length;
+        const [sent, tagged] = [detaches(), patches()];
         await p.detachVolume(v.id, s.id, fast);
         await p.detachVolume(v.id, '00000000-0000-4000-8000-00000000dead', fast);
         await p.detachVolume('not-a-volume', s.id, fast);
-        expect(detaches()).toBe(sent);
+        // Neither detached nor tagged: nothing is sent, not even the tags it has.
+        expect([detaches(), patches()]).toEqual([sent, tagged]);
         // A stale tag (the volume detached by hand) is dropped.
         await p.api.setServerTags('pl-waw-2', s.id.split('/')[1], [`${MOUNT_TAG}${v.id.split('/')[1]}`, 'prod']);
         await p.detachVolume(v.id, s.id, fast);
         expect((await p.getServer(s.id))!.raw.tags).toEqual(['prod']);
+        // Detached, it takes its own tag with it, and only that: the server's others stay.
+        await p.attachVolume(v.id, s.id, fast);
+        expect((await p.getServer(s.id))!.raw.tags).toEqual(['prod', `${MOUNT_TAG}${v.id.split('/')[1]}`]);
+        await p.detachVolume(v.id, s.id, fast);
+        expect((await p.getServer(s.id))!.raw.tags).toEqual(['prod']);
+    });
+
+    it('a Block Storage volume named by its bare id is attached and detached without File Storage being asked: a key with no File Storage rights still does it', async () => {
+        const { fake, p } = make();
+        const s = await running(p);
+        const v = await volume(p);
+        // The key may not read File Storage (an IAM policy with Instances and Block Storage only).
+        fake.intercept((r) => r.path.startsWith('/file/'), { answer: () => json(403, { type: 'permissions_denied', message: 'insufficient permissions', details: [{ action: 'read', resource: 'file_storage' }] }) });
+        await p.attachVolume(v.id.split('/')[1], s.id, fast);
+        expect((await p.getServer(s.id))!.mounts).toEqual([{ volumeId: v.id }]);
+        await p.detachVolume(v.id.split('/')[1], s.id, fast);
+        expect(await p.getVolume(v.id)).toMatchObject({ status: 'available', serverIds: [] });
+        expect(fake.calls.filter((c) => c.path.startsWith('/file/'))).toEqual([]);
     });
 
     it('refuses an id that is not one, a volume of another zone, one the zone lacks, and one another server holds', async () => {
@@ -1189,6 +1247,17 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         expect((await p.listEndpoints()).map((e) => e.region).sort()).toEqual(['nl-ams', 'nl-ams', 'pl-waw', 'pl-waw']);
     });
 
+    it('a bare id is asked of each region in turn: one outside the first region is read, called and deleted by it', async () => {
+        const { fake, p } = make({}, { zones: ['fr-par-1', 'nl-ams-1'] });
+        const e = await p.createEndpoint({ name: 'amsterdam', container: WHOAMI, region: 'nl-ams', ...fast });
+        const bare = e.id.split('/')[1];
+        expect(await p.getEndpoint(bare)).toMatchObject({ id: `nl-ams/${bare}`, region: 'nl-ams' });
+        fake.state.containers.get(bare).cold = 0;
+        expect((await p.requestEndpoint(bare, '/', { intervalMs: 0 })).status).toBe(200);
+        await p.deleteEndpoint(bare, fast);
+        expect(await p.getEndpoint(e.id)).toBeNull();
+    });
+
     it('refuses what it cannot make before anything is sent', async () => {
         const { fake, p } = make();
         const refused: Array<[Parameters<Scaleway['createEndpoint']>[0], RegExp | typeof NotSupportedError]> = [
@@ -1197,22 +1266,44 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
             [{ name: 'X1', container: WHOAMI }, /2-34 lowercase letters/],
             [{ name: 'x', container: WHOAMI }, /2-34 lowercase letters/],
             [{ name: 'x1-', container: WHOAMI }, /2-34 lowercase letters/],
+            // The whole name: not only its end.
+            [{ name: 'Xy1', container: WHOAMI }, /^scaleway: endpoint name "Xy1": 2-34 lowercase letters, digits and dashes, a letter first, no dash last$/],
+            [{ name: 'a'.repeat(35), container: WHOAMI }, /^scaleway: endpoint name "a{35}": 2-34 lowercase letters/],
             [{ name: 'x1', container: { image: '' } }, /needs an image/],
             [{ name: 'x1', container: WHOAMI, port: 0 }, /bad port 0/],
+            [{ name: 'x1', container: WHOAMI, port: 65536 }, /^scaleway: bad port 65536$/],
             [{ name: 'x1', container: { ...WHOAMI, env: { PORT: '8080' } } }, /pass port \(8080\), not env\.PORT/],
             [{ name: 'x1', container: WHOAMI, minWorkers: 11, maxWorkers: 20 }, /minWorkers 0-10/],
             [{ name: 'x1', container: WHOAMI, maxWorkers: 201 }, /maxWorkers 1-200/],
             [{ name: 'x1', container: WHOAMI, minWorkers: 2, maxWorkers: 1 }, /min <= max/],
+            // Each bound on its own: a count below it, or one that is not whole.
+            [{ name: 'x1', container: WHOAMI, minWorkers: -1 }, /^scaleway: workers: minWorkers 0-10, maxWorkers 1-200, min <= max \(not -1 and 1\)$/],
+            [{ name: 'x1', container: WHOAMI, minWorkers: 0.5 }, /\(not 0\.5 and 1\)$/],
+            [{ name: 'x1', container: WHOAMI, maxWorkers: 0 }, /\(not 0 and 0\)$/],
+            [{ name: 'x1', container: WHOAMI, maxWorkers: 1.5 }, /\(not 0 and 1\.5\)$/],
             [{ name: 'x1', container: WHOAMI, offer: '2vcpu' }, /bad container size "2vcpu"/],
-            [{ name: 'x1', container: WHOAMI, region: 'us-east' }, /"us-east" is no Scaleway region/],
+            [{ name: 'x1', container: WHOAMI, region: 'us-east' }, /"us-east" is no Scaleway region \(fr-par, nl-ams, pl-waw, it-mil\) nor zone$/],
         ];
         for (const [o, why] of refused) await expect(p.createEndpoint({ ...o, ...fast })).rejects.toThrow(why);
+        // What Scaleway does not do is named.
+        await expect(p.createEndpoint({ name: 'x1', container: { ...WHOAMI, registryAuth: { username: 'u', password: 'p' } } }))
+            .rejects.toThrow(/^scaleway: createEndpoint option "container\.registryAuth" \(Scaleway pulls a public image, or one of the Project's own registry\) is not supported$/);
+        await expect(p.createEndpoint({ name: 'x1', container: WHOAMI, idleTimeoutSeconds: 60 }))
+            .rejects.toThrow(/^scaleway: createEndpoint option "idleTimeoutSeconds" \(Scaleway stops an idle instance after 15 minutes\) is not supported$/);
         const theirs = { ...(await p.listEndpointOffers())[0], provider: 'runpod' };
         await expect(p.createEndpoint({ name: 'x1', container: WHOAMI, offer: theirs })).rejects.toThrow(/runpod's, not scaleway's/);
         const custom = { ...(await p.listEndpointOffers())[0], id: 'big' };
         await expect(p.createEndpoint({ name: 'x1', container: WHOAMI, offer: custom })).rejects.toThrow(/bad container size "big"/);
-        await expect(make({}, { projectId: undefined }).p.createEndpoint({ name: 'x1', container: WHOAMI })).rejects.toThrow(/Project/);
+        await expect(make({}, { projectId: undefined }).p.createEndpoint({ name: 'x1', container: WHOAMI })).rejects.toThrow(/^scaleway: a Scaleway Project is needed to create an endpoint: pass projectId/);
         expect(containerCalls(fake)).toEqual([]);
+    });
+
+    it('takes the bounds themselves: 10 instances at least, 200 at most, as many at least as at most, port 65535', async () => {
+        const { fake, p } = make();
+        await p.createEndpoint({ name: 'least', container: WHOAMI, minWorkers: 10, maxWorkers: 10, ...fast });
+        await p.createEndpoint({ name: 'most', container: { ...WHOAMI, env: { PORT: '65535' } }, maxWorkers: 200, port: 65535, ...fast });
+        expect(fake.calls.filter((c) => c.method === 'POST' && /\/containers$/.test(c.path)).map((c) => [c.body.name, c.body.min_scale, c.body.max_scale, c.body.port]))
+            .toEqual([['least', 10, 10, 80], ['most', 0, 200, 65535]]);
     });
 
     it('a deploy that fails is thrown with Scaleway\'s message, and leaves nothing: the namespace goes, its container with it', async () => {
@@ -1222,6 +1313,12 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
             ['POST', '/containers/v1/regions/fr-par/namespaces'], ['POST', '/containers/v1/regions/fr-par/containers'], ['DELETE', '/containers/v1/regions/fr-par/namespaces/<id>'],
         ]);
         expect(await p.listEndpoints()).toEqual([]);
+        // A namespace that fails: thrown with Scaleway's message, naming it, and deleted too.
+        fake.intercept((r) => r.method === 'GET' && /\/namespaces\/[0-9a-f-]{36}$/.test(r.path), {
+            answer: (r) => json(200, { ...fake.state.namespaces.get(r.path.split('/').pop()!), status: 'error', error_message: 'namespace quota reached' }), times: 1,
+        });
+        await expect(p.createEndpoint({ name: 'nsfail', container: WHOAMI, ...fast })).rejects.toThrow(/^scaleway: namespace nsfail is error: namespace quota reached$/);
+        expect(fake.state.namespaces.size).toBe(0);
     });
 
     it('a deploy that fails, whose clean-up fails too, is thrown as the deploy\'s failure', async () => {
@@ -1259,6 +1356,7 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         fake.state.containers.get(e.id.split('/')[1]).public_endpoint = 'https://evil.example.com';
         await expect(p.requestEndpoint(e, '/')).rejects.toThrow(/answers on evil\.example\.com, not on a Scaleway host/);
         await expect(p.requestEndpoint('fr-par/00000000-0000-4000-8000-0000000000ff', '/')).rejects.toBeInstanceOf(NotFoundError);
+        await expect(p.requestEndpoint('fr-par/00000000-0000-4000-8000-0000000000ff', '/')).rejects.toThrow(/^scaleway: no endpoint fr-par\/00000000-0000-4000-8000-0000000000ff$/);
         await expect(p.requestEndpoint({ ...e, provider: 'runpod' }, '/')).rejects.toThrow(/runpod's, not scaleway's/);
     });
 
@@ -1371,6 +1469,28 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
         // The account's own (a production server's disk) aside.
         expect((await p.listVolumes()).filter((v) => ['scratch', 'models'].includes(v.name)).map((v) => [v.name, v.shared])).toEqual([['scratch', false], ['models', true]]);
         expect(block.shared).toBe(false);
+        // The Project's only: another Project's filesystem the key can read is not listed.
+        const theirs = '00000000-0000-4000-8000-0000000f0000';
+        fake.state.filesystems.set(theirs, { ...fake.state.filesystems.get(share.id.split('/')[1]), id: theirs, name: 'theirs', project_id: '22222222-2222-4222-8222-222222222222' });
+        expect((await p.listVolumes()).filter((v) => v.shared).map((v) => v.id)).toEqual([share.id]);
+    });
+
+    it('takes the bounds themselves: 25 GB and 50000 GB', async () => {
+        const { fake, p } = make();
+        expect([(await shareOf(p, 'smallest', 25)).sizeGb, (await shareOf(p, 'largest', 50000)).sizeGb]).toEqual([25, 50000]);
+        expect(fsCalls(fake).map(([, , body]) => body.size)).toEqual([25e9, 50000e9]);
+    });
+
+    it('a regional id of a region without File Storage names no filesystem, and is not asked for', async () => {
+        const { fake, p } = make();
+        const s = await running(p);
+        const before = fake.calls.length;
+        const amsterdam = 'nl-ams/00000000-0000-4000-8000-0000000000aa';
+        expect(await p.getVolume(amsterdam)).toBeNull();
+        await expect(p.deleteVolume(amsterdam)).resolves.toBeUndefined();
+        expect(fake.calls).toHaveLength(before);
+        await expect(p.attachVolume(amsterdam, s.id, fast)).rejects.toThrow(/^scaleway: no filesystem nl-ams\/00000000-0000-4000-8000-0000000000aa$/);
+        expect(fake.calls.slice(before).filter((c) => c.path.startsWith('/file/'))).toEqual([]);
     });
 
     it('refuses a size out of bounds, a region without File Storage, and one outside the provider\'s zones; one that fails is deleted, and its failure thrown', async () => {
@@ -1378,6 +1498,9 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
         await expect(shareOf(p, 'tiny', 24)).rejects.toThrow(/25-50000 GB, not 24/);
         await expect(shareOf(p, 'huge', 50001)).rejects.toThrow(/25-50000 GB/);
         await expect(p.createVolume({ name: 'x', region: 'nl-ams-1', sizeGb: 25, shared: true })).rejects.toThrow(/File Storage is in fr-par, not nl-ams/);
+        await expect(make({}, { projectId: undefined }).p.createVolume({ name: 'x', region: 'fr-par-2', sizeGb: 25, shared: true })).rejects.toMatchObject({
+            code: 'project_required', message: 'scaleway: a Scaleway Project is needed to create a filesystem: pass projectId (SCW_DEFAULT_PROJECT_ID; the console shows it under Project settings)',
+        });
         expect(fsCalls(fake)).toEqual([]);
         fake.intercept((r) => r.method === 'GET' && /\/filesystems\/[0-9a-f-]{36}$/.test(r.path), { answer: (r) => json(200, { ...fake.state.filesystems.get(r.path.split('/').pop()!), status: 'error' }), times: 1 });
         await expect(shareOf(p, 'broken')).rejects.toThrow(/filesystem broken is error, not available/);
@@ -1418,7 +1541,8 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
         const { fake, p } = make();
         const share = await shareOf(p);
         const o = { name: 'x', offer: GPU_FS, region: 'fr-par-2' };
-        await expect(p.createServer({ ...o, offer: 'DEV1-S', mounts: [{ volume: share }] })).rejects.toThrow(/1 filesystems on .*it attaches 0/);
+        await expect(p.createServer({ ...o, offer: 'DEV1-S', mounts: [{ volume: share }] }))
+            .rejects.toThrow(/^scaleway: 1 filesystems on this type \(it attaches 0: types with max_file_systems, e\.g\. POP2, L4, L40S, H100\) is not supported$/);
         await expect(p.createServer({ ...o, region: 'pl-waw-2', mounts: [{ volume: share }] })).rejects.toThrow(/filesystem models is in fr-par: an Instance in pl-waw-2 cannot attach it/);
         await expect(p.createServer({ ...o, mounts: [{ volume: 'fr-par/00000000-0000-4000-8000-0000000000aa' }] })).rejects.toThrow(/no filesystem/);
         await expect(p.createServer({ ...o, mounts: [{ volume: share, path: 'models' }] })).rejects.toThrow(/mount path "models" is not absolute/);
@@ -1454,6 +1578,11 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
         await expect(p.attachVolume('fr-par/00000000-0000-4000-8000-0000000000aa', s.id, fast)).rejects.toThrow(/no filesystem/);
         // A bare id of a filesystem works too.
         await p.detachVolume(b.id.split('/')[1], s.id, fast);
+        expect((await p.getServer(s.id))?.mounts).toEqual([{ volumeId: share.id, path: '/mnt/models' }]);
+        // One it no longer holds, beside one it does: nothing is detached, and no tag is set.
+        const writes = fake.calls.filter((x) => x.method !== 'GET').length;
+        await p.detachVolume(b.id, s.id, fast);
+        expect(fake.calls.filter((x) => x.method !== 'GET')).toHaveLength(writes);
         expect((await p.getServer(s.id))?.mounts).toEqual([{ volumeId: share.id, path: '/mnt/models' }]);
     });
 
@@ -1496,6 +1625,25 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
             answer: (r) => { const body: any = { servers: {} }; for (const [k, v] of Object.entries<any>(SERVER_TYPES)) body.servers[k] = k === GPU_FS ? { ...v, capabilities: undefined } : v; return json(200, body, 'application/json', { 'x-total-count': String(Object.keys(body.servers).length) }); },
         });
         await expect(p2.createServer({ name: 'x', offer: GPU_FS, region: 'fr-par-2', mounts: [{ volume: share2 }] })).rejects.toThrow(/it attaches 0/);
+    });
+
+    it('a server whose record lists no filesystems, or that is gone, holds none: a detach is done at once, and an attachment waited for is no longer there', async () => {
+        const { fake, p } = make();
+        const share = await shareOf(p);
+        const fsId = share.id.split('/')[1];
+        const s = await p.waitUntilRunning((await p.createServer({ name: 'gpu-1', offer: GPU_FS, region: 'fr-par-2' })).id, fast);
+        // The list is optional in the Instance API's answer: a record may come without it.
+        fake.intercept((r) => r.method === 'GET' && r.path.endsWith(`/servers/${s.raw.id}`), {
+            answer: () => { const { filesystems: _f, ...rest } = fake.state.servers.get(s.id); return json(200, { server: { ...rest, allowed_actions: [] } }); },
+        });
+        const writes = fake.calls.filter((c) => c.method !== 'GET').length;
+        await expect(p.detachVolume(share.id, s.id, fast)).resolves.toBeUndefined();
+        await expect(p.api.fileSystemState(s.raw.zone, s.raw.id, fsId, 'gone', fast)).resolves.toBeUndefined();
+        expect(fake.calls.filter((c) => c.method !== 'GET')).toHaveLength(writes);
+        // A server deleted meanwhile: what it held is gone with it.
+        const gone = '00000000-0000-4000-8000-00000000dead';
+        await expect(p.api.fileSystemState('fr-par-2', gone, fsId, 'gone', fast)).resolves.toBeUndefined();
+        await expect(p.api.fileSystemState('fr-par-2', gone, fsId, 'available', fast)).rejects.toThrow(new RegExp(`^scaleway: filesystem ${fsId} is no longer attached to server ${gone}$`));
     });
 
     it('an attachment whose server cannot be read in time is a timeout that says it was never read', async () => {
@@ -1565,9 +1713,42 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
     it('refuses before anything is made: no access key, a URL that is no file\'s', async () => {
         const { fake, p } = make();
         await expect(p.importImage({ name: 'x', url: URL_OK, region: 'fr-par-2' })).rejects.toThrow(/needs the API key's access key: pass accessKey \(SCW_ACCESS_KEY\)/);
-        const { p: q } = withKey();
-        for (const url of ['s3://bucket/x.qcow2', 'https://example.com', 'disk.qcow2']) await expect(q.importImage({ name: 'x', url, region: 'fr-par-2' })).rejects.toThrow(/http\(s\) URL of a file/);
+        const { fake: keyed, p: q } = withKey();
+        // An http(s) URL inside another scheme's is another scheme's.
+        for (const url of ['s3://bucket/x.qcow2', 'https://example.com', 'disk.qcow2', 'ftp://mirror.example.com/https://cloud-images.example.com/x.qcow2']) {
+            await expect(q.importImage({ name: 'x', url, region: 'fr-par-2' })).rejects.toThrow(/http\(s\) URL of a file/);
+        }
         expect(blockCalls(fake)).toEqual([]);
+        expect(keyed.calls).toEqual([]);
+    });
+
+    it('takes an http URL as well as an https one', async () => {
+        const { fake, p } = withKey();
+        const image = await p.importImage({ name: 'plain-http', url: 'http://cloud-images.example.com/noble-minimal.qcow2', region: 'fr-par-2', ...fast });
+        expect(image).toMatchObject({ name: 'plain-http', status: 'available' });
+        expect(fake.calls.filter((c) => c.host === 'cloud-images.example.com').map((c) => c.method)).toEqual(['HEAD', 'GET']);
+    });
+
+    it('a file downloaded first is in the temporary directory only until it is in the bucket', async () => {
+        const { fake } = withKey();
+        const dir = mkdtempSync(join(os.tmpdir(), 'asap-vps-test-'));
+        const staged: string[][] = [];
+        // What the temporary directory holds while the file goes up.
+        const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+            const u = new URL(String(url));
+            if (u.host.startsWith('s3.') && init?.method === 'PUT' && u.pathname.endsWith('/image.qcow2')) staged.push(readdirSync(dir));
+            return fake.fetchImpl(url, init);
+        }) as typeof fetch;
+        const p = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, accessKey: ACCESS, fetchImpl, sleep: noSleep });
+        const temporary = jest.spyOn(os, 'tmpdir').mockReturnValue(dir);
+        try {
+            expect((await p.importImage({ name: 'staged', url: URL_OK, region: 'fr-par-2', ...fast })).status).toBe('available');
+            expect(staged).toEqual([[expect.stringMatching(/^asap-vps-[0-9a-f]{16}$/)]]);
+            expect(readdirSync(dir)).toEqual([]);
+        } finally {
+            temporary.mockRestore();
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     it('a download that fails, a file Scaleway cannot read, an image that errors: each thrown, and nothing left (bucket, snapshot, image)', async () => {
@@ -1641,5 +1822,121 @@ describe('Scaleway image import: a QCOW2 from a URL, through a bucket of its own
             ['fr-par', expect.stringMatching(/^asap-vps-tmp-[0-9a-f]{12}$/), 0], ['fr-par', expect.stringMatching(/^asap-vps-tmp-[0-9a-f]{12}$/), 0],
             ['pl-waw', expect.stringMatching(/^asap-vps-tmp-[0-9a-f]{12}$/), 0],
         ]);
+    });
+});
+
+describe('Scaleway waits given no wait options: each its own default', () => {
+    const WHOAMI = { image: 'traefik/whoami:v1.12.0' };
+    /**
+     * A provider on a clock only its waits move (each sleep advances it by what it waits), every sleep recorded.
+     * A wait that would never end on it (a sleep of no length at all, or one too many) is cut short, as a failure.
+     */
+    const onClock = async (params: Partial<ScalewayParams>, test: (m: { fake: Fake, p: Scaleway, slept: number[] }) => Promise<void>) => {
+        let now = Date.now();
+        const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+        const slept: number[] = [];
+        const sleep = async (ms: number) => {
+            slept.push(ms);
+            if (!Number.isFinite(ms) || slept.length > 1000) throw new Error(`a wait of ${ms} ms, the ${slept.length}th: it would never end`);
+            now += ms;
+        };
+        try {
+            const fake = fakeScaleway();
+            const p = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep, ...params });
+            await test({ fake, p, slept });
+        } finally {
+            clock.mockRestore();
+        }
+    };
+    /** `n` waits of `ms` each. */
+    const waits = (n: number, ms: number) => Array<number>(n).fill(ms);
+
+    it('a volume made: up to 5 min, read every 2 s; one still being made then is deleted once it is free, waited for as long again', async () => {
+        await onClock({}, async ({ fake, p, slept }) => {
+            fake.intercept((r) => r.method === 'POST' && r.path === '/block/v1/zones/pl-waw-2/volumes', {
+                after: () => { for (const v of fake.state.volumes.values()) if (v.status === 'creating') v.left = 1e9; }, times: 1,
+            });
+            const e = await p.createVolume({ name: 'slow', region: 'pl-waw-2', sizeGb: 20 }).catch((x) => x);
+            expect(e).toMatchObject({ code: 'left_behind' });
+            expect(e.message).toMatch(/timed out after 300 s waiting for volume pl-waw-2\/([0-9a-f-]{36}): creating; and volume pl-waw-2\/\1, made for it, is not deleted \(scaleway: block volume pl-waw-2\/\1 is still creating: it cannot be deleted yet\): it stays, and bills, until deleted$/);
+            expect(slept).toEqual(waits(300, 2000));
+        });
+    });
+
+    it('a shared volume (a filesystem) made: up to 10 min, read every 3 s', async () => {
+        await onClock({}, async ({ fake, p, slept }) => {
+            fake.intercept((r) => r.method === 'POST' && r.path === '/file/v1alpha1/regions/fr-par/filesystems', {
+                after: () => { for (const x of fake.state.filesystems.values()) if (x.status === 'creating') x.left = 1e9; }, times: 1,
+            });
+            await expect(p.createVolume({ name: 'slow', region: 'fr-par-2', sizeGb: 25, shared: true })).rejects.toMatchObject({
+                code: 'timeout', message: 'scaleway: timed out after 600 s waiting for filesystem slow: creating',
+            });
+            expect(slept).toEqual(waits(200, 3000));
+            // Deleted once it failed: nothing is left billing.
+            expect(fake.state.filesystems.size).toBe(0);
+        });
+    });
+
+    it('a shared volume deleted: up to 5 min, read every 2 s', async () => {
+        await onClock({}, async ({ fake, p, slept }) => {
+            const share = await p.createVolume({ name: 'sticky', region: 'fr-par-2', sizeGb: 25, shared: true, ...fast });
+            // Scaleway accepts the delete, and the filesystem stays.
+            fake.intercept((r) => r.method === 'DELETE' && r.path.endsWith(`/filesystems/${share.id.split('/')[1]}`), { answer: () => new Response(null, { status: 204 }) });
+            slept.length = 0;
+            await expect(p.deleteVolume(share.id)).rejects.toMatchObject({ code: 'timeout', message: 'scaleway: timed out after 300 s waiting for delete of filesystem sticky: available' });
+            expect(slept).toEqual(waits(150, 2000));
+        });
+    });
+
+    it('a shared volume attached to a server: up to 5 min, read every 2 s, until the attachment settles; one that never does is a timeout', async () => {
+        await onClock({}, async ({ fake, p, slept }) => {
+            const share = await p.createVolume({ name: 'models', region: 'fr-par-2', sizeGb: 25, shared: true, ...fast });
+            const s = await p.waitUntilRunning((await p.createServer({ name: 'gpu-1', offer: 'L40S-1-48G', region: 'fr-par-2' })).id, fast);
+            const fsId = share.id.split('/')[1];
+            // Its attachment, under way, never settles.
+            fake.intercept((r) => r.method === 'GET' && r.path.endsWith(`/servers/${s.raw.id}`), {
+                answer: () => json(200, { server: { ...fake.state.servers.get(s.id), filesystems: [{ filesystem_id: fsId, state: 'attaching' }], allowed_actions: [] } }),
+            });
+            slept.length = 0;
+            await expect(p.attachVolume(share.id, s.id)).rejects.toMatchObject({ code: 'timeout', message: `scaleway: filesystem ${fsId} on server ${s.raw.id}: still attaching, not available` });
+            expect(slept).toEqual(waits(150, 2000));
+        });
+    });
+
+    it('an endpoint made: up to 10 min, read every 3 s; its namespace, deleted once it failed, waited for on the same schedule', async () => {
+        await onClock({}, async ({ fake, p, slept }) => {
+            fake.intercept((r) => r.method === 'GET' && /\/containers\/[0-9a-f-]{36}$/.test(r.path), {
+                answer: (r) => json(200, { ...fake.state.containers.get(r.path.split('/').pop()!), status: 'creating' }),
+            });
+            await expect(p.createEndpoint({ name: 'slow', container: WHOAMI })).rejects.toMatchObject({ code: 'timeout', message: 'scaleway: timed out after 600 s waiting for endpoint slow: creating' });
+            // The container read until the wait ran out; then its namespace, deleted, read once more and gone.
+            expect(slept).toEqual(waits(201, 3000));
+            expect(fake.state.namespaces.size).toBe(0);
+        });
+    });
+
+    it('an endpoint deleted: up to 5 min, read every 2 s', async () => {
+        await onClock({}, async ({ fake, p, slept }) => {
+            const e = await p.createEndpoint({ name: 'sticky', container: WHOAMI, ...fast });
+            const id = e.id.split('/')[1];
+            fake.intercept((r) => r.method === 'GET' && r.path.endsWith(`/containers/${id}`), { answer: () => json(200, { ...fake.state.containers.get(id), status: 'deleting' }) });
+            slept.length = 0;
+            await expect(p.deleteEndpoint(e.id)).rejects.toMatchObject({ code: 'timeout', message: 'scaleway: timed out after 300 s waiting for delete of endpoint sticky: deleting' });
+            expect(slept).toEqual(waits(150, 2000));
+        });
+    });
+
+    it('an image copied: up to 2 h, read every 15 s', async () => {
+        await onClock({ accessKey: 'SCWFAKEACCESSKEY0000' }, async ({ fake, p, slept }) => {
+            const s = await running(p);
+            await p.stopServer(s.id);
+            const image = await p.createImage(s.id, { name: 'copy', ...fast });
+            const root = image.raw.root_volume!.id;
+            // Its export never ends.
+            fake.intercept((r) => r.method === 'POST' && r.path.endsWith('/export-to-object-storage'), { after: () => { fake.state.snapshots.get(root).exportTo.left = 1e9; }, times: 1 });
+            slept.length = 0;
+            await expect(p.copyImage(image.id, ['pl-waw-3'])).rejects.toMatchObject({ code: 'timeout', message: `scaleway: timed out after 7200 s waiting for export of snapshot pl-waw-2/${root}: exporting` });
+            expect(slept).toEqual(waits(480, 15_000));
+        });
     });
 });
