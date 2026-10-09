@@ -124,6 +124,38 @@ describe('ServerProvisioner', () => {
         expect((await p.getServer(e.server.id))?.status).toBe('running');
     });
 
+    it('a server still there when the wait for its delete ends is reported as such, after the step that failed (named alone when it gave no message)', async () => {
+        const { p } = digitalOcean();
+        const [offer] = await p.listOffers({ kind: 'cpu' });
+        jest.spyOn(p, 'deleteServerAndWait').mockResolvedValue(false);
+        const e = await new ServerProvisioner(p).provision({ serverOptions: { name: 'slow', offer }, ...quick },
+            (pipeline) => void pipeline.addStep({ name: 'bad', execute: async () => ({ step: 'bad', success: false }) })).catch((x) => x);
+        expect(e).toBeInstanceOf(ProvisionError);
+        expect(e.message).toBe(`digitalocean: setup step "bad" failed; and server ${e.server.id} is not verified deleted (still there when the wait ended): it may still bill`);
+        expect(e.kept).toBe(false);
+        expect('cleanupError' in e).toBe(false);
+    });
+
+    it('a running server that reports no ssh endpoint is never dialled: it is deleted, and the provision says why', async () => {
+        const { p, fake } = digitalOcean();
+        const before = fake.liveServers();
+        const [offer] = await p.listOffers({ kind: 'cpu' });
+        const running = p.waitUntilRunning.bind(p);
+        let id = '';
+        jest.spyOn(p, 'waitUntilRunning').mockImplementation(async (serverId, o) => {
+            id = serverId;
+            return { ...(await running(serverId, o)), ssh: undefined };
+        });
+        const e = await new ServerProvisioner(p).provision({ serverOptions: { name: 'no-ssh', offer }, ...quick }, () => {}).catch((x) => x);
+        // Verified deleted: the failure is thrown as it is.
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e).not.toBeInstanceOf(ProvisionError);
+        expect(e.message).toBe(`digitalocean: server ${id} is running but reports no ssh endpoint`);
+        expect(SSHService.connect).not.toHaveBeenCalled();
+        expect(fake.liveServers()).toBe(before);
+        expect(await p.listSSHKeys()).toEqual([]);
+    });
+
     it('a failed setup that keeps its server (deleteOnFailure false) says so, with the server and the key pair to log in with', async () => {
         const { p, fake } = digitalOcean();
         const before = fake.liveServers();
@@ -258,12 +290,14 @@ describe('ServerProvisioner', () => {
             expect(await p.listSSHKeys()).toEqual([]);
         });
 
-        it('connects with the retry it is given', async () => {
+        it('connects with the retry it is given, else with 12 tries 10 s apart', async () => {
             const { p } = digitalOcean();
             const [offer] = await p.listOffers({ kind: 'cpu' });
             const retry = { maxRetries: 5, retryTimeout: 3000 };
             await new ServerProvisioner(p).provision({ serverOptions: { name: 'x', offer }, wait: fast, sshRetry: retry }, () => {});
             expect(SSHService.connect).toHaveBeenCalledWith(expect.objectContaining({ retry }));
+            await new ServerProvisioner(p).provision({ serverOptions: { name: 'y', offer }, wait: fast }, () => {});
+            expect((SSHService.connect as jest.Mock).mock.calls[1][0].retry).toEqual({ maxRetries: 12, retryTimeout: 10_000 });
         });
     });
 });
@@ -274,13 +308,13 @@ describe('asRoot: the steps\' connection on a login that is not root', () => {
      * run, with the server behind it stubbed: the commands it is sent and the
      * paths written over SFTP are recorded.
      */
-    const client = (o: { refuse?: RegExp } = {}) => {
+    const client = (o: { refuse?: RegExp, stderr?: string } = {}) => {
         const commands: Array<[string, unknown?]> = [];
         const written: string[] = [];
         const ssh = new NodeSSH();
         ssh.execCommand = (async (command: string, options?: unknown) => {
             commands.push(options === undefined ? [command] : [command, options]);
-            return o.refuse?.test(command) ? { stdout: '', stderr: 'mv: cannot move', code: 1, signal: null } : { stdout: '', stderr: '', code: 0, signal: null };
+            return o.refuse?.test(command) ? { stdout: '', stderr: o.stderr ?? 'mv: cannot move', code: 1, signal: null } : { stdout: '', stderr: '', code: 0, signal: null };
         }) as NodeSSH['execCommand'];
         const sftp = {
             fastPut: (_local: string, remote: string, _options: unknown, done: (e: Error | null) => void) => {
@@ -363,5 +397,10 @@ describe('asRoot: the steps\' connection on a login that is not root', () => {
         const { ssh, sent, written } = client({ refuse: /mv -f/ });
         await expect(asRoot(ssh, 'ubuntu').putFile(join(local, 'app.conf'), '/etc/app/app.conf')).rejects.toThrow('putFile /etc/app/app.conf: mv: cannot move');
         expect(sent().pop()).toBe(`sudo -n bash -c 'rm -f -- ${q(written[0])}'`);
+    });
+
+    it('a move that fails without a word is an error that gives its exit code', async () => {
+        const { ssh } = client({ refuse: /mv -f/, stderr: '' });
+        await expect(asRoot(ssh, 'ubuntu').putFile(join(local, 'app.conf'), '/etc/app/app.conf')).rejects.toThrow(/^putFile \/etc\/app\/app\.conf: exit 1$/);
     });
 });

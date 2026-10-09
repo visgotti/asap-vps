@@ -120,6 +120,23 @@ describe('SSHService.connect', () => {
         expect(console.error).toHaveBeenCalledWith('[SSHService] The connection to h1 dropped: read ETIMEDOUT');
     });
 
+    it('a late error from a connection the session has since replaced leaves the new connection up', async () => {
+        const { EventEmitter } = await import('events');
+        const connections: Array<InstanceType<typeof EventEmitter> & { ended: number }> = [];
+        connect.mockImplementation(async function (this: NodeSSH) {
+            const c = Object.assign(new EventEmitter(), { ended: 0, end() { c.ended++; } });
+            connections.push(c);
+            this.connection = c as unknown as NodeSSH['connection'];
+            return this;
+        });
+        const ssh = await SSHService.connect({ host: 'h1', privateKey: 'PEM' });
+        // The caller reconnects the same client: node-ssh's own connect replaces the first connection.
+        await ssh.connect({ host: 'h1', username: 'root', privateKey: 'PEM' });
+        connections[0].emit('error', new Error('read ECONNRESET'));
+        expect(connections.map((c) => c.ended)).toEqual([0, 0]);
+        expect(ssh.isConnected()).toBe(true);
+    });
+
     it('decrypts a stored key, and tries as often as asked before it gives up', async () => {
         const { privateKey } = await SSHService.initKeys({ encryptionKey: 'secret' });
         connect.mockRejectedValueOnce(new Error('refused')).mockRejectedValueOnce(new Error('refused'));
@@ -130,6 +147,7 @@ describe('SSHService.connect', () => {
         connect.mockReset().mockRejectedValue(new Error('refused'));
         await expect(SSHService.connect({ host: 'h', privateKey: 'PEM', retry: { maxRetries: 2, retryTimeout: 0 } })).rejects.toThrow(/refused/);
         expect(connect).toHaveBeenCalledTimes(2);
+        expect(console.error).toHaveBeenCalledWith('[SSHService] Failed to connect to h after 2 retries:', 'refused');
     });
 });
 
@@ -164,8 +182,9 @@ describe('SSHService.connect with a key or a stored key entity (positional: root
         expect(connect.mock.calls.map(([c]) => [c.host, c.port, c.username])).toEqual(['h1', 'h2', 'h3', 'h4', 'h5'].map((h) => [h, 22, 'root']));
     });
 
-    it('answers a keyboard-interactive prompt with nothing: the key is the only way in', async () => {
+    it('offers keyboard-interactive and answers its prompt with nothing: the key is the only way in', async () => {
         await SSHService.connect('h', 'PEM');
+        expect(connect.mock.calls[0][0].tryKeyboard).toBe(true);
         const finish = jest.fn();
         connect.mock.calls[0][0].onKeyboardInteractive('', '', '', [{ prompt: 'Password: ', echo: false }], finish);
         expect(finish).toHaveBeenCalledWith([]);
@@ -220,9 +239,14 @@ describe('SSHService helpers, on an open session', () => {
         expect(sent).toEqual(['sudo npm install pm2 -g', 'npm install left-pad']);
     });
 
-    it('sshGetFileText: the file\'s text, trimmed; an empty or missing file is null; sshEnsureFileTextExists compares it', async () => {
-        expect(await SSHService.sshGetFileText(session({ stdout: '  v20.11.1\n' }).ssh, '/etc/node-version')).toBe('v20.11.1');
+    it('sshGetFileText: cats the file and gives its text, trimmed; an empty or missing file, or a session that answers nothing, is null; sshEnsureFileTextExists compares it', async () => {
+        const node = session({ stdout: '  v20.11.1\n' });
+        expect(await SSHService.sshGetFileText(node.ssh, '/etc/node-version')).toBe('v20.11.1');
+        expect(node.sent).toEqual(['cat /etc/node-version']);
         expect(await SSHService.sshGetFileText(session().ssh, '/nope')).toBeNull();
+        const answering = (result: unknown) => ({ execCommand: async () => result }) as unknown as NodeSSH;
+        expect(await SSHService.sshGetFileText(answering(undefined), '/f')).toBeNull();
+        expect(await SSHService.sshGetFileText(answering({ code: 0 }), '/f')).toBeNull();
         expect(await SSHService.sshEnsureFileTextExists(session({ stdout: 'ok\n' }).ssh, '/f', 'ok')).toBe(true);
         expect(await SSHService.sshEnsureFileTextExists(session({ stdout: 'no' }).ssh, '/f', 'ok')).toBe(false);
     });
@@ -245,6 +269,7 @@ describe('SSHService helpers, on an open session', () => {
         const { ssh, sent } = session({ put: async () => { throw new Error('No such file'); } });
         await expect(SSHService.installNvm(ssh)).rejects.toThrow('No such file');
         expect(sent).toEqual([]);
+        expect(console.error).toHaveBeenCalledWith('Error in sshExecFile: No such file');
         expect(console.error).toHaveBeenCalledWith('Error in sshSetupScript: No such file');
     });
 

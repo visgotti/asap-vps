@@ -1,5 +1,5 @@
 import type { NodeSSH } from 'node-ssh';
-import type { SetupContext } from '../../types';
+import type { ISetupStep, SetupContext } from '../../types';
 import { PLATFORM } from '../../constants';
 import { InstallDockerStep } from './InstallDockerStep';
 import { ConfigureFirewallStep } from './ConfigureFirewallStep';
@@ -364,5 +364,121 @@ describe('InstallNodeStep', () => {
         const result = await step.execute(ssh, debianContext);
 
         expect(result.success).toBe(false);
+    });
+});
+
+/** The commands a mock session was sent, in order. */
+const sent = (ssh: NodeSSH): string[] => (ssh.execCommand as jest.Mock).mock.calls.map((c: any[]) => c[0]);
+
+describe('each step, command by command, and the result it reports', () => {
+    it('InstallDockerStep installs from apt on debian, from Docker\'s yum repo elsewhere, then enables and starts it and reports the version', async () => {
+        const installed = () => {
+            let checks = 0;
+            return createMockSSH((cmd) => (cmd === 'docker --version' ? (checks++ === 0 ? { code: 1 } : { stdout: 'Docker version 24.0.7' }) : {}));
+        };
+        const debian = installed();
+        expect(await new InstallDockerStep().execute(debian, debianContext)).toEqual({ step: 'install-docker', success: true, message: 'Docker installed', output: 'Docker version 24.0.7' });
+        expect(sent(debian)).toEqual(['docker --version', 'apt-get update -y', 'apt-get install -y docker.io', 'systemctl enable docker', 'systemctl start docker', 'docker --version']);
+        const rhel = installed();
+        await new InstallDockerStep().execute(rhel, rhelContext);
+        expect(sent(rhel)).toEqual([
+            'docker --version',
+            'yum install -y yum-utils',
+            'yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo',
+            'yum install -y docker-ce docker-ce-cli containerd.io',
+            'systemctl enable docker',
+            'systemctl start docker',
+            'docker --version',
+        ]);
+        const broken = createMockSSH((cmd) => (cmd === 'docker --version' ? { code: 127, stderr: 'docker: command not found' } : {}));
+        expect(await new InstallDockerStep().execute(broken, debianContext)).toEqual({ step: 'install-docker', success: false, message: 'Docker install failed', output: 'docker: command not found' });
+    });
+
+    it('ConfigureFirewallStep on debian installs ufw, sets the defaults asked, applies each rule, enables it and reports its status', async () => {
+        const ssh = createMockSSH((cmd) => (cmd === 'ufw status' ? { stdout: 'Status: active' } : {}));
+        const rules = [{ port: 22, protocol: 'tcp' as const }, { port: 53, protocol: 'udp' as const, allow: false }];
+        expect(await new ConfigureFirewallStep(rules).execute(ssh, debianContext)).toEqual({ step: 'configure-firewall', success: true, message: 'UFW configured', output: 'Status: active' });
+        expect(sent(ssh)).toEqual(['apt-get install -y ufw', 'ufw default deny incoming', 'ufw default allow outgoing', 'ufw allow 22/tcp', 'ufw deny 53/udp', 'ufw --force enable', 'ufw status']);
+        // Without the defaults, ufw keeps its own.
+        const bare = createMockSSH();
+        await new ConfigureFirewallStep(rules, false, false).execute(bare, debianContext);
+        expect(sent(bare)).toEqual(['apt-get install -y ufw', 'ufw allow 22/tcp', 'ufw deny 53/udp', 'ufw --force enable', 'ufw status']);
+    });
+
+    it('ConfigureFirewallStep elsewhere installs, enables and starts firewalld, opens and closes each port, reloads it and reports its zone', async () => {
+        const ssh = createMockSSH((cmd) => (cmd === 'firewall-cmd --list-all' ? { stdout: 'public (active)' } : {}));
+        const rules = [{ port: 22, protocol: 'tcp' as const }, { port: 53, protocol: 'udp' as const, allow: false }];
+        expect(await new ConfigureFirewallStep(rules).execute(ssh, rhelContext)).toEqual({ step: 'configure-firewall', success: true, message: 'firewalld configured', output: 'public (active)' });
+        expect(sent(ssh)).toEqual([
+            'yum install -y firewalld',
+            'systemctl enable firewalld',
+            'systemctl start firewalld',
+            'firewall-cmd --permanent --add-port=22/tcp',
+            'firewall-cmd --permanent --remove-port=53/udp',
+            'firewall-cmd --reload',
+            'firewall-cmd --list-all',
+        ]);
+    });
+
+    it('InstallSSLCertificateStep writes the certificate and the key through quoted heredocs, makes the key private, and checks both are there', async () => {
+        const ssh = createMockSSH((cmd) => (cmd.endsWith('echo "ok"') ? { stdout: 'ok\n' } : {}));
+        expect(await new InstallSSLCertificateStep({ certContent: '---CERT---', keyContent: '---KEY---' }).execute(ssh, debianContext))
+            .toEqual({ step: 'install-ssl-certificate', success: true, message: 'SSL certificate installed to /etc/ssl/cloudflare' });
+        expect(sent(ssh)).toEqual([
+            'mkdir -p /etc/ssl/cloudflare',
+            "cat > /etc/ssl/cloudflare/cert.pem << 'CERTEOF'\n---CERT---\nCERTEOF",
+            "cat > /etc/ssl/cloudflare/key.pem << 'KEYEOF'\n---KEY---\nKEYEOF",
+            'chmod 600 /etc/ssl/cloudflare/key.pem',
+            'chmod 644 /etc/ssl/cloudflare/cert.pem',
+            'test -f /etc/ssl/cloudflare/cert.pem && test -f /etc/ssl/cloudflare/key.pem && echo "ok"',
+        ]);
+    });
+
+    it('InstallSSLCertificateStep stops at the first write that fails, with its error, and fails when the files are not there after', async () => {
+        const config = { certContent: 'c', keyContent: 'k' };
+        const cert = createMockSSH((cmd) => (cmd.includes('CERTEOF') ? { code: 1, stderr: 'read-only file system' } : {}));
+        expect(await new InstallSSLCertificateStep(config).execute(cert, debianContext))
+            .toEqual({ step: 'install-ssl-certificate', success: false, message: 'Failed to write certificate', output: 'read-only file system' });
+        expect(sent(cert)).toHaveLength(2);
+        const key = createMockSSH((cmd) => (cmd.includes('KEYEOF') ? { code: 1, stderr: 'no space left on device' } : {}));
+        expect(await new InstallSSLCertificateStep(config).execute(key, debianContext))
+            .toEqual({ step: 'install-ssl-certificate', success: false, message: 'Failed to write key', output: 'no space left on device' });
+        expect(sent(key)).toHaveLength(3);
+        const missing = createMockSSH();
+        expect(await new InstallSSLCertificateStep(config).execute(missing, debianContext))
+            .toEqual({ step: 'install-ssl-certificate', success: false, message: 'Certificate files not found after write' });
+    });
+
+    it('CreateDirectoryStep reports the directories it made', async () => {
+        expect(await new CreateDirectoryStep(['/app', '/data', '/logs']).execute(createMockSSH(), debianContext))
+            .toEqual({ step: 'create-directories', success: true, message: 'Created directories: /app, /data, /logs' });
+    });
+
+    it('InstallNodeStep installs curl and nvm, then installs, uses and checks the version in one shell that has loaded nvm', async () => {
+        const ssh = createMockSSH((cmd) => (cmd.endsWith('node --version') ? { stdout: 'v20.11.0' } : {}));
+        expect(await new InstallNodeStep().execute(ssh, debianContext)).toEqual({ step: 'install-node', success: true, message: 'Node --lts installed', output: 'v20.11.0' });
+        expect(sent(ssh)).toEqual([
+            'apt-get update -y',
+            'apt-get install -y curl',
+            'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash',
+            'export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" && nvm install --lts && nvm use --lts && node --version',
+        ]);
+        const failing = createMockSSH((cmd) => (cmd.includes('nvm install') ? { code: 3, stderr: 'nvm: command not found' } : {}));
+        expect(await new InstallNodeStep('18').execute(failing, rhelContext)).toEqual({ step: 'install-node', success: false, message: 'Node install failed', output: 'nvm: command not found' });
+    });
+
+    it('a step whose connection fails mid-way reports the failure as its result, under its default name, never as a throw', async () => {
+        const dropped = { execCommand: jest.fn(async () => { throw new Error('Not connected to server'); }) } as unknown as NodeSSH;
+        const steps: Array<[string, ISetupStep]> = [
+            ['install-docker', new InstallDockerStep()],
+            ['install-ssl-certificate', new InstallSSLCertificateStep({ certContent: 'c', keyContent: 'k' })],
+            ['create-directories', new CreateDirectoryStep(['/app'])],
+            ['run-commands', new RunCommandStep(['uptime'])],
+            ['add-authorized-key', new AddAuthorizedKeyStep('ssh-ed25519 AAAA')],
+            ['install-node', new InstallNodeStep()],
+        ];
+        for (const [name, step] of steps) {
+            expect(await step.execute(dropped, debianContext)).toEqual({ step: name, success: false, message: 'Not connected to server' });
+        }
     });
 });

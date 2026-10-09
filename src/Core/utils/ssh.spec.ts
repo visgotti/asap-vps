@@ -4,12 +4,12 @@
 // ssh-keygen; where it is installed, it is asked too.
 
 import { execFileSync } from 'child_process';
-import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'crypto';
+import { createPrivateKey, createPublicKey, createSecretKey, generateKeyPairSync, KeyObject } from 'crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { testPublicKey } from '../../testing/fakes/util';
-import { createSSHKeyPair, findSSHKey, parseSSHPublicKey, sshKeyFingerprint, toOpenSSHPublicKey } from './ssh';
+import { createSSHKeyPair, findSSHKey, parseSSHPublicKey, sshKeyFingerprint, sshKeyMatches, toOpenSSHPublicKey } from './ssh';
 
 /** What ssh-keygen prints for `args` over `files` (written to a temp dir, mode 0600); null where it is not installed. */
 function keygen(files: Record<string, string>, args: (dir: string) => string[]): string | null {
@@ -110,12 +110,18 @@ describe('SSH keys', () => {
         expect((await createSSHKeyPair()).publicKey).not.toBe(publicKey);
     });
 
-    it('writes an Ed25519 line as OpenSSH does, and refuses a key type it has no line for', () => {
+    it('writes an Ed25519 line as OpenSSH does, and refuses, naming it, a key type it has no line for', () => {
         const line = toOpenSSHPublicKey(generateKeyPairSync('ed25519').publicKey);
         expect(parseSSHPublicKey(line)).toMatchObject({ type: 'ssh-ed25519', comment: '' });
         // string "ssh-ed25519", then string(the 32-byte key).
         expect(Buffer.from(parseSSHPublicKey(line).blob, 'base64')).toHaveLength(4 + 11 + 4 + 32);
-        expect(() => toOpenSSHPublicKey(generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey)).toThrow(/no OpenSSH public key form/);
+        const refused = (key: KeyObject) => () => toOpenSSHPublicKey(key);
+        expect(refused(generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey)).toThrow(/^no OpenSSH public key form for a EC P-256 key$/);
+        // Ed25519's family, but not Ed25519: no ssh-ed25519 line.
+        expect(refused(generateKeyPairSync('ed448').publicKey)).toThrow(/^no OpenSSH public key form for a OKP Ed448 key$/);
+        expect(refused(generateKeyPairSync('x25519').publicKey)).toThrow(/^no OpenSSH public key form for a OKP X25519 key$/);
+        // A secret key has no curve to name.
+        expect(refused(createSecretKey(Buffer.alloc(32)))).toThrow(/^no OpenSSH public key form for a oct key$/);
     });
 
     it('finds an account\'s registration of a key by fingerprint, whatever its name or comment', () => {
@@ -123,5 +129,16 @@ describe('SSH keys', () => {
         const keys = [{ id: 1, fingerprint: sshKeyFingerprint(testPublicKey()) }, { id: 2, fingerprint: sshKeyFingerprint(line) }];
         expect(findSSHKey(keys, line.replace('laptop', 'renamed'))?.id).toBe(2);
         expect(findSSHKey(keys, testPublicKey())).toBeUndefined();
+    });
+
+    it('sshKeyMatches names a key by its id, its name, either fingerprint or its line whatever the comment, and by nothing else', () => {
+        const [rsa, ed] = RECORDED;
+        const key = { id: 42, name: 'laptop', publicKey: `${ed.line} me@host`, fingerprint: ed.sha256 };
+        for (const ref of [42, '42', ' laptop ', ed.sha256, ed.md5, ed.line, `${ed.line} renamed@box`]) expect([ref, sshKeyMatches(key, ref)]).toEqual([ref, true]);
+        // Another key's line or fingerprints, another name, and a reference that is no key line at all.
+        for (const ref of [rsa.line, rsa.sha256, rsa.md5, 'desktop', 'not a key']) expect([ref, sshKeyMatches(key, ref)]).toEqual([ref, false]);
+        // A key it cannot read is named by its id and its name alone.
+        const unreadable = { id: 7, name: 'odd', publicKey: 'x509v3-sign-rsa AAAA', fingerprint: '' };
+        expect([sshKeyMatches(unreadable, 'odd'), sshKeyMatches(unreadable, 'x509v3-sign-rsa AAAA'), sshKeyMatches(unreadable, '')]).toEqual([true, false, false]);
     });
 });
