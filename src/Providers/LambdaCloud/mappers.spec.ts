@@ -21,7 +21,7 @@ describe('Lambda instance types as offers', () => {
     });
 
     it('a type with no regions listed is in stock nowhere', () => {
-        expect(offerOf(type()).regions).toEqual([]);
+        expect(offerOf(type()).regions).toStrictEqual([]);
     });
 });
 
@@ -49,5 +49,11 @@ describe('Lambda filesystems', () => {
         const f = (o: Partial<LambdaFilesystem>) => toVolume({ id: 'fs-1', name: 'models', mount_point: '/lambda/nfs/models', created: '2026-10-01T00:00:00Z', is_in_use: false, region: { name: 'us-east-1', description: '' }, ...o });
         expect(f({ is_in_use: true, created: 'x' })).toMatchObject({ status: 'attached', providerStatus: 'in use', createdAt: undefined, shared: true, mountPath: '/lambda/nfs/models' });
         expect(f({})).toMatchObject({ status: 'available', createdAt: Date.parse('2026-10-01T00:00:00Z') });
+    });
+
+    it('one whose record names no region has none', () => {
+        const v = toVolume({ id: 'fs-1', name: 'models', mount_point: '/lambda/nfs/models', created: '2026-10-01T00:00:00Z', is_in_use: false } as LambdaFilesystem);
+        expect(v).toMatchObject({ id: 'fs-1', name: 'models', status: 'available' });
+        expect(v.region).toBeUndefined();
     });
 });

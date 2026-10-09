@@ -7,10 +7,15 @@
 
 import { AuthError, CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
 import { fakeLambda } from '../../testing/fakes/lambda';
+import { json } from '../../testing/fakes/util';
 import { LambdaCloud } from './LambdaCloud';
 
 const noSleep = async () => {};
 const fast = { intervalMs: 0, timeoutMs: 5000 };
+
+/** The fake, but for the requests `answer` answers itself: an answer Lambda may give that the fake does not. */
+const answering = (fake: ReturnType<typeof fakeLambda>, answer: (method: string, path: string) => Response | undefined) =>
+    (async (url: string, init?: RequestInit) => answer(init?.method ?? 'GET', new URL(url).pathname) ?? fake.fetchImpl(url, init)) as typeof fetch;
 
 describe('LambdaCloud', () => {
     const make = (o: Parameters<typeof fakeLambda>[0] = {}) => {
@@ -40,7 +45,53 @@ describe('LambdaCloud', () => {
         const { p, fake } = make();
         await expect(p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1' })).rejects.toThrow(/SSH key/);
         await expect(p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['nope'] })).rejects.toThrow(/no SSH key "nope"/);
+        // An offer given by its id has no regions of its own to pick from.
+        await expect(p.createServer({ name: 'a', offer: 'gpu_1x_a10', sshKeyIds: ['laptop'] })).rejects.toThrow('an instance needs a region (one of the offer\'s regions)');
         expect(fake.calls.filter((c) => c.path === '/api/v1/instance-operations/launch')).toHaveLength(0);
+    });
+
+    it('an image is an id when the whole of it is 32 hex digits or a UUID, and a family otherwise', async () => {
+        const { p, fake } = make();
+        const hex = '0123456789abcdef0123456789abcdef';
+        const uuid = '43336648-096D-4CBA-9AA2-F9BB7727639D';
+        const images: Array<[string, Record<string, string>]> = [
+            [hex, { id: hex }], [uuid, { id: uuid }], [`family-${hex}`, { family: `family-${hex}` }], [`${hex}-v2`, { family: `${hex}-v2` }], [`${uuid}-v2`, { family: `${uuid}-v2` }],
+        ];
+        for (const [image] of images) await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'], image });
+        expect(fake.calls.filter((c) => c.path === '/api/v1/instance-operations/launch').map((c) => c.body.image)).toEqual(images.map(([, sent]) => sent));
+    });
+
+    it('reads the GPU count an instance type\'s name states, and refuses a gpuCount other than it before anything launches', async () => {
+        expect(['gpu_8x_a100_80gb_sxm4', 'gpu_1x_a10', 'gpu_16x_b200', 'cpu_4x_general', 'my_gpu_2x_a10'].map((t) => LambdaCloud.gpuCountOf(t))).toEqual([8, 1, 16, undefined, undefined]);
+        const { p, fake } = make();
+        const o = { name: 'a', offer: 'gpu_8x_a100_80gb_sxm4', region: 'us-east-1', sshKeyIds: ['laptop'] };
+        await expect(p.createServer({ ...o, gpuCount: 1 })).rejects.toThrow('createServer option "gpuCount" 1: this offer has 8 GPU(s); pick an offer with 1 is not supported');
+        expect(fake.calls.filter((c) => c.path === '/api/v1/instance-operations/launch')).toEqual([]);
+        await expect(p.createServer({ ...o, gpuCount: 8 })).resolves.toMatchObject({ name: 'a', gpuCount: 8 });
+    });
+
+    it('a launch that answers no instance id is an error; an instance not listed yet is what the launch said of it', async () => {
+        const fake = fakeLambda();
+        const launch = '/api/v1/instance-operations/launch';
+        const none = new LambdaCloud({ apiKey: 'lambda-test', sleep: noSleep,
+            fetchImpl: answering(fake, (_, path) => (path === launch ? json(200, { data: { instance_ids: [] } }) : undefined)) });
+        await expect(none.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] })).rejects.toThrow('lambda: the launch returned no instance id');
+        // Launched, but the read of it answers that it does not exist (yet).
+        const p = new LambdaCloud({ apiKey: 'lambda-test', sleep: noSleep,
+            fetchImpl: answering(fake, (method, path) => (method === 'GET' && path.startsWith('/api/v1/instances/')
+                ? json(404, { error: { code: 'global/object-does-not-exist', message: 'Specified instance does not exist.' } }) : undefined)) });
+        const s = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] });
+        const id = [...fake.state.instances.keys()].pop()!;
+        expect(s).toEqual({
+            provider: 'lambda', id, name: 'a', status: 'pending', providerStatus: 'booting', offerId: 'gpu_1x_a10', region: 'us-east-1', billing: LambdaCloud.BILLING,
+            raw: { id, name: 'a', status: 'booting', ssh_key_names: ['laptop'], region: { name: 'us-east-1', description: '' } },
+        });
+    });
+
+    it('an answer without its data reads as none: no instances, keys, filesystems or offers', async () => {
+        const fake = fakeLambda();
+        const p = new LambdaCloud({ apiKey: 'lambda-test', sleep: noSleep, fetchImpl: answering(fake, (method) => (method === 'GET' ? json(200, {}) : undefined)) });
+        expect([await p.listServers(), await p.listSSHKeys(), await p.listVolumes(), await p.listOffers()]).toEqual([[], [], [], []]);
     });
 
     it('the account quota is a QuotaError', async () => {
@@ -75,6 +126,20 @@ describe('LambdaCloud', () => {
         }
     });
 
+    it('reads a failure by its status where it has no code: a server error may be retried; a code that says not found is NotFoundError whatever its status', async () => {
+        const failing = (status: number, body: unknown) => new LambdaCloud({ apiKey: 'lambda-test', sleep: noSleep,
+            fetchImpl: answering(fakeLambda(), (_, path) => (path === '/api/v1/instance-types' ? json(status, body) : undefined)) }).listOffers().catch((e) => e);
+        const bare = await failing(400, { error: { message: 'Bad request.' } });
+        expect([bare.constructor.name, bare.status, bare.code, isRetriable(bare)]).toEqual(['ProviderError', 400, undefined, false]);
+        expect(bare.message).toMatch(/^lambda: GET \/api\/v1\/instance-types -> 400 +Bad request\.$/);
+        for (const status of [500, 503]) {
+            const e = await failing(status, { error: { code: 'global/unknown', message: 'Something went wrong.' } });
+            expect([e.constructor.name, e.status, isRetriable(e)]).toEqual(['ProviderError', status, true]);
+        }
+        const missing = await failing(400, { error: { code: 'global/not-found', message: 'Not found.' } });
+        expect([missing.constructor.name, missing.status, missing.code]).toEqual(['NotFoundError', 400, 'global/not-found']);
+    });
+
     it('lists GPU instances, CPU instances, or both (the default); logs in as ubuntu', async () => {
         const { p } = make();
         const cpu = await p.createServer({ name: 'cpu', offer: 'cpu_4x_general', region: 'us-east-1', sshKeyIds: ['laptop'] });
@@ -93,6 +158,14 @@ describe('LambdaCloud', () => {
         expect((await p.getServer(s.id))?.status).toBe('terminating');
         expect((await p.getServer(s.id))?.status).toBe('terminated');
         expect(await p.getServer(s.id)).toBeNull();
+    });
+
+    it('deleteServerAndWait says false when the instance is still terminating at the timeout', async () => {
+        const { p } = make({ terminateReads: 1e9 });
+        const s = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] });
+        await p.waitUntilRunning(s.id, fast);
+        expect(await p.deleteServerAndWait(s.id, { timeoutMs: 0 })).toBe(false);
+        expect((await p.getServer(s.id))?.status).toBe('terminating');
     });
 
     it('reads every status word Lambda reports: unhealthy is an error, preempted is gone', async () => {
@@ -121,6 +194,8 @@ describe('LambdaCloud launch limits', () => {
         const second = await p.addSSHKey('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtestsecondkeyonlyAAAAAAAAAAAAAAAAAAAAAAAAAAA two@test', 'second');
         await expect(p.createServer({ name: 'two-keys', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: [key.id, second.id] }))
             .rejects.toBeInstanceOf(NotSupportedError);
+        await expect(p.createServer({ name: 'two-keys', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: [key.id, second.id] }))
+            .rejects.toThrow('more than one SSH key at launch is not supported');
         expect(launches(fake)).toHaveLength(0);
         await expect(p.createServer({ name: 'one-key', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: [key.id] })).resolves.toMatchObject({ name: 'one-key' });
     });
@@ -133,9 +208,14 @@ describe('LambdaCloud launch limits', () => {
         for (const tag of ['Owner=me', 'my_tag=1', 'a=1', 'lambda-ai-x=1', `ok=${'v'.repeat(129)}`]) {
             await expect(p.createServer({ ...base, name: 'tagged', tags: [tag] })).rejects.toBeInstanceOf(ProviderError);
         }
+        await expect(p.createServer({ ...base, name: 'tagged', tags: ['Owner=me'] }))
+            .rejects.toThrow('tag "Owner=me": a key is 2-55 of a-z 0-9 - : starting with a letter (not lambda-ai-), a value at most 128 characters');
         expect(launches(fake)).toHaveLength(0);
         await expect(p.createServer({ ...base, name: 'tagged', tags: ['team:gpu=render', 'env'] })).resolves.toMatchObject({ name: 'tagged' });
         expect(launches(fake)[0].body.tags).toEqual([{ key: 'team:gpu', value: 'render' }, { key: 'env', value: '' }]);
+        // A value of 128 characters is Lambda's longest.
+        await expect(p.createServer({ ...base, name: 'longest', tags: [`ok=${'v'.repeat(128)}`] })).resolves.toMatchObject({ name: 'longest' });
+        expect(launches(fake)[1].body.tags).toEqual([{ key: 'ok', value: 'v'.repeat(128) }]);
         await expect(p.addSSHKey('ssh-ed25519 AAAA x', 'k'.repeat(65))).rejects.toThrow(/1-64 characters/);
     });
 });
@@ -147,11 +227,23 @@ describe('Lambda filesystems', () => {
     };
     const launches = (fake: ReturnType<typeof fakeLambda>) => fake.calls.filter((c) => c.path === '/api/v1/instance-operations/launch').map((c) => c.body);
     const reads = (fake: ReturnType<typeof fakeLambda>) => fake.calls.filter((c) => c.method === 'GET' && c.path === '/api/v1/filesystems').length;
+    /** A provider whose clock moves only as it sleeps: a wait that never ends runs out at once, however long it is. */
+    const clocked = async (fake: ReturnType<typeof fakeLambda>, run: (p: LambdaCloud) => Promise<void>) => {
+        let now = Date.now();
+        const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+            await run(new LambdaCloud({ apiKey: 'lambda-test', fetchImpl: fake.fetchImpl, sleep: async (ms) => { now += ms; } }));
+        } finally {
+            clock.mockRestore();
+        }
+    };
 
     it('has no size, and a name Lambda takes: refused before anything is sent otherwise', async () => {
         const { fake, p } = make();
         // Not in its type (a filesystem grows as it fills); code typed for any provider may still pass it.
         await expect(p.createVolume({ name: 'models', region: 'us-east-1', sizeGb: 10 } as Parameters<LambdaCloud['createVolume']>[0])).rejects.toThrow(NotSupportedError);
+        await expect(p.createVolume({ name: 'models', region: 'us-east-1', sizeGb: 10 } as Parameters<LambdaCloud['createVolume']>[0]))
+            .rejects.toThrow('createVolume option "sizeGb" (a filesystem grows as it fills) is not supported');
         await expect(p.createVolume({ name: '1models', region: 'us-east-1' })).rejects.toThrow(/a letter then letters/);
         await expect(p.createVolume({ name: 'm'.repeat(61), region: 'us-east-1' })).rejects.toThrow(/1-60 characters/);
         expect(fake.calls.filter((c) => c.method === 'POST')).toEqual([]);
@@ -232,5 +324,89 @@ describe('Lambda filesystems', () => {
         const t0 = reads(fake);
         await expect(p.deleteVolume(other.id, fast)).rejects.toMatchObject({ code: 'filesystems/filesystem-in-use' });
         expect(reads(fake) - t0).toBeLessThanOrEqual(1);
+    });
+
+    it('getVolume reads the one asked for among several; an id the account does not have is none', async () => {
+        const { p } = make();
+        const models = await p.createVolume({ name: 'models', region: 'us-east-1' });
+        const data = await p.createVolume({ name: 'data', region: 'us-west-1' });
+        expect([(await p.getVolume(data.id))?.name, (await p.getVolume(models.id))?.name, await p.getVolume('f'.repeat(32))]).toEqual(['data', 'models', null]);
+    });
+
+    it('mounts filesystems given as objects and as ids in one launch, at a path of up to 256 characters; one whose record names no region is refused', async () => {
+        const { fake, p } = make();
+        const models = await p.createVolume({ name: 'models', region: 'us-east-1' });
+        const data = await p.createVolume({ name: 'data', region: 'us-east-1' });
+        const o = { offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] };
+        const path = `/data/${'x'.repeat(250)}`;
+        expect(path).toHaveLength(256);
+        await p.createServer({ ...o, name: 'a', mounts: [{ volume: models }, { volume: data.id, path }] });
+        expect(launches(fake).pop()?.file_system_mounts).toEqual([{ file_system_id: models.id, mount_point: '/lambda/nfs/models' }, { file_system_id: data.id, mount_point: path }]);
+        // Refused as not in the instance's region, never a crash.
+        const nowhere = { ...data, raw: { ...data.raw, region: undefined } } as unknown as typeof data;
+        const e = await p.createServer({ ...o, name: 'b', mounts: [{ volume: nowhere }] }).catch((x) => x);
+        expect(e).toBeInstanceOf(ProviderError);
+        expect(e.message).toMatch(/^lambda: filesystem data is in .*: an instance in us-east-1 cannot mount it$/);
+    });
+
+    it('deleteVolume refuses at once, waiting for nothing, a filesystem a live instance mounts, and any other failure', async () => {
+        const fake = fakeLambda();
+        const sent: string[] = [];
+        let inactive = false;
+        const p = new LambdaCloud({ apiKey: 'lambda-test', sleep: noSleep, fetchImpl: answering(fake, (method, path) => {
+            sent.push(`${method} ${path}`);
+            return inactive && method === 'DELETE' ? json(403, { error: { code: 'global/account-inactive', message: 'Your account is inactive.' } }) : undefined;
+        }) });
+        const held = await p.createVolume({ name: 'models', region: 'us-east-1' });
+        const free = await p.createVolume({ name: 'data', region: 'us-east-1' });
+        await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'], mounts: [{ volume: held }] });
+        sent.length = 0;
+        await expect(p.deleteVolume(held.id, fast)).rejects.toMatchObject({ status: 400, code: 'filesystems/filesystem-in-use' });
+        // The refusal, and the read that shows a live instance mounts it: no wait, no second delete.
+        expect(sent).toEqual([`DELETE /api/v1/filesystems/${held.id}`, 'GET /api/v1/instances']);
+        inactive = true;
+        sent.length = 0;
+        await expect(p.deleteVolume(free.id, fast)).rejects.toMatchObject({ status: 403, code: 'global/account-inactive' });
+        expect(sent).toEqual([`DELETE /api/v1/filesystems/${free.id}`]);
+    });
+
+    it('deleteVolume waits as long as Lambda takes to let go of a filesystem whose instance is gone, then deletes it', async () => {
+        const fake = fakeLambda({ releaseReads: 5 });
+        const p = new LambdaCloud({ apiKey: 'lambda-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
+        const fs = await p.createVolume({ name: 'models', region: 'us-east-1' });
+        const s = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'], mounts: [{ volume: fs }] });
+        await p.waitUntilRunning(s.id, fast);
+        await p.deleteServer(s.id);
+        while (await p.getServer(s.id)) { /* the fake moves on with every read */ }
+        await p.deleteVolume(fs.id, fast);
+        expect(await p.getVolume(fs.id)).toBeNull();
+        // Refused while Lambda held it, then deleted once it let go.
+        expect(fake.calls.filter((c) => c.method === 'DELETE').map((c) => c.path)).toEqual([`/api/v1/filesystems/${fs.id}`, `/api/v1/filesystems/${fs.id}`]);
+    });
+
+    it('waits up to 5 minutes by default, reading every 10 s, for Lambda to let go of what an instance mounted; then says which filesystems it still holds', async () => {
+        // Lambda never lets go here.
+        const fake = fakeLambda({ releaseReads: 1e9 });
+        await clocked(fake, async (p) => {
+            const models = await p.createVolume({ name: 'models', region: 'us-east-1' });
+            const data = await p.createVolume({ name: 'data', region: 'us-east-1' });
+            const s = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'], mounts: [{ volume: models }, { volume: data }] });
+            await p.waitUntilRunning(s.id, fast);
+            const before = reads(fake);
+            await expect(p.deleteServerAndWait(s.id)).rejects.toThrow(`timed out after 300 s waiting for filesystem(s) to be let go by instance ${s.id}: models, data in use, by no live instance`);
+            // At 0 s, 10 s, ... 300 s.
+            expect(reads(fake) - before).toBe(31);
+        });
+    });
+
+    it('a filesystem only a preempted instance still lists is not held by it: deleteVolume waits for Lambda to let go, and says so when it does not', async () => {
+        const fake = fakeLambda();
+        await clocked(fake, async (p) => {
+            const fs = await p.createVolume({ name: 'models', region: 'us-east-1' });
+            const s = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'], mounts: [{ volume: fs }] });
+            fake.state.instances.get(s.id).status = 'preempted';
+            expect((await p.listServers()).find((x) => x.id === s.id)).toMatchObject({ status: 'terminated', mounts: [{ volumeId: fs.id }] });
+            await expect(p.deleteVolume(fs.id, { timeoutMs: 60_000 })).rejects.toThrow('timed out after 60 s waiting for filesystem(s) to be let go: models in use, by no live instance');
+        });
     });
 });

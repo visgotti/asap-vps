@@ -6,13 +6,18 @@
 // machine, whose driver's CUDA version is read before it is rented.
 
 import { RegistryClient } from '../../Core/utils';
-import { CapacityError, NotSupportedError, ProviderError } from '../../errors';
+import { CapacityError, isRetriable, NotSupportedError, ProviderError } from '../../errors';
+import { json, testPublicKey } from '../../testing/fakes/util';
 import { FAKE_SNAPSHOTS, fakeVast } from '../../testing/fakes/vast';
 import { VastAI } from './VastAI';
 
 const noSleep = async () => {};
 const fast = { intervalMs: 0, timeoutMs: 5000 };
 const last = <T>(a: T[]): T | undefined => a[a.length - 1];
+
+/** The fake, but for the requests `answer` answers itself: an answer Vast may give that the fake does not. */
+const answering = (fake: ReturnType<typeof fakeVast>, answer: (method: string, path: string) => Response | undefined) =>
+    (async (url: string, init?: RequestInit) => answer(init?.method ?? 'GET', new URL(url).pathname) ?? fake.fetchImpl(url, init)) as typeof fetch;
 
 describe('VastAI', () => {
     const make = () => {
@@ -76,6 +81,63 @@ describe('VastAI', () => {
         const upload = fake.calls.filter((c) => c.host === 'logs.fake');
         expect(upload.length).toBeGreaterThan(1);
         expect(upload.every((c) => c.auth === undefined)).toBe(true);
+    });
+
+    it('a log Vast hands no address for is empty; one never uploaded is an error worth retrying, after 10 fetches', async () => {
+        const { p, fake } = make();
+        const s = await p.createServer({ name: 'logs', offer: '101', image: 'img', command: ['sh', '-c', 'echo "one"'] });
+        fake.state.logs.get(s.id)!.fetchesBeforeReady = 1e9;
+        const e = await p.getServerLogs(s.id).catch((x) => x);
+        expect([e.constructor.name, e.message, isRetriable(e)]).toEqual(['ProviderError', `vast: the log of instance ${s.id} was not uploaded in time`, true]);
+        expect(fake.calls.filter((c) => c.host === 'logs.fake')).toHaveLength(10);
+        const unsent = new VastAI({ apiKey: 'vast-test', sleep: noSleep,
+            fetchImpl: answering(fake, (_, path) => (path.startsWith('/api/v0/instances/request_logs/') ? json(200, { success: true }) : undefined)) });
+        expect(await unsent.getServerLogs(s.id)).toBe('');
+    });
+
+    it('refuses before anything is rented: an offer id that names no ask, a port of no protocol Vast maps, an env name no shell takes', async () => {
+        const { p, fake } = make();
+        const o = { name: 'x', offer: '101', image: 'img' };
+        await expect(p.createServer({ ...o, offer: 'gpu-x' })).rejects.toThrow('bad offer id "gpu-x"');
+        await expect(p.createServer({ ...o, ports: ['80/sctp'] })).rejects.toThrow('bad port "80/sctp": use <port>/<tcp|udp|http>');
+        await expect(p.createServer({ ...o, env: { '1BAD': 'x' } })).rejects.toThrow('bad env name "1BAD"');
+        expect(fake.calls).toEqual([]);
+    });
+
+    it('rents the disk asked for in whole GB, rounded up', async () => {
+        const { p, fake } = make();
+        await p.createServer({ name: 'x', offer: '101', image: 'img', diskGb: 20.5 });
+        expect(fake.calls.find((c) => c.method === 'PUT' && c.path === '/api/v0/asks/101/')?.body.disk).toBe(21);
+    });
+
+    it('a rental that answers no instance id is an error; an instance not listed yet is what the rental said of it', async () => {
+        const fake = fakeVast();
+        const none = new VastAI({ apiKey: 'vast-test', sleep: noSleep,
+            fetchImpl: answering(fake, (method, path) => (method === 'PUT' && path === '/api/v0/asks/101/' ? json(200, { success: true }) : undefined)) });
+        await expect(none.createServer({ name: 'x', offer: '101', image: 'img' })).rejects.toThrow('vast: the rental returned no instance id (new_contract)');
+        // Rented, but neither the list nor the single read has it yet.
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (method, path) => {
+            if (method === 'GET' && path === '/api/v1/instances/') return json(200, { success: true, instances: [], next_token: null });
+            return method === 'GET' && /^\/api\/v0\/instances\/\d+\/$/.test(path) ? json(200, { instances: null }) : undefined;
+        }) });
+        const s = await p.createServer({ name: 'x', offer: '101', image: 'img' });
+        const id = Math.max(...[...fake.state.instances.values()].map((i) => i.id));
+        expect(s).toEqual({
+            provider: 'vast', id: String(id), name: 'x', status: 'pending', providerStatus: 'created/?', offerId: '101', billing: VastAI.BILLING,
+            raw: { id, label: 'x', actual_status: 'created' },
+        });
+    });
+
+    it('stops reading an instance list that never ends after 400 pages', async () => {
+        const fake = fakeVast();
+        let pages = 0;
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (_, path) => {
+            if (path !== '/api/v1/instances/') return undefined;
+            pages++;
+            return json(200, { success: true, instances: [], next_token: 'more' });
+        }) });
+        await expect(p.listServers()).rejects.toThrow('vast: the instance list has more than 400 pages');
+        expect(pages).toBe(400);
     });
 });
 
@@ -165,6 +227,50 @@ describe('Vast.ai API facts', () => {
         Object.assign(inst, { actual_status: 'running', cur_state: 'running', intended_status: 'stopped' });
         expect((await p.getServer(s.id))?.status).toBe('stopping');
     });
+
+    it('a page that adds no machine ends the search: 64 offers at one price are read in two searches, not eight', async () => {
+        const { p, fake } = make();
+        // These alone, at one price: the next page starts at that price, and is the same page.
+        fake.state.asks.length = 0;
+        for (let i = 0; i < 64; i++) {
+            fake.state.asks.push({ id: 3000 + i, gpu_name: 'RTX 3060', num_gpus: 1, gpu_ram: 12288, dph_total: 0.05, min_bid: 0.03,
+                geolocation: 'Ohio, US', rentable: true, verified: true, reliability: 0.99, cuda_max_good: 12.8, machine_id: 4000 + i } as any);
+        }
+        expect((await p.listOffers()).map((o) => o.id)).toEqual(Array.from({ length: 64 }, (_, i) => String(3000 + i)));
+        expect(searches(fake).map((c) => c.body.dph_total)).toEqual([undefined, { gte: 0.05 }]);
+    });
+
+    it('answers that leave out their list read as nothing: no instances, offers or volumes', async () => {
+        const fake = fakeVast();
+        // Each answer as the fake gives it, less its list.
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: (async (url: string, init?: RequestInit) => {
+            const body = await (await fake.fetchImpl(url, init)).json();
+            for (const k of ['instances', 'offers', 'volumes']) delete body[k];
+            return json(200, body);
+        }) as typeof fetch });
+        expect([await p.listServers(), await p.listOffers(), await p.offersOn('machine:14'), await p.listVolumes()]).toEqual([[], [], [], []]);
+    });
+
+    it('a 429 is an error worth retrying that keeps its status and code; sent again first, as nothing was done', async () => {
+        const fake = fakeVast();
+        let sent = 0;
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (method, path) => {
+            if (method !== 'PUT' || path !== '/api/v0/asks/101/') return undefined;
+            sent++;
+            return json(429, { success: false, error: 'rate_limited', msg: 'Too many requests' });
+        }) });
+        const e = await p.createServer({ name: 'x', offer: '101', image: 'img' }).catch((x) => x);
+        expect([e.constructor.name, e.status, e.code, isRetriable(e)]).toEqual(['ProviderError', 429, 'rate_limited', true]);
+        expect(sent).toBe(4);
+    });
+
+    it('a key added with no name goes as the bare key', async () => {
+        const { p, fake } = make();
+        const line = testPublicKey('ignored');
+        const bare = line.split(' ').slice(0, 2).join(' ');
+        expect(await p.addSSHKey(line, '')).toMatchObject({ name: '', publicKey: bare });
+        expect(last(fake.calls.filter((c) => c.method === 'POST' && c.path === '/api/v0/ssh/'))?.body).toEqual({ ssh_key: bare });
+    });
 });
 
 describe('minCudaVersion on Vast: every offer is one machine, read before it is rented', () => {
@@ -193,6 +299,14 @@ describe('minCudaVersion on Vast: every offer is one machine, read before it is 
         const reads = fake.calls.filter((c) => c.path === '/api/v0/bundles/' && c.body?.limit === 1);
         expect(reads.map((c) => c.body.ask_contract_id)).toEqual([{ eq: 104 }, { eq: 101 }, { eq: 102 }]);
         expect(reads.every((c) => c.body.id === undefined)).toBe(true);
+    });
+
+    it('a machine whose driver Vast does not report is not rented with a floor', async () => {
+        const { p, fake } = make();
+        delete (fake.state.asks.find((a) => a.id === 101) as { cuda_max_good?: number }).cuda_max_good;
+        const e = await p.createServer({ name: 'x', offer: '101', image: 'img', minCudaVersion: '12.0' }).catch((x) => x);
+        expect([e.constructor.name, e.message]).toEqual(['CapacityError', 'vast: offer 101: its host\'s driver runs CUDA (unknown), below 12.0']);
+        expect(rents(fake)).toHaveLength(0);
     });
 });
 
@@ -307,6 +421,17 @@ describe('Vast userData: a script run before the command, each time the containe
         await expect(p.createServer({ name: 'a', offer, image: 'busybox', userData: 'echo hi' })).rejects.toThrow(/without "command"/);
         expect(rentals(fake)).toEqual([]);
     });
+
+    it('cloud-config is told by how it starts, blank space before it and all; a script that only mentions it is a script', async () => {
+        const { fake, p } = make();
+        const [offer] = await p.listOffers();
+        await expect(p.createServer({ name: 'a', offer, image: 'busybox', userData: '\n  #cloud-config\nruncmd: [true]', command: ['true'] }))
+            .rejects.toThrow('createServer option "userData" as cloud-config (a Vast container runs no cloud-init: pass a shell script) is not supported');
+        expect(rentals(fake)).toEqual([]);
+        const script = '#!/bin/sh\necho "not #cloud-config" > /tmp/note';
+        await p.createServer({ name: 'b', offer, image: 'busybox', userData: script, command: ['true'] });
+        expect(rentals(fake)).toMatchObject([{ onstart: 'sh', args: ['-c', `${script}\nexec "$@"`, 'asap-vps', 'true'] }]);
+    });
 });
 
 describe('Vast volumes: storage on one machine, mounted by an instance rented there (observed 2026-10-06)', () => {
@@ -338,6 +463,9 @@ describe('Vast volumes: storage on one machine, mounted by an instance rented th
         // (To the second: the two dates are two readings of the clock.)
         expect(vol.raw.end_date! - vol.raw.start_date!).toBeCloseTo(30 * 86_400, 0);
         expect(last(fake.calls.filter((c) => c.method === 'PUT' && c.path === '/api/v0/volumes/'))?.body).toEqual({ id: 5014, size: 20, name: 'weights_1' });
+        // Rented from the machine's storage offers with room for it, cheapest first.
+        const search = last(fake.calls.filter((c) => c.path === '/api/v0/volumes/search/'));
+        expect([search?.method, search?.body]).toEqual(['POST', { machine_id: { eq: 14 }, disk_space: { gte: 20 }, order: [['storage_cost', 'asc']], limit: 64, allocated_storage: 20 }]);
         expect(await p.getVolume(vol.id)).toMatchObject({ id: vol.id });
         expect((await p.listVolumes()).map((v) => v.name)).toEqual(['weights_1']);
         await p.deleteVolume(vol.id, fast);
@@ -358,6 +486,7 @@ describe('Vast volumes: storage on one machine, mounted by an instance rented th
         await expect(p.createVolume({ name: 'v', region: 'Ohio, US', sizeGb: 1 })).rejects.toThrow(/on one machine: region "Ohio, US" names none/);
         expect(fake.calls).toEqual([]);
         await expect(p.createVolume({ name: 'v', region: 'machine:14', sizeGb: 401 })).rejects.toBeInstanceOf(CapacityError);
+        await expect(p.createVolume({ name: 'v', region: 'machine:14', sizeGb: 401 })).rejects.toThrow('machine 14 has no room for a volume of 401 GB now');
         expect(fake.state.volumes.size).toBe(1);
     });
 
@@ -414,6 +543,13 @@ describe('Vast volumes: storage on one machine, mounted by an instance rented th
         const other = (await p.listOffers({ kind: 'gpu' }))[0];
         fake.state.asks.find((a) => a.id === Number(other.id))!.machine_id = 14;
         await expect(p.createServer({ ...base, offer: other.id, mounts: [{ volume: vol.id }] })).rejects.toThrow(`volume ${vol.id} is attached to instance ${holder.id}: one instance mounts it at a time`);
+        // Vast lists a volume's instances: every one is named.
+        fake.state.volumes.get(vol.id).instances.push(424242);
+        await expect(p.createServer({ ...base, offer: other.id, mounts: [{ volume: vol.id }] })).rejects.toThrow(`volume ${vol.id} is attached to instance ${holder.id}, 424242: one instance mounts it at a time`);
+        // An offer whose machine Vast does not say is not where any volume is.
+        delete (fake.state.asks.find((a) => a.id === 102) as { machine_id?: number }).machine_id;
+        await expect(p.createServer({ ...base, offer: '102', mounts: [{ volume: far.id }] }))
+            .rejects.toThrow(`volume ${far.id} is on machine:11: only an instance rented there mounts it, and offer 102 is on (an unknown machine)`);
         await expect(p.createServer({ ...base, volume: { sizeGb: 10, path: '/x' } } as never)).rejects.toBeInstanceOf(NotSupportedError);
         expect(rentals(fake)).toHaveLength(1);
     });
@@ -434,6 +570,67 @@ describe('Vast volumes: storage on one machine, mounted by an instance rented th
         expect(toVolume({ id: 5, machine_id: 3, instances: [], status: 'in-use' }).status).toBe('attached');
         expect(toVolume({ id: 5, machine_id: 3, status: 'weird' })).toMatchObject({ status: 'unknown', serverIds: [] });
         expect(toVolume({ id: 5, machine_id: 3 }).sizeGb).toBeUndefined();
+    });
+
+    it('a volume Vast lists without a type is one of a machine\'s', async () => {
+        const { p, fake } = make();
+        const vol = await p.createVolume({ name: 'untyped', region: 'machine:14', sizeGb: 1, ...fast });
+        delete fake.state.volumes.get(vol.id).type;
+        expect((await p.listVolumes()).map((v) => [v.id, v.region])).toEqual([[vol.id, 'machine:14']]);
+    });
+
+    it('the storage search is a read, sent again on a server error; all of a machine\'s room can be taken', async () => {
+        const fake = fakeVast();
+        let searched = 0;
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (_, path) => {
+            if (path !== '/api/v0/volumes/search/') return undefined;
+            return searched++ === 0 ? json(503, { success: false, error: 'server_error', msg: 'upstream timeout' }) : undefined;
+        }) });
+        // The machine has 400 GB of room.
+        expect(await p.createVolume({ name: 'all_of_it', region: 'machine:14', sizeGb: 400, ...fast })).toMatchObject({ region: 'machine:14', sizeGb: 400, status: 'available' });
+        expect(searched).toBe(2);
+    });
+
+    it('rents from a storage offer of that machine with room for the size, whatever else the search answers', async () => {
+        const fake = fakeVast();
+        // Another machine's offer with room, this machine's with too little, then the one to take.
+        const offers = [{ id: 5011, machine_id: 11, disk_space: 400, storage_cost: 0.1 }, { id: 5099, machine_id: 14, disk_space: 5, storage_cost: 0.15 },
+            { id: 5014, machine_id: 14, disk_space: 400, storage_cost: 0.2 }];
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (_, path) => (path === '/api/v0/volumes/search/' ? json(200, { offers }) : undefined)) });
+        expect(await p.createVolume({ name: 'here', region: 'machine:14', sizeGb: 20, ...fast })).toMatchObject({ region: 'machine:14', sizeGb: 20 });
+        expect(fake.calls.filter((c) => c.method === 'PUT' && c.path === '/api/v0/volumes/').map((c) => c.body.id)).toEqual([5014]);
+    });
+
+    it('createVolume and deleteVolume time out saying what Vast last showed: the volume not listed yet, or still listed as it was', async () => {
+        const fake = fakeVast();
+        let unlisted = false;
+        let kept = false;
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (method, path) => {
+            if (unlisted && method === 'GET' && path === '/api/v0/volumes') return json(200, { volumes: [] });
+            return kept && method === 'DELETE' && path === '/api/v0/volumes/' ? json(200, { success: true }) : undefined;
+        }) });
+        unlisted = true;
+        const e = await p.createVolume({ name: 'unlisted', region: 'machine:14', sizeGb: 1, timeoutMs: 0 }).catch((x) => x);
+        const id = Math.max(...[...fake.state.volumes.values()].map((v) => v.id));
+        expect(e.message).toBe(`vast: timed out after 0 s waiting for volume ${id}: not listed`);
+        unlisted = false;
+        kept = true;
+        await expect(p.deleteVolume(String(id), { timeoutMs: 0 })).rejects.toThrow(`timed out after 0 s waiting for delete of volume ${id}: created`);
+    });
+
+    it('deleteServerAndWait says false when the instance is still there at the timeout; a volume Vast never lets go of times out saying so', async () => {
+        const fake = fakeVast({ volumeReleaseReads: 1e9 });
+        let kept = false;
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (method, path) => (kept && method === 'DELETE' && /^\/api\/v0\/instances\/\d+\/$/.test(path)
+            ? json(200, { success: true, msg: 'destroying instance' }) : undefined)) });
+        const vol = await p.createVolume({ name: 'data', region: 'machine:14', sizeGb: 10, ...fast });
+        const s = await p.createServer({ name: 'x', offer: '104', ...IMAGE, mounts: [{ volume: vol }] });
+        // The delete is taken, but the instance stays.
+        kept = true;
+        expect(await p.deleteServerAndWait(s.id, { timeoutMs: 0 })).toBe(false);
+        kept = false;
+        await expect(p.deleteServerAndWait(s.id, { timeoutMs: 0 })).rejects.toThrow(`timed out after 0 s waiting for volume ${vol.id} to let go of instance ${s.id}: still in use by instance ${s.id}, which is gone`);
+        expect(await p.getServer(s.id)).toBeNull();
     });
 });
 
@@ -517,6 +714,41 @@ describe('Vast images: snapshots an instance pushes to a registry of yours (obse
         expect(fake.registry.tags.get('acme/snapshots')!.has('never')).toBe(false);
     });
 
+    it('createImage waits up to an hour by default, reading the repository every 30 s', async () => {
+        const { p, fake } = make({ snapshotReads: 1e9 });
+        const s = await running(p);
+        // The clock moves only as the provider sleeps.
+        let now = Date.now();
+        const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+            let listed = 0;
+            const counting = (async (url: string, init?: RequestInit) => {
+                const r = await fake.fetchImpl(url, init);
+                // Each read of the tags (its login's challenge aside).
+                if (new URL(url).pathname === '/v2/acme/snapshots/tags/list' && r.status === 200) listed++;
+                return r;
+            }) as typeof fetch;
+            const q = new VastAI({ apiKey: 'vast-test', fetchImpl: counting, sleep: async (ms) => { now += ms; }, snapshots: FAKE_SNAPSHOTS });
+            await expect(q.createImage(s.id, { name: 'never' })).rejects.toThrow(`timed out after 3600 s waiting for the snapshot of instance ${s.id} in registry.fake/acme/snapshots: not pushed yet`);
+            // The tags before, then at 0 s, 30 s, ... 3600 s.
+            expect(listed).toBe(1 + 121);
+        } finally {
+            clock.mockRestore();
+        }
+    });
+
+    it('a snapshot gone before it could be named is an error saying so', async () => {
+        const fake = fakeVast();
+        // Its manifest is gone by the time it is read.
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, snapshots: FAKE_SNAPSHOTS,
+            fetchImpl: answering(fake, (method, path) => (method === 'GET' && path.startsWith('/v2/acme/snapshots/manifests/instance_') ? new Response(null, { status: 404 }) : undefined)) });
+        const s = await running(p);
+        const e = await p.createImage(s.id, { name: 'named', ...fast }).catch((x) => x);
+        const [tag] = [...fake.registry.tags.get('acme/snapshots')!.keys()];
+        expect([e.constructor.name, e.message]).toEqual(['ProviderError', `vast: the snapshot registry.fake/acme/snapshots:${tag} went before it could be named named`]);
+        expect(fake.registry.tags.get('acme/snapshots')!.has('named')).toBe(false);
+    });
+
     it('a Docker Hub repository is read as Docker Hub names it: its short names are its images too', async () => {
         const { p, fake } = make({}, { server: 'docker.io', repository: 'acme/snaps', username: 'hubber', password: 'hub-token' });
         await p.createServer({ name: 'short', offer: '104', image: 'acme/snaps:v1', command: ['nvidia-smi'] });
@@ -560,6 +792,13 @@ describe('Vast regions: an offer is one machine, rented where it is', () => {
         const taken = (await p.listOffers({ kind: 'gpu', includeUnavailable: true })).find((o) => o.id === '103')!;
         await expect(p.createServer({ name: 'x', offer: taken, region: 'Sweden, SE', ...IMAGE })).rejects.toBeInstanceOf(CapacityError);
         await expect(p.createServer({ name: 'x', offer: '103', region: 'Sweden, SE', ...IMAGE })).rejects.toThrow(/offer 103 has no stock anywhere right now/);
+        expect(rentals(fake)).toEqual([]);
+    });
+
+    it('an offer id Vast no longer has, with a region asked for, is a CapacityError saying so before anything is rented', async () => {
+        const { p, fake } = make();
+        const e = await p.createServer({ name: 'x', offer: '999', region: 'Texas, US', ...IMAGE }).catch((x) => x);
+        expect([e.constructor.name, e.message]).toEqual(['CapacityError', 'vast: offer 999 is no longer offered']);
         expect(rentals(fake)).toEqual([]);
     });
 });

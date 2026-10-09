@@ -3,8 +3,8 @@
 // default), never NaN or a crash.
 
 import { testPublicKey } from '../../testing/fakes/util';
-import { instanceStatus, toImage, toOffer, toServer, toSSHKey } from './mappers';
-import type { VastInstance, VastOffer, VastSnapshotRepository } from './types';
+import { instanceStatus, machineOf, toImage, toOffer, toServer, toSSHKey, toVolume } from './mappers';
+import type { VastInstance, VastOffer, VastSnapshotRepository, VastVolume } from './types';
 
 describe('Vast offers', () => {
     it('an ask that says next to nothing: one GPU of no known model, its place unknown, no CUDA', () => {
@@ -41,6 +41,21 @@ describe('Vast instances', () => {
     it('ports: a key with no protocol is tcp; one Vast has not mapped yet is left out', () => {
         const s = toServer({ id: 9, public_ipaddr: '198.51.100.7\n', ports: { '8080': [{ HostIp: '0.0.0.0', HostPort: '41234' }], '22/tcp': null, '53/udp': [{ HostIp: '0.0.0.0' }] } } as unknown as VastInstance);
         expect(s.ports).toEqual([{ privatePort: 8080, publicPort: 41234, ip: '198.51.100.7', protocol: 'tcp' }]);
+        // A binding that is null among the port's bindings is no binding.
+        expect(toServer({ id: 9, ports: { '443/tcp': [null, { HostIp: '0.0.0.0', HostPort: '41000' }] } } as unknown as VastInstance).ports)
+            .toEqual([{ privatePort: 443, publicPort: 41000, ip: undefined, protocol: 'tcp' }]);
+    });
+});
+
+describe('Vast volumes and machines', () => {
+    it('a region names a machine when the whole of it, blank space aside, is machine:<id>', () => {
+        expect(['machine:14', ' machine:14\n', 'xmachine:14', 'machine:14x', 'machine:', 'Ohio, US'].map((r) => machineOf(r))).toEqual([14, 14, undefined, undefined, undefined, undefined]);
+    });
+
+    it('a volume that says next to nothing: no size where Vast gives null, no status word, and an instance entry that is null is no instance', () => {
+        const v = toVolume({ id: 5, machine_id: 3, disk_space: null, instances: [null, 9] } as unknown as VastVolume);
+        expect(v).toMatchObject({ id: '5', region: 'machine:3', status: 'attached', providerStatus: '', serverIds: ['9'] });
+        expect(v.sizeGb).toBeUndefined();
     });
 });
 
