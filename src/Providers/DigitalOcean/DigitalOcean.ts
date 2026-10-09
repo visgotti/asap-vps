@@ -355,11 +355,13 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         if (o.shared) return this.createShare(o);
         const size = Math.ceil(o.sizeGb);
         if (!(size >= 1 && size <= 16384)) throw new ProviderError(this.id, `a volume is 1-16384 GiB, not ${o.sizeGb}`);
-        // Tagged with its filesystem: DigitalOcean says it only in this answer, never in a read.
-        const filesystem = o.providerOptions?.filesystem_type ?? 'ext4';
-        const tags = [...(o.providerOptions?.tags ?? []), ...(filesystem ? [`${FS_TAG}${filesystem}`] : [])];
+        // Tagged with its filesystem: DigitalOcean says it only in this answer, never in a read. The tag and the request
+        // take it from one place, so an option given but unset (undefined) formats ext4 as tagged, never a bare disk tagged ext4.
+        const { filesystem_type, tags: given, ...rest } = o.providerOptions ?? {};
+        const filesystem = filesystem_type ?? 'ext4';
+        const tags = [...(given ?? []), ...(filesystem ? [`${FS_TAG}${filesystem}`] : [])];
         const { volume } = await this.api.call<{ volume: DigitalOceanVolumeData }>('POST', '/v2/volumes', {
-            name: o.name, size_gigabytes: size, region: this.regionName(o.region), filesystem_type: 'ext4', ...o.providerOptions, tags,
+            name: o.name, size_gigabytes: size, region: this.regionName(o.region), ...rest, ...(filesystem ? { filesystem_type: filesystem } : {}), tags,
         });
         return toVolume(volume);
     }

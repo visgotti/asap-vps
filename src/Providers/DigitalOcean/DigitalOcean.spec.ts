@@ -578,6 +578,20 @@ describe('DigitalOcean Block Storage volumes', () => {
         expect(xfs.mountPath).toBe('/mnt/scratch_v2_a');
     });
 
+    it('a filesystem option given but unset is the default: formatted ext4, as its tag says; the tag and the request never disagree', async () => {
+        const { fake, p } = make();
+        const sent = () => fake.calls.filter((c) => c.path === '/v2/volumes').pop()?.body;
+        // As code passes a setting it may not have: `{ filesystem_type: config.fs }`.
+        const unset: { filesystem_type?: 'ext4' | 'xfs' } = { filesystem_type: undefined };
+        const vol = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 10, providerOptions: unset });
+        expect(sent()).toEqual({ name: 'models', size_gigabytes: 10, region: 'tor1', filesystem_type: 'ext4', tags: ['asap-vps-fs:ext4'] });
+        expect([vol.raw.filesystem_type, vol.mountPath]).toEqual(['ext4', '/mnt/models']);
+        // Code that is not typed and asks for no filesystem gets a bare disk: nothing formats it, nothing tags it, nothing mounts it.
+        const bare = await p.createVolume({ name: 'raw-disk', region: 'tor1', sizeGb: 10, providerOptions: { filesystem_type: '' } as unknown as typeof unset });
+        expect(sent()).toEqual({ name: 'raw-disk', size_gigabytes: 10, region: 'tor1', tags: [] });
+        expect(bare.mountPath).toBeUndefined();
+    });
+
     it('a name of up to 64 characters and a size of 1 to 16384 GiB are taken; a longer name, or one with a character DigitalOcean refuses after a valid start, is refused before anything is sent', async () => {
         const { fake, p } = make();
         for (const name of ['models_v2', 'models.v2', `a${'b'.repeat(64)}`]) {
