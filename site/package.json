@@ -1,0 +1,22 @@
+{
+  "name": "asap-vps-docs",
+  "private": true,
+  "description": "The documentation site of asap-vps: Monaco editors with the library's real types, running snippets against its fakes in a Web Worker. Built with esbuild.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --serve",
+    "check": "node scripts/check-snippets.mjs",
+    "typecheck": "../node_modules/.bin/tsc -p tsconfig.json",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "devDependencies": {
+    "@noble/hashes": "^2.4.0",
+    "buffer": "^6.0.3",
+    "esbuild": "^0.28.2",
+    "marked": "^18.1.0",
+    "monaco-editor": "^0.57.0",
+    "path-browserify": "^1.0.1",
+    "puppeteer-core": "^24.43.1"
+  }
+}

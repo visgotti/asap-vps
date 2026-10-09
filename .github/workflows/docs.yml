@@ -1,0 +1,57 @@
+# The documentation site (site/): built with esbuild, with Monaco editors that have this library's real types and a sandbox that runs the
+# snippets against its fakes. Every build first type-checks and executes every code block of every page (npm run docs:check), so the docs
+# cannot show code that no longer compiles. Pull requests build and check; only master deploys to GitHub Pages.
+
+name: Docs
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths: ['site/**', 'src/**', 'package.json', '.github/workflows/docs.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # As ci.yml: GitHub's runners, or the self-hosted ones the variable CI_RUNS_ON names (never for a fork's pull request).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            site/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix site
+      - name: Type-check the site, then every snippet on it (and run the runnable ones)
+        run: npm run docs:check
+      - run: npm run docs:build
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
+        with:
+          path: site/dist
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

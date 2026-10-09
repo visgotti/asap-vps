@@ -1,0 +1,21 @@
+// Types into the first editor of a page and prints what the completion widget offers, with a screenshot: proof that the editors have the library's real types.
+import { launch } from './chrome.mjs';
+const route = process.argv[2] ?? '#/overview';
+const typed = process.argv[3] ?? '\ndigitalOcean.';
+const out = process.argv[4] ?? '/tmp/complete.png';
+const browser = await launch();
+const page = await browser.newPage();
+await page.setViewport({ width: 1360, height: 1000 });
+await page.goto(`${process.env.SITE_URL ?? 'http://localhost:8765/'}${route}`, { waitUntil: 'networkidle2', timeout: 90000 });
+await page.waitForSelector('.snippet.live .monaco-editor', { timeout: 60000 });
+await new Promise((r) => setTimeout(r, 4000));
+await page.click('.snippet.live .monaco-editor .view-lines');
+await page.keyboard.down('Control'); await page.keyboard.press('End'); await page.keyboard.up('Control');
+await page.keyboard.type(typed, { delay: 30 });
+await page.keyboard.down('Control'); await page.keyboard.press('Space'); await page.keyboard.up('Control');
+await page.waitForSelector('.suggest-widget.visible', { timeout: 30000 }).catch(() => console.log('no suggest widget'));
+await new Promise((r) => setTimeout(r, 800));
+const items = await page.evaluate(() => [...document.querySelectorAll('.suggest-widget .monaco-list-row')].map((r) => r.getAttribute('aria-label') ?? r.textContent));
+console.log(`${items.length} suggestions: ${items.slice(0, 40).join(' | ')}`);
+await page.screenshot({ path: out });
+await browser.close();

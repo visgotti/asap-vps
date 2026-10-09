@@ -1,26 +1,13 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
-import { exec } from 'child_process';
 import { NodeSSH } from 'node-ssh';
-import { encrypt, decrypt, makeId, retryInvoke,ensureDirectoryExists } from '../utils';
+import { encrypt, decrypt, makeId, retryInvoke, ensureDirectoryExists, createSSHKeyPair } from './utils';
 import { MACHINE_TYPES, SETUP_SCRIPTS } from '../constants';
-
-const { readFile, unlink, rm } = fs.promises;
-export type SSHKeyData = {
-  publicKey: string,
-  privateKey: string
-}
-
-export type SSHData<T extends (true | false)> = SSHKeyData & {
-  id?: string | number,
-  isEncrypted?: T,
-  username?: string,
-}
-export type EncryptedSSHData = SSHData<true>
-export type UnencryptedSSHData = SSHData<false>
+import type { EncryptedSSHData, SSHConnectOptions, SSHData, SSHEndpoint, SSHKeyData, SSHRetryOptions, UnencryptedSSHData } from '../types';
 
 const DEFAULT_SSH_PATH =  path.join(__dirname, 'temp_ssh');
+const DEFAULT_RETRY: SSHRetryOptions = { maxRetries: 10, retryTimeout: 5000 };
 
 export class SSHService {
     private openConnections : {[ip: string]: { [publicKey: string]: NodeSSH } }  = {};
@@ -34,24 +21,48 @@ export class SSHService {
     }
   }
 
+  /**
+   * An ssh session. The options form reaches any login on any port, so a GPU
+   * server's endpoint spreads straight in: connect({ ...server.ssh, privateKey }).
+   * The positional forms log in as root on port 22.
+   */
+  public static async connect(options: SSHConnectOptions):  Promise<NodeSSH>;
   public static async connect(ip: string, privateKey: string, decryptionKey?: string):  Promise<NodeSSH>;
   public static async connect(ip: string, sshData: EncryptedSSHData, decryptionKey: string):  Promise<NodeSSH>;
   public static async connect(ip: string, sshData: UnencryptedSSHData) : Promise<NodeSSH>;
-  public static async connect(ip: string, privateKey: string, decryptionKey: string | undefined, retryOption: {maxRetries: number, retryTimeout: number}):  Promise<NodeSSH>;
-  public static async connect(ip: string, sshData: EncryptedSSHData | UnencryptedSSHData | string, decryptionKey?: string, retryOption?: {maxRetries: number, retryTimeout: number}) : Promise<NodeSSH> {
+  public static async connect(ip: string, privateKey: string, decryptionKey: string | undefined, retryOption: SSHRetryOptions):  Promise<NodeSSH>;
+  public static async connect(ip: string | SSHConnectOptions, sshData?: EncryptedSSHData | UnencryptedSSHData | string, decryptionKey?: string, retryOption?: SSHRetryOptions) : Promise<NodeSSH> {
     const s = new SSHService();
-    if (retryOption) {
+    if (typeof ip === 'object') {
+      return s.connect(ip);
+    } else if (retryOption) {
       return s.connect(ip, sshData as any, decryptionKey as string, retryOption);
     } else {
       return s.connect(ip, sshData as any, decryptionKey as string);
     }
   }
 
+  public async connect(options: SSHConnectOptions):  Promise<NodeSSH>;
   public async connect(ip: string, privateKey: string, decryptionKey?: string):  Promise<NodeSSH>;
   public async connect(ip: string, sshData: EncryptedSSHData, decryptionKey: string):  Promise<NodeSSH>;
   public async connect(ip: string, sshData: UnencryptedSSHData) : Promise<NodeSSH>;
-  public async connect(ip: string, privateKey: string, decryptionKey: string | undefined, retryOption: {maxRetries: number, retryTimeout: number}):  Promise<NodeSSH>;
-  public async connect(ip: string, sshData: SSHData<boolean> | string, decryptionKey?: string, retryOption={maxRetries: 10, retryTimeout: 5000}) : Promise<NodeSSH> {
+  public async connect(ip: string, privateKey: string, decryptionKey: string | undefined, retryOption: SSHRetryOptions):  Promise<NodeSSH>;
+  public async connect(ipOrOptions: string | SSHConnectOptions, sshData?: SSHData<boolean> | string, decryptionKey?: string, retryOption=DEFAULT_RETRY) : Promise<NodeSSH> {
+    if (typeof ipOrOptions === 'object') {
+      const o = ipOrOptions;
+      const ssh = new NodeSSH();
+      const retry = o.retry ?? DEFAULT_RETRY;
+      try {
+        const privateKey = o.decryptionKey ? decrypt(o.privateKey, o.decryptionKey) : o.privateKey;
+        await SSHService.dial(ssh, { host: o.host, port: o.port ?? 22, username: o.username ?? 'root' }, privateKey, retry);
+        return ssh;
+      } catch (err) {
+        console.error(`[SSHService] Failed to connect to ${o.host} after ${retry.maxRetries} retries:`, err.message);
+        throw err;
+      }
+    }
+    const ip = ipOrOptions;
+    if (sshData === undefined) throw new Error(`No private key given to connect to ${ip}`);
     const ssh = new NodeSSH();
     let decryptedPrivateKey = '';
     if(typeof sshData !== "string") {
@@ -59,9 +70,9 @@ export class SSHService {
       if(sshData.isEncrypted && !decryptionKey) {
         throw new Error(`SSH Entity is encrypted but no decryption key was provided`);
       }
-  
+
       decryptedPrivateKey = sshData.isEncrypted || (sshData.isEncrypted === undefined && decryptionKey) ? decrypt(sshData.privateKey, decryptionKey as string) : sshData.privateKey
-      if(this.openConnections[ip] && decryptedPrivateKey in this.openConnections[ip]) {
+      if(this.openConnections[ip] && sshData.publicKey in this.openConnections[ip]) {
           throw new Error(`There is already an open connection with the publicKey: ${sshData.publicKey} on the ip ${ip}`);
       }
       if(!this.openConnections[ip]) {
@@ -71,7 +82,7 @@ export class SSHService {
     } else {
       decryptedPrivateKey = decryptionKey ? decrypt(sshData, decryptionKey as string) : sshData
     }
-        
+
     const removeConnection = () => {
       if(typeof sshData !== "string") {
         let had = ip in this.openConnections;
@@ -90,24 +101,13 @@ export class SSHService {
       }
     }
     try {
-        const _dispose = ssh.dispose;
+        const _dispose = ssh.dispose.bind(ssh);
         ssh.dispose = async () => {
             try { await _dispose();
             } catch (err) {};
             removeConnection();
         }
-        const doConnection = async () => {
-          await ssh.connect({
-            tryKeyboard: true,
-            host: ip,
-            username: 'root',
-            privateKey: decryptedPrivateKey,
-            onKeyboardInteractive(_name: unknown, _instructions: unknown, _instructionsLang: unknown, _prompts:unknown, finish: Function) {
-              finish([])
-            }
-          });
-        }
-        await retryInvoke(doConnection, retryOption.retryTimeout, retryOption.maxRetries);
+        await SSHService.dial(ssh, { host: ip, port: 22, username: 'root' }, decryptedPrivateKey, retryOption);
 
         return ssh;
     } catch (err) {
@@ -117,7 +117,28 @@ export class SSHService {
     }
   }
 
-  
+  /** Connect `ssh` to the endpoint, trying `retry.maxRetries` times. */
+  private static async dial(ssh: NodeSSH, endpoint: SSHEndpoint, privateKey: string, retry: SSHRetryOptions): Promise<void> {
+    await retryInvoke(() => ssh.connect({
+      tryKeyboard: true,
+      host: endpoint.host,
+      port: endpoint.port,
+      username: endpoint.username,
+      privateKey,
+      onKeyboardInteractive(_name: unknown, _instructions: unknown, _instructionsLang: unknown, _prompts: unknown, finish: Function) {
+        finish([]);
+      },
+    }), retry.retryTimeout, retry.maxRetries);
+    // node-ssh stops listening for the connection's errors once it is up, so one that drops later (a read
+    // that times out, a reset) would be an uncaught exception that ends the process: it ends the session
+    // instead, and a command in flight fails.
+    const connection = ssh.connection;
+    connection?.on('error', (err: Error) => {
+      console.error(`[SSHService] The connection to ${endpoint.host} dropped: ${err.message}`);
+      if (ssh.connection === connection) ssh.dispose();
+    });
+  }
+
   public static async installNodeModule(ssh: NodeSSH, options: { module: string, sudo: boolean, global: boolean }) {
     let cmd = `npm install ${options.module}`;
     if(options.sudo) {
@@ -138,7 +159,7 @@ export class SSHService {
     const f = await SSHService.sshGetFileText(ssh, filePath);
     return f === stringToCheck;
   }
-  
+
   public static async installNvm(ssh: NodeSSH, machineType: MACHINE_TYPES = MACHINE_TYPES.UBUNTU_22) {
     await SSHService.sshSetupScript(ssh, machineType, SETUP_SCRIPTS.NVM);
     await ssh.execCommand(`source ~/.profile`);
@@ -171,7 +192,7 @@ export class SSHService {
     } catch (err) {};
     fs.unlinkSync(id);
   }
-  
+
   public static async sshPutTextFile (ssh: NodeSSH, text: string, toPath: string) {
     return ssh.execCommand(`echo "${text}" > ${toPath}`);
   }
@@ -181,7 +202,7 @@ export class SSHService {
       const toPath = `~/tempsetup_${makeId(10)}.sh`;
       await SSHService.sshExecFile(
         ssh,
-        path.resolve(__dirname, '..', 'scripts', 'setup', machineType, scriptType + '.sh'), 
+        path.resolve(__dirname, '..', 'scripts', 'setup', machineType, scriptType + '.sh'),
         toPath
       )
     } catch (error) {
@@ -191,31 +212,19 @@ export class SSHService {
   }
 
 
+  /**
+   * A new key pair, generated in-process (Core/utils/ssh.ts): an RSA 2048
+   * private key in PEM, as `ssh-keygen -m PEM -t rsa -b 2048` makes it, and its
+   * authorized_keys line. Nothing touches the disk unless `deleteAfter` is
+   * false: then the pair is also written to `<path>/id_rsa_<id>` (mode 0600)
+   * and `<path>/id_rsa_<id>.pub`, refusing to overwrite either.
+   */
   public static async createKeys(path=DEFAULT_SSH_PATH, id?: string | number, deleteAfter=true) : Promise<SSHKeyData>{
-    id = id ?? makeId(10);
-    path = path || DEFAULT_SSH_PATH
-    ensureDirectoryExists(path);
-    const privateKeyPath = await SSHService.generateSSHKeyPair(path, id);
-    const publicKeyPath = privateKeyPath + '.pub';
-    const deleteKeys = async () => {
-      try {
-        await Promise.all([
-          unlink(privateKeyPath),
-          unlink(publicKeyPath),
-          rm(path, { recursive: true, force: true })
-        ]);
-      } catch(err) {
-        console.error(err);
-      }
+    const keys = await createSSHKeyPair();
+    if(!deleteAfter) {
+      writeKeyFiles(path || DEFAULT_SSH_PATH, id ?? makeId(10), keys);
     }
-    const [ publicKey, privateKey ] = await Promise.all([
-      readFile(publicKeyPath, 'utf-8'), 
-      readFile(privateKeyPath, 'utf-8')
-    ]);
-    if(deleteAfter) {
-      await deleteKeys();
-    }
-    return { publicKey, privateKey }
+    return keys;
   }
 
 
@@ -250,23 +259,20 @@ export class SSHService {
     return SSHService.generateSSHKeyPair(this.sshPath, id);
   }
 
+  /** createKeys, written to `<sshPath>/id_rsa_<id>` and `.pub`: the private key's path. */
   public static async generateSSHKeyPair(sshPath=DEFAULT_SSH_PATH, id: string | number = makeId(10)) : Promise<string> {
-    return new Promise((resolve, reject) => {
-      ensureDirectoryExists(sshPath);
-      const keyPath = path.join(sshPath, `id_rsa_${id}`);
-      // Execute ssh-keygen command
-      const command = `ssh-keygen -m PEM -t rsa -b 2048 -f ${keyPath} -P ""`;
-      exec(command, (err) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(keyPath);
-        }
-      });
-    });
+    return writeKeyFiles(sshPath, id, await createSSHKeyPair());
   }
 }
 
-
-
-  
+/** `<dir>/id_rsa_<id>` (mode 0600) and its `.pub`, as ssh-keygen writes them; never over existing files. */
+function writeKeyFiles(dir: string, id: string | number, keys: SSHKeyData): string {
+  ensureDirectoryExists(dir);
+  const keyPath = path.join(dir, `id_rsa_${id}`);
+  for (const p of [keyPath, `${keyPath}.pub`]) {
+    if (fs.existsSync(p)) throw new Error(`${p} already exists`);
+  }
+  fs.writeFileSync(keyPath, keys.privateKey, { mode: 0o600, flag: 'wx' });
+  fs.writeFileSync(`${keyPath}.pub`, `${keys.publicKey}\n`, { mode: 0o644, flag: 'wx' });
+  return keyPath;
+}

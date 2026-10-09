@@ -8,23 +8,41 @@
   "exports": {
     ".": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build": "tsc -d",
+    "build": "rm -rf dist && tsc -d -p tsconfig.build.json && cp -R src/scripts dist/scripts",
+    "prepublishOnly": "npm run build",
     "test": "jest",
-    "test:do": "npm run test src/Initializers/DigitalOcean/DigitalOceanInitializer.spec.ts"
+    "test:do": "ASAP_VPS_LIVE=digitalocean-vps jest --config jest.live.config.js DigitalOceanVps.live",
+    "test:do:cpu": "ASAP_VPS_LIVE=digitalocean-cpu jest --config jest.live.config.js DigitalOceanCpu.live",
+    "test:scw": "ASAP_VPS_LIVE=scaleway-vps jest --config jest.live.config.js ScalewayVps.live",
+    "test:scw:cpu": "ASAP_VPS_LIVE=scaleway-cpu jest --config jest.live.config.js ScalewayCpu.live",
+    "test:scw:volumes": "ASAP_VPS_LIVE=scaleway-vps jest --config jest.live.config.js ScalewayVolumes.live",
+    "gpu:smoke": "ts-node --transpile-only scripts/gpu-smoke.ts",
+    "test:live": "jest --config jest.live.config.js",
+    "test:coverage": "jest --coverage",
+    "scaleway:spec": "ts-node --transpile-only scripts/scaleway-spec-check.ts",
+    "api:spec": "ts-node --transpile-only scripts/api-spec-check.ts",
+    "docs:install": "npm install --prefix site",
+    "docs:dev": "npm run dev --prefix site",
+    "docs:build": "npm run build --prefix site",
+    "docs:check": "npm run typecheck --prefix site && npm run check --prefix site"
   },
   "dependencies": {
-    "axios": "^1.11.0",
     "node-ssh": "^13.1.0"
   },
   "devDependencies": {
     "@types/bcrypt": "^5.0.0",
     "@types/jest": "^29.5.2",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.3.1",
     "@types/node-ssh": "^7.0.2",
     "@types/ssh2": "^1.11.19",
     "dotenv": "^16.4.1",
     "jest": "^29.5.0",
+    "js-yaml": "^4.3.2",
     "prettier": "^3.0.0",
     "ts-jest": "^29.1.0",
     "ts-loader": "^9.4.3",
@@ -45,11 +63,59 @@
       "^.+\\.(t|j)s$": "ts-jest"
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s"
+      "src/**/*.ts",
+      "!src/**/*.spec.ts",
+      "!src/testing/**"
     ],
-    "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "coverageDirectory": "coverage",
+    "testEnvironment": "node",
+    "testTimeout": 30000,
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "\\.live\\.spec\\.ts$"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "statements": 90,
+        "branches": 90,
+        "functions": 90,
+        "lines": 90
+      },
+      "./src/Providers/Scaleway/api.ts": {
+        "statements": 100,
+        "branches": 100,
+        "functions": 100,
+        "lines": 100
+      },
+      "./src/Providers/Scaleway/endpoints.ts": {
+        "statements": 100,
+        "branches": 100,
+        "functions": 100,
+        "lines": 100
+      },
+      "./src/Providers/Scaleway/types.ts": {
+        "statements": 100,
+        "branches": 100,
+        "functions": 100,
+        "lines": 100
+      },
+      "./src/Providers/Scaleway/Scaleway.ts": {
+        "statements": 100,
+        "branches": 100,
+        "functions": 100,
+        "lines": 100
+      },
+      "./src/Providers/Scaleway/mappers.ts": {
+        "statements": 100,
+        "branches": 100,
+        "functions": 100,
+        "lines": 100
+      }
+    }
   },
   "author": "visgotti",
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
 }

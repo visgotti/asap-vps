@@ -1,8 +1,0 @@
-src
-tsconfig.json
-.gitignore
-node_modules
-.env
-.env.test
-do-server-options.test.json
-jest.setup.js
