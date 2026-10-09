@@ -72,7 +72,7 @@ export class SSHService {
       }
 
       decryptedPrivateKey = sshData.isEncrypted || (sshData.isEncrypted === undefined && decryptionKey) ? decrypt(sshData.privateKey, decryptionKey as string) : sshData.privateKey
-      if(this.openConnections[ip] && decryptedPrivateKey in this.openConnections[ip]) {
+      if(this.openConnections[ip] && sshData.publicKey in this.openConnections[ip]) {
           throw new Error(`There is already an open connection with the publicKey: ${sshData.publicKey} on the ip ${ip}`);
       }
       if(!this.openConnections[ip]) {

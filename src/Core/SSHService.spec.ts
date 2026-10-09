@@ -197,6 +197,26 @@ describe('SSHService.connect with a key or a stored key entity (positional: root
         expect(console.error).toHaveBeenCalledWith('[SSHService] Failed to connect to h after 2 retries:', 'refused');
     });
 
+    it('one session per stored key and host at a time on a service: a second is refused while the first is open, and allowed once it is disposed or its dial failed', async () => {
+        const s = new SSHService();
+        const once = { maxRetries: 1, retryTimeout: 0 };
+        const a = entity('ssh-rsa A', 'PEM-A', false) as UnencryptedSSHData;
+        const first = await s.connect('h', a);
+        await expect(s.connect('h', a)).rejects.toThrow('There is already an open connection with the publicKey: ssh-rsa A on the ip h');
+        // Another host, or another key: sessions of their own.
+        await expect(s.connect('h2', a)).resolves.toBeInstanceOf(NodeSSH);
+        await expect(s.connect('h', entity('ssh-rsa B', 'PEM-B', false) as UnencryptedSSHData)).resolves.toBeInstanceOf(NodeSSH);
+        await first.dispose();
+        const again = await s.connect('h', a);
+        await again.dispose();
+        connect.mockRejectedValueOnce(new Error('refused'));
+        await expect(s.connect('h', a as unknown as string, undefined, once)).rejects.toThrow('refused');
+        await expect(s.connect('h', a)).resolves.toBeInstanceOf(NodeSSH);
+        // SSHService.connect makes a service per call: its sessions are never refused for another's.
+        await expect(SSHService.connect('h', a)).resolves.toBeInstanceOf(NodeSSH);
+        expect(keysUsed()).toEqual(['PEM-A', 'PEM-A', 'PEM-B', 'PEM-A', 'PEM-A', 'PEM-A', 'PEM-A']);
+    });
+
     it('sessions opened with entities close with dispose(), each once (a second dispose does nothing); a failed one leaves the entity free to connect again', async () => {
         const s = new SSHService();
         const once = { maxRetries: 1, retryTimeout: 0 };
