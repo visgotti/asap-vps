@@ -471,6 +471,7 @@ describe('each step, command by command, and the result it reports', () => {
         const dropped = { execCommand: jest.fn(async () => { throw new Error('Not connected to server'); }) } as unknown as NodeSSH;
         const steps: Array<[string, ISetupStep]> = [
             ['install-docker', new InstallDockerStep()],
+            ['configure-firewall', new ConfigureFirewallStep([{ port: 22, protocol: 'tcp' }])],
             ['install-ssl-certificate', new InstallSSLCertificateStep({ certContent: 'c', keyContent: 'k' })],
             ['create-directories', new CreateDirectoryStep(['/app'])],
             ['run-commands', new RunCommandStep(['uptime'])],
@@ -480,5 +481,7 @@ describe('each step, command by command, and the result it reports', () => {
         for (const [name, step] of steps) {
             expect(await step.execute(dropped, debianContext)).toEqual({ step: name, success: false, message: 'Not connected to server' });
         }
+        // The firewall on a RHEL machine too (firewalld, not ufw).
+        expect(await new ConfigureFirewallStep([{ port: 22, protocol: 'tcp' }]).execute(dropped, rhelContext)).toEqual({ step: 'configure-firewall', success: false, message: 'Not connected to server' });
     });
 });

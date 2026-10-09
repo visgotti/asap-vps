@@ -14,10 +14,11 @@ export class ConfigureFirewallStep implements ISetupStep {
         const { platformFamily } = context;
 
         try {
+            // Awaited here, so a command that fails (a connection that drops) is this catch's, and a result like any step's.
             if (platformFamily === 'debian') {
-                return this.configureUfw(ssh);
+                return await this.configureUfw(ssh);
             } else {
-                return this.configureFirewalld(ssh);
+                return await this.configureFirewalld(ssh);
             }
         } catch (err: any) {
             return { step: this.name, success: false, message: err.message };
