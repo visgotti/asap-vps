@@ -228,16 +228,19 @@ describe('Vast.ai API facts', () => {
         expect((await p.getServer(s.id))?.status).toBe('stopping');
     });
 
-    it('a page that adds no machine ends the search: 64 offers at one price are read in two searches, not eight', async () => {
+    it('more offers at one price than a page holds do not end the search: it goes on above that price, and no dearer machine is lost', async () => {
         const { p, fake } = make();
-        // These alone, at one price: the next page starts at that price, and is the same page.
-        fake.state.asks.length = 0;
-        for (let i = 0; i < 64; i++) {
+        const dearer = (await p.listOffers()).map((o) => o.id);
+        const before = searches(fake).length;
+        // 70 machines at one price, cheaper than the rest: more than a page (64), which Vast cannot page through by price.
+        for (let i = 0; i < 70; i++) {
             fake.state.asks.push({ id: 3000 + i, gpu_name: 'RTX 3060', num_gpus: 1, gpu_ram: 12288, dph_total: 0.05, min_bid: 0.03,
                 geolocation: 'Ohio, US', rentable: true, verified: true, reliability: 0.99, cuda_max_good: 12.8, machine_id: 4000 + i } as any);
         }
-        expect((await p.listOffers()).map((o) => o.id)).toEqual(Array.from({ length: 64 }, (_, i) => String(3000 + i)));
-        expect(searches(fake).map((c) => c.body.dph_total)).toEqual([undefined, { gte: 0.05 }]);
+        const ids = (await p.listOffers()).map((o) => o.id);
+        // A page of them, then every machine listed before: the next page starts above their price once a page at it adds nothing.
+        expect(ids).toEqual([...Array.from({ length: 64 }, (_, i) => String(3000 + i)), ...dearer]);
+        expect(searches(fake).slice(before).map((c) => c.body.dph_total)).toEqual([undefined, { gte: 0.05 }, { gt: 0.05 }]);
     });
 
     it('answers that leave out their list read as nothing: no instances, offers or volumes', async () => {

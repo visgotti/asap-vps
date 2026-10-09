@@ -438,16 +438,24 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         return toServer(i, this.relaunched.get(String(i.id)));
     }
 
-    /** Cheapest first, a page of 64 at a time: the next page starts at the last page's price. */
+    /**
+     * Cheapest first, a page of 64 at a time: the next page starts at the last
+     * page's price. Vast pages by price alone, so where more offers than a page
+     * share one price, a page at it brings none new: the next then starts above
+     * that price. No dearer offer is lost; those of that price past the first
+     * page are (a model filter, which Vast applies itself, avoids such a tie).
+     */
     private async search(type: 'ondemand' | 'bid', query: OfferQuery): Promise<VastOffer[]> {
         const out: VastOffer[] = [];
         const seen = new Set<number>();
         let floor: number | undefined;
+        // The floor is a price every offer at it was already read at: the next page starts above it.
+        let above = false;
         const minCuda = query.minCudaVersion !== undefined ? Number(cudaVersion(query.minCudaVersion)) : this.minCudaVersion;
         const models = serverSideModels(query);
         for (let page = 0; page < this.offerPages; page++) {
             const price = {
-                ...(floor !== undefined ? { gte: floor } : {}),
+                ...(floor !== undefined ? { [above ? 'gt' : 'gte']: floor } : {}),
                 ...(query.maxPricePerHour !== undefined ? { lte: query.maxPricePerHour } : {}),
             };
             // A search is a read: retried on 5xx like any GET.
@@ -475,7 +483,11 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
                 out.push(a);
                 added++;
             }
-            if (batch.length < VastAI.PAGE || added === 0) break;
+            if (batch.length < VastAI.PAGE) break;
+            // A full page of offers read already: more than a page share its price. Above it, every offer is new, so a page
+            // there that brings nothing new would be Vast repeating itself: the search ends.
+            if (added === 0 && above) break;
+            above = added === 0;
             floor = Number(batch[batch.length - 1].dph_total);
         }
         return out;
