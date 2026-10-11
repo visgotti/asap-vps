@@ -1,6 +1,9 @@
 # The documentation site (site/): built with esbuild, with Monaco editors that have this library's real types and a sandbox that runs the
 # snippets against its fakes. Every build first type-checks and executes every code block of every page (npm run docs:check), so the docs
 # cannot show code that no longer compiles. Pull requests build and check; only master deploys to GitHub Pages.
+#
+# The site is published as the gh-pages branch (Pages: deploy from a branch), not as a Pages artifact: an artifact is refused whenever
+# the account's artifact storage quota is hit, and a branch needs none.
 
 name: Docs
 
@@ -37,22 +40,55 @@ jobs:
       - name: Type-check the site, then every snippet on it (and run the runnable ones)
         run: npm run docs:check
       - run: npm run docs:build
-      - uses: actions/upload-pages-artifact@v5
-        if: github.event_name != 'pull_request'
-        with:
-          path: site/dist
 
   deploy:
     needs: build
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     # Never a pull request, so the self-hosted runners whenever CI_RUNS_ON names them.
     runs-on: ${{ vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 20
     permissions:
+      contents: write
       pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            site/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix site
+      - run: npm run docs:build
+      - name: Publish site/dist as the gh-pages branch (one commit, replaced by every deploy, so the repository does not grow)
+        id: publish
+        working-directory: site/dist
+        run: |
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "The documentation site, built from ${GITHUB_SHA}"
+          git push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Ask Pages to build that commit, and wait until it is live
+        run: |
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/pages/builds"
+          auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json")
+          field() { node -pe 'JSON.parse(require("fs").readFileSync(0, "utf8"))[process.argv[1]] ?? ""' "$1"; }
+          curl -fsS -X POST "${auth[@]}" "$api" > /dev/null
+          for attempt in $(seq 1 60); do
+            latest=$(curl -fsS "${auth[@]}" "$api/latest")
+            if [ "$(field commit <<< "$latest")" = "${{ steps.publish.outputs.sha }}" ]; then
+              status=$(field status <<< "$latest")
+              if [ "$status" = built ]; then echo "Pages built ${{ steps.publish.outputs.sha }}"; exit 0; fi
+              if [ "$status" = errored ]; then echo "::error::Pages could not build the site: $latest"; exit 1; fi
+            fi
+            sleep 10
+          done
+          echo "::error::Pages had not built ${{ steps.publish.outputs.sha }} after 10 minutes"
+          exit 1
