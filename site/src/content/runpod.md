@@ -35,7 +35,7 @@ await runpod.deleteServerAndWait(server.id);
 
 `stopServer`, `startServer` and `restartServer` wait on every provider that has them, and take `{ timeoutMs?, intervalMs? }` to say for how long. A pod rented by an offer goes to the offer's first data center with stock; where that one cannot place it (no host there runs the CUDA your image needs), the offer's next is tried. Pass `region` to pin it. A stopped pod can resume without its GPU (the host gave it to someone else): `startServer` then stops it again and throws `CapacityError`, so a retry loop knows to move on. See [Errors](#/errors).
 
-A pod is **logged in to like any server**: name the keys with `sshKeyIds` and the library starts an SSH server in the container ahead of its command, with exactly those keys, at the endpoint the running pod reports as `server.ssh`. An image of your own needs a `command` for it to hand over to. See [Logging in and setting up](#/ssh).
+A pod is **logged in to like any server**: name the keys with `sshKeyIds` and the library starts an SSH server in the container ahead of its command, with exactly those keys, at the endpoint the running pod reports as `server.ssh`. An image of your own needs a `command` for it to hand over to. RunPod reads a pod as running some seconds before its ports are published, so `waitUntilRunning` returns it only once each port it exposes has its public one, and its SSH endpoint with them. See [Logging in and setting up](#/ssh).
 
 Pods also come **without a GPU**: `listOffers({ kind: "cpu" })` returns CPU flavors, and the rest of the call is the same.
 

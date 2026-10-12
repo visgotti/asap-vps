@@ -123,7 +123,8 @@ export function toServer(i: VastInstance, relaunchedAt?: number): Server<VastIns
     const ports = Object.entries(i.ports ?? {}).flatMap(([key, maps]) => {
         const [port, protocol = 'tcp'] = key.split('/');
         return (maps ?? []).filter((x) => x?.HostPort).map((x) => ({ privatePort: Number(port), publicPort: Number(x.HostPort), ip, protocol }));
-    });
+        // Vast lists a port once for each address family it is bound on (0.0.0.0 and ::), with the same public port (seen live): one mapping.
+    }).filter((x, i, all) => all.findIndex((y) => y.privatePort === x.privatePort && y.publicPort === x.publicPort && y.protocol === x.protocol) === i);
     const mounts = instanceMounts(i);
     return {
         provider: VAST_ID,

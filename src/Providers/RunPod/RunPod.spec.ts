@@ -440,6 +440,113 @@ describe('RunPod API facts', () => {
         expect((await p.waitUntilRunning(both.id, fast)).ip).toBe('194.68.245.10');
     });
 
+    describe('a pod reads as RUNNING before RunPod has published its ports (seen live): waitUntilRunning returns it once it says where it is reached', () => {
+        const slow = (publishReads: number, fetchImpl?: (inner: typeof fetch) => typeof fetch, sleep: (ms: number) => Promise<void> = noSleep) => {
+            const fake = fakeRunPod({ publishReads });
+            return { fake, p: new RunPod({ apiKey: 'rp-test', fetchImpl: fetchImpl ? fetchImpl(fake.fetchImpl) : fake.fetchImpl, sleep }) };
+        };
+        const readsOf = (fake: ReturnType<typeof fakeRunPod>) => fake.calls.filter((c) => c.method === 'GET' && /^\/v2\/pods\/[^/]+$/.test(c.path)).length;
+        const shown = (s: { ports?: Array<{ privatePort: number, protocol?: string }> }) => s.ports?.map((x) => `${x.privatePort}/${x.protocol}`).sort();
+
+        it('one made to be logged in to: with its SSH endpoint and every port it exposes, no sooner and not a read later', async () => {
+            const { p, fake } = slow(3);
+            const key = await p.addSSHKey(testPublicKey('laptop'), 'laptop');
+            const pod = await p.createServer({ name: 'ssh', offer: 'NVIDIA RTX A5000', image: 'img', command: ['sleep', 'infinity'], ports: ['8080/tcp'], sshKeyIds: [key.id] });
+            // What RunPod says of a pod that has just come up: it runs, and is nowhere yet. Its record says what it was made to expose.
+            const early = await p.waitForServer(pod.id, (s) => s?.status === 'running', fast);
+            expect([early?.status, early?.ssh, early?.ports, early?.raw.ports]).toEqual(['running', undefined, [], ['8080/tcp', '22/tcp']]);
+            const before = readsOf(fake);
+            const s = await p.waitUntilRunning(pod.id, fast);
+            expect([s.ssh, shown(s)]).toEqual([{ host: '194.68.245.10', port: expect.any(Number), username: 'root' }, ['22/tcp', '8080/tcp']]);
+            expect(readsOf(fake) - before).toBe(3);
+        });
+
+        it('one that only exposes ports: with each of them, http and tcp; one that exposes none is returned as soon as it runs', async () => {
+            const { p, fake } = slow(2);
+            const web = await p.createServer({ name: 'web', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8888/http', '8080/tcp'] });
+            expect((await p.waitForServer(web.id, (s) => s?.status === 'running', fast))?.ports).toEqual([]);
+            let before = readsOf(fake);
+            expect(shown(await p.waitUntilRunning(web.id, fast))).toEqual(['8080/tcp', '8888/http']);
+            expect(readsOf(fake) - before).toBe(2);
+            // Each port, and its public one: a read that lists one of the two, and then both with one not given a public port yet, is no place to stop.
+            let read = 0;
+            const partly = slow(1, (inner) => async (url, init) => {
+                const r = await inner(url, init);
+                if ((init?.method ?? 'GET') !== 'GET' || !/\/v2\/pods\/[^/?]+$/.test(String(url))) return r;
+                const pod = await r.json();
+                if (!pod.runtime?.ports?.length) return answer(r.status, pod);
+                read++;
+                if (read === 1) pod.runtime.ports = pod.runtime.ports.filter((x: { type: string }) => x.type === 'http');
+                if (read === 2) pod.runtime.ports = pod.runtime.ports.map((x: { type: string }) => (x.type === 'tcp' ? { ...x, public: null } : x));
+                return answer(r.status, pod);
+            });
+            const two = await partly.p.createServer({ name: 'two', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8888/http', '8080/tcp'] });
+            await partly.p.waitForServer(two.id, (s) => s?.status === 'running', fast);
+            before = readsOf(partly.fake);
+            const whole = await partly.p.waitUntilRunning(two.id, fast);
+            expect([whole.ports?.map((x) => [`${x.privatePort}/${x.protocol}`, typeof x.publicPort]).sort(), readsOf(partly.fake) - before]).toEqual([[['8080/tcp', 'number'], ['8888/http', 'number']], 3]);
+            // Nothing to publish: nothing to wait for, however long RunPod would take.
+            const never = slow(Infinity);
+            const bare = await never.p.createServer({ name: 'bare', offer: 'NVIDIA RTX A5000', image: 'img' });
+            await never.p.waitForServer(bare.id, (s) => s?.status === 'running', fast);
+            before = readsOf(never.fake);
+            const s = await never.p.waitUntilRunning(bare.id, fast);
+            expect([s.status, s.ports, s.ssh, readsOf(never.fake) - before]).toEqual(['running', [], undefined, 1]);
+        });
+
+        it('its SSH port published but its endpoint not named yet: still waited for; a record that names no ports at all is one to return', async () => {
+            // RunPod's answers once it lists the pod's ports: first with no public port for them yet (null, as its reference allows),
+            // then with the ports published and the endpoint still left out, then whole.
+            let read = 0;
+            const { p, fake } = slow(1, (inner) => async (url, init) => {
+                const r = await inner(url, init);
+                if ((init?.method ?? 'GET') !== 'GET' || !/\/v2\/pods\/[^/?]+$/.test(String(url))) return r;
+                const pod = await r.json();
+                if (!pod.runtime?.ports?.length) return answer(r.status, pod);
+                read++;
+                if (read === 1) pod.runtime.ports = pod.runtime.ports.map((x: object) => ({ ...x, public: null }));
+                if (read <= 2) pod.ssh.direct = null;
+                return answer(r.status, pod);
+            });
+            const key = await p.addSSHKey(testPublicKey('laptop'), 'laptop');
+            const pod = await p.createServer({ name: 'ssh', offer: 'NVIDIA RTX A5000', image: 'img', command: ['sleep', 'infinity'], sshKeyIds: [key.id] });
+            await p.waitForServer(pod.id, (s) => s?.status === 'running', fast);
+            const before = readsOf(fake);
+            const s = await p.waitUntilRunning(pod.id, fast);
+            expect([s.ssh?.username, shown(s), s.ports?.[0].publicPort === undefined, readsOf(fake) - before]).toEqual(['root', ['22/tcp'], false, 3]);
+            // A record with no list of what the pod exposes (a field RunPod may leave out): nothing is known to wait for.
+            const other = slow(Infinity, (inner) => async (url, init) => {
+                const r = await inner(url, init);
+                if ((init?.method ?? 'GET') !== 'GET' || !/\/v2\/pods\/[^/?]+$/.test(String(url))) return r;
+                const { ports, ...rest } = await r.json();
+                return answer(r.status, rest);
+            });
+            const old = await other.p.createServer({ name: 'old', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8080/tcp'] });
+            expect((await other.p.waitUntilRunning(old.id, fast)).status).toBe('running');
+        });
+
+        it('one whose ports are never published is not returned as if it could be reached: the wait runs out, and says what it was waiting for', async () => {
+            const clock = waitingClock();
+            try {
+                const { p } = slow(Infinity, undefined, clock.sleep);
+                const pod = await p.createServer({ name: 'nowhere', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8080/tcp'] });
+                await expect(p.waitUntilRunning(pod.id, { timeoutMs: 30_000, intervalMs: 10_000 })).rejects.toMatchObject({
+                    name: 'ProviderError', code: 'timeout',
+                    message: `runpod: timed out after 30 s waiting for server ${pod.id}: running (RUNNING), which has not said where it is reached yet (its SSH endpoint, its ports)`,
+                });
+                // One that never came to run is reported as what it still was, and no more: where it is reached is no question yet.
+                const fake = fakeRunPod({ bootReads: Infinity });
+                const stuck = new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: clock.sleep });
+                const starting = await stuck.createServer({ name: 'starting', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8080/tcp'] });
+                await expect(stuck.waitUntilRunning(starting.id, { timeoutMs: 30_000, intervalMs: 10_000 })).rejects.toMatchObject({
+                    code: 'timeout', message: `runpod: timed out after 30 s waiting for server ${starting.id}: pending (STARTING)`,
+                });
+            } finally {
+                clock.restore();
+            }
+        });
+    });
+
     it('a pod resumed without its GPU is stopped again and reported as no capacity', async () => {
         const { p, fake } = make({ resumeWithoutGpu: true });
         const s = await p.createServer({ name: 'r', offer: 'NVIDIA RTX A5000', image: 'img' });

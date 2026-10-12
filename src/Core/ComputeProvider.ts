@@ -81,16 +81,35 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
     }
 
     /**
-     * Until the server is running (a VM also needs its public address).
+     * Until the server is running and says where it is reached: a VM its
+     * public address, and a server whose platform names them only after it
+     * reads as running (`comingUp`) its SSH endpoint and its ports. So the
+     * server this returns is one RemoteMachine.connect can take.
      * Throws when it errors, or disappears (NotFoundError) instead.
      */
     public async waitUntilRunning(id: string, o: WaitOptions & { requireIp?: boolean } = {}): Promise<Server<T['server']>> {
         const requireIp = o.requireIp ?? this.capabilities.compute.kind === 'vm';
-        const s = await this.waitForServer(id, (x) => !x || ['error', 'terminating', 'terminated'].includes(x.status)
-            || (x.status === 'running' && (!requireIp || !!x.ip)), o);
+        const s = await this.poll(() => this.getServer(id), (x) => !x || ['error', 'terminating', 'terminated'].includes(x.status)
+            || (x.status === 'running' && (!requireIp || !!x.ip) && !this.comingUp(x)), {
+            ...o,
+            what: `server ${id}`,
+            // A wait that runs out on a server that runs says what it was still waiting for.
+            describe: (x) => (x ? `${x.status} (${x.providerStatus})${x.status === 'running' && this.comingUp(x) ? ', which has not said where it is reached yet (its SSH endpoint, its ports)' : ''}` : 'gone'),
+        });
         if (!s) throw new NotFoundError(this.id, `server ${id} disappeared before it was running`);
         if (s.status !== 'running') throw new ProviderError(this.id, `server ${id} is ${s.status} (${s.providerStatus})`);
         return s;
+    }
+
+    /**
+     * Whether a server that reads as running has still to say where it is
+     * reached: its `ssh` endpoint, the public ports of the ports it exposes.
+     * False wherever those are known as soon as the server runs; a platform
+     * that names them later (it maps a container's ports only after the
+     * container reads as running) says so here, and waitUntilRunning waits.
+     */
+    protected comingUp(_server: Server<T['server']>): boolean {
+        return false;
     }
 
     /**

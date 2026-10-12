@@ -112,6 +112,8 @@ const cudaAtLeast = (have: string | null, want: string) => {
 
 export function fakeRunPod(o: {
     token?: string, bootReads?: number, resumeWithoutGpu?: boolean,
+    /** Reads a pod shows as RUNNING before its ports have public ones (default 1: seen live, a pod reads RUNNING seconds before its port mappings and its direct SSH endpoint appear). */
+    publishReads?: number,
     /** Requests a load-balancing endpoint answers "no workers available" while its first worker boots (a cold start). */
     coldRequests?: number,
     /** The most rows a page of a list holds, whatever `limit` asks (the spec's 1000 unless set): a few rows then span pages. */
@@ -131,6 +133,7 @@ export function fakeRunPod(o: {
         workers: new Map<string, { cold: number, up: number }>(),
         nextId: 1,
         bootReads: o.bootReads ?? 2,
+        publishReads: o.publishReads ?? 1,
         /** Pods made so far: each has public ports of its own. */
         slots: 0,
         /** "You may be allocated zero GPUs if capacity has changed": a start that comes back with none. */
@@ -179,9 +182,12 @@ export function fakeRunPod(o: {
         return { rows: newestFirst.slice(Number(at), end), pagination: { nextCursor: more ? Buffer.from(`${operation}:${end}`).toString('base64url') : null, hasNextPage: more } };
     };
     const view = (p: any) => {
-        const { reads, logs, rate, slot, ...rest } = p;
+        const { reads, logs, rate, slot, runningReads, ...rest } = p;
         const running = p.status === 'RUNNING';
-        const ports = (p.ports ?? []).map((x: string) => {
+        // A pod runs before its ports are published: RUNNING with no port mappings and no direct SSH endpoint, for a read or more
+        // (seen live 2026-10-12: RUNNING 2 s after the create with `runtime.ports` empty; all its ports, and `ssh.direct`, together some 20 to 40 s later).
+        const published = running && (p.runningReads === undefined || p.runningReads > state.publishReads);
+        const ports = (published ? p.ports ?? [] : []).map((x: string) => {
             const [n, type = 'tcp'] = x.split('/');
             // An http port rides RunPod's proxy network (a private address); a tcp port is mapped on the host's public IP.
             return type === 'http' ? { private: Number(n), public: Number(n), type, ip: '100.65.0.101' }
@@ -437,7 +443,8 @@ export function fakeRunPod(o: {
                 pod.reads++;
                 if (pod.status === 'PROVISIONING' && pod.reads >= 1) pod.status = 'STARTING';
                 // Its run (and its billing) starts once it is running: startedAt (v2 spec, 2026-10-02).
-                else if (pod.status === 'STARTING' && pod.reads >= state.bootReads) Object.assign(pod, { status: 'RUNNING', startedAt: new Date().toISOString() });
+                else if (pod.status === 'STARTING' && pod.reads >= state.bootReads) Object.assign(pod, { status: 'RUNNING', startedAt: new Date().toISOString(), runningReads: 0 });
+                if (pod.status === 'RUNNING' && pod.runningReads !== undefined) pod.runningReads++;
                 return json(200, view(pod));
             }
             if (method === 'DELETE') {

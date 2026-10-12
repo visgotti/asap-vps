@@ -662,6 +662,9 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
   - So `sshKeyIds` starts the library's SSH server instead (as the pod's entrypoint, ahead of its command), with exactly the keys named, and exposes `22/tcp`.
   - `server.ssh` is the pod's public address and the port mapped to it.
   - The keys are sent as `PUBLIC_KEY` too, so `env.PUBLIC_KEY` can't be given with `sshKeyIds`.
+- A pod reads as running before RunPod has published its ports (seen live: running 2 s after the create with no port mappings; its ports and its SSH endpoint together within the next 40 s):
+  - `waitUntilRunning` returns a pod only once every port it exposes has its public one and, where it is to be logged in to, its SSH endpoint. What it returns is what `RemoteMachine.connect` takes.
+  - `getServer` and `listServers` show the pod as RunPod does, ports or not.
 - A stopped pod can resume without its GPU: `startServer` then stops it again and throws `CapacityError`.
 - A pod rented by an offer goes to the offer's first data center with stock, as on every provider:
   - Where that one can't place it (nothing free of what was asked, no host that runs the CUDA asked for), the offer's next is tried before the create fails.
@@ -682,7 +685,8 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
 - Ports are mapped to random public ports: read them from the server's `ports`.
 - SSH:
   - `sshKeyIds` starts the library's SSH server in the container (as its entrypoint, ahead of its command and of a `userData` script) and maps its port 22.
-  - `server.ssh` is the machine's address and that port, or Vast's own SSH proxy where the instance reports no mapped port.
+  - `server.ssh` is the machine's address and that port.
+  - An instance launched in Vast's own `ssh` mode reports Vast's proxy instead; one launched with `sshKeyIds` has none (seen live).
   - `providerOptions.runtype` is Vast's own launch mode, and can't be given with `sshKeyIds`.
 - Vast takes no `tags`.
 - Price:
