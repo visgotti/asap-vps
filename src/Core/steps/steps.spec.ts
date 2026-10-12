@@ -303,10 +303,26 @@ describe('AddAuthorizedKeyStep', () => {
         expect(await new AddAuthorizedKeyStep('ssh-rsa AAAA..."; rm -rf /').execute(ssh, debianContext)).toEqual({
             step: 'add-authorized-key', success: false, message: 'bad public key "ssh-rsa AAAA...\\"; rm -rf /": not an OpenSSH public key line (ssh-ed25519 AAAA... comment)',
         });
-        expect((await new AddAuthorizedKeyStep(KEY, 'de ploy').execute(ssh, debianContext)).message).toMatch(/^bad user name "de ploy"/);
+        expect((await new AddAuthorizedKeyStep(KEY, 'de ploy').execute(ssh, debianContext)).message)
+            .toBe('bad login name "de ploy": letters, digits, underscores, dots, dashes and at signs, not beginning with a dash or a dot');
         expect(sent).toEqual([]);
         const dropped = recordingSSH(new Error('Not connected to server'));
         expect(await new AddAuthorizedKeyStep(KEY).execute(dropped.ssh, debianContext)).toEqual({ step: 'add-authorized-key', success: false, message: 'Not connected to server' });
+    });
+
+    it('takes a login as the machine names it, and a key with the options authorized_keys takes before it: what the step took before it was one script', async () => {
+        // An account of a RHEL family or directory-backed machine: capitals, dots, name@domain. The step made no user; it need not name one as it would.
+        for (const user of ['john.doe', 'Admin', 'jdoe@example.com']) {
+            const { ssh, sent } = recordingSSH();
+            expect(await new AddAuthorizedKeyStep(KEY, user).execute(ssh, debianContext)).toEqual({ step: 'add-authorized-key', success: true, message: `Public key authorized for ${user}` });
+            expect(sent).toEqual([{ command: 'sh -s', stdin: authorizeKeysScript([KEY], user) }]);
+            expect(sent[0].stdin).toContain(`asap_vps_keys '${user}' '${KEY}'`);
+        }
+        // A key restricted where it is authorized: the line goes into the file whole, as one shell word.
+        const restricted = `from="10.0.0.0/8,192.168.1.*",command="echo \\"it's read only\\"",no-port-forwarding ${KEY}`;
+        const { ssh, sent } = recordingSSH();
+        expect((await new AddAuthorizedKeyStep(restricted).execute(ssh, debianContext)).success).toBe(true);
+        expect(sent[0].stdin).toContain(`asap_vps_keys 'root' 'from="10.0.0.0/8,192.168.1.*",command="echo \\"it'\\''s read only\\"",no-port-forwarding ${KEY}'`);
     });
 });
 
@@ -337,7 +353,7 @@ describe('AddUserStep', () => {
     it('in a pipeline run as a login that is not root, the script goes to a shell root runs: through sudo, its input with it', async () => {
         const { ssh, sent } = recordingSSH();
         expect((await new AddUserStep('deploy', { sudo: true }).execute(asRoot(ssh, 'ubuntu'), debianContext)).success).toBe(true);
-        expect(sent).toEqual([{ command: `sudo -n bash -c 'sh -s'`, stdin: addUserScript('deploy', { sudo: true }) }]);
+        expect(sent).toEqual([{ command: `sudo -n sh -c 'exec "$(command -v bash || command -v sh)" -c "$1"' asap-vps 'sh -s'`, stdin: addUserScript('deploy', { sudo: true }) }]);
     });
 });
 

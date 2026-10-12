@@ -171,10 +171,21 @@ export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
 }
 
 /**
+ * `script` as one command a login that is not root runs it as root with:
+ * through passwordless sudo, by bash where the machine has it (what a root
+ * login's own shell is on the images that have it, and what a step written
+ * for bash needs) and by sh where it has none (an Alpine image). The one way
+ * a command becomes root's: RemoteMachine.sudo and asRoot both go through it.
+ */
+export function rootCommand(script: string): string {
+    return `sudo -n sh -c 'exec "$(command -v bash || command -v sh)" -c "$1"' asap-vps ${shellQuote(script)}`;
+}
+
+/**
  * The connection the steps are given, as root. A root login is used as it is.
  * Any other login (Lambda's `ubuntu`) acts through passwordless sudo:
- * - `execCommand` runs its command under `sudo -n bash -c`, and enters `cwd`
- *   as root too;
+ * - `execCommand` runs its command as root (rootCommand), and enters `cwd`
+ *   as root too: one that is not there ends it;
  * - `exec` and `mkdir` go the same way (a directory is made as root, never
  *   over SFTP as the login);
  * - `putFile`, `putFiles` and `putDirectory` upload over SFTP as the login
@@ -188,10 +199,11 @@ export function asRoot(ssh: NodeSSH, username: string): NodeSSH {
     if (username === 'root') return ssh;
     type ExecOptions = Parameters<NodeSSH['execCommand']>[1];
     const sudo = (command: string, opts?: ExecOptions) => {
-        if (opts === undefined) return ssh.execCommand(`sudo -n bash -c ${shellQuote(command)}`);
+        if (opts === undefined) return ssh.execCommand(rootCommand(command));
         // The directory is entered as root: before sudo it is the login that changes to it, and the command runs on where the login could not.
+        // One that is not there ends it: of a command that is several (`a; b`), `cd <dir> && ...` would skip only the first.
         const { cwd, ...rest } = opts;
-        return ssh.execCommand(`sudo -n bash -c ${shellQuote(cwd ? `cd ${shellQuote(cwd)} && ${command}` : command)}`, rest);
+        return ssh.execCommand(rootCommand(cwd ? `cd -- ${shellQuote(cwd)} || exit\n${command}` : command), rest);
     };
     const unix = (path: string) => path.split('\\').join('/');
     const overrides: Partial<NodeSSH> = {

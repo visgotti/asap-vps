@@ -6,7 +6,7 @@
 // it sends, which sshd.spec runs for real on a stand-in machine.
 
 import { spawnSync } from 'child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'fs';
 import type { NodeSSH } from 'node-ssh';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -58,6 +58,13 @@ function scriptedSession(answer: { stdout?: string, stderr?: string, code?: numb
     return { ssh: ssh as unknown as NodeSSH, mock: ssh, sent };
 }
 
+/** One shell word, as the code must quote it: written here on its own, so the pin does not follow the code. */
+const word = (x: string) => `'${x.split("'").join(`'\\''`)}'`;
+/** A script as the one command a login that is not root runs it as root with: by bash where the machine has it, else sh. */
+const asRootOf = (script: string) => `sudo -n sh -c 'exec "$(command -v bash || command -v sh)" -c "$1"' asap-vps ${word(script)}`;
+/** A server's first login is tried for three minutes unless the caller says. */
+const FIRST_LOGIN = { maxRetries: 36, retryTimeout: 5000 };
+
 const ROOT: SSHEndpoint = { host: '203.0.113.7', port: 22, username: 'root' };
 const UBUNTU: SSHEndpoint = { host: '198.51.100.9', port: 22, username: 'ubuntu' };
 const CONTAINER: SSHEndpoint = { host: '192.0.2.44', port: 41022, username: 'root' };
@@ -74,7 +81,7 @@ describe('RemoteMachine', () => {
             const connect = jest.spyOn(SSHService, 'connect').mockResolvedValue(session);
             for (const [provider, endpoint] of [['digitalocean', ROOT], ['lambda', UBUNTU], ['runpod', CONTAINER]] as const) {
                 const m = await RemoteMachine.connect(server(provider, endpoint), { privateKey: 'PRIVATE' });
-                expect(connect).toHaveBeenLastCalledWith({ ...endpoint, privateKey: 'PRIVATE' });
+                expect(connect).toHaveBeenLastCalledWith({ ...endpoint, privateKey: 'PRIVATE', retry: FIRST_LOGIN });
                 expect([m.endpoint, m.username, m.login, m.ssh]).toEqual([endpoint, endpoint.username, `${endpoint.username}@${endpoint.host}`, session]);
             }
             expect(connect).toHaveBeenCalledTimes(3);
@@ -87,13 +94,42 @@ describe('RemoteMachine', () => {
             expect(m.endpoint).toEqual(CONTAINER);
         });
 
-        it('as another user when one is named: the same host and port, that login; a name that is no user name is refused before anything is dialed', async () => {
+        it('a server\'s first login is given three minutes, since its SSH server may still be coming up; an endpoint given as it is, SSHService\'s own tries; what the caller says, always', async () => {
+            const connect = jest.spyOn(SSHService, 'connect').mockResolvedValue(scriptedSession().ssh);
+            expect(RemoteMachine.FIRST_LOGIN).toEqual({ maxRetries: 36, retryTimeout: 5000 });
+            expect(Object.isFrozen(RemoteMachine.FIRST_LOGIN)).toBe(true);
+            await RemoteMachine.connect(server('vast', CONTAINER), { privateKey: 'PRIVATE' });
+            await RemoteMachine.connect(CONTAINER, { privateKey: 'PRIVATE' });
+            await RemoteMachine.connect(server('vast', CONTAINER), { privateKey: 'PRIVATE', retry: { maxRetries: 1, retryTimeout: 0 } });
+            expect(connect.mock.calls).toEqual([
+                [{ ...CONTAINER, privateKey: 'PRIVATE', retry: { maxRetries: 36, retryTimeout: 5000 } }],
+                [{ ...CONTAINER, privateKey: 'PRIVATE' }],
+                [{ ...CONTAINER, privateKey: 'PRIVATE', retry: { maxRetries: 1, retryTimeout: 0 } }],
+            ]);
+            // Its own copy each time: a caller that changes what it was handed changes nobody else's.
+            expect(connect.mock.calls[0][0]).not.toBe(RemoteMachine.FIRST_LOGIN);
+        });
+
+        it('as another user when one is named: the same host and port, that login; a name that is no login name is refused before anything is dialed', async () => {
             const connect = jest.spyOn(SSHService, 'connect').mockResolvedValue(scriptedSession().ssh);
             const m = await RemoteMachine.connect(server('vast', CONTAINER), { privateKey: 'PRIVATE', username: 'deploy' });
-            expect(connect.mock.calls).toEqual([[{ host: CONTAINER.host, port: CONTAINER.port, username: 'deploy', privateKey: 'PRIVATE' }]]);
+            expect(connect.mock.calls).toEqual([[{ host: CONTAINER.host, port: CONTAINER.port, username: 'deploy', privateKey: 'PRIVATE', retry: FIRST_LOGIN }]]);
             expect([m.username, m.login, m.endpoint]).toEqual(['deploy', `deploy@${CONTAINER.host}`, { ...CONTAINER, username: 'deploy' }]);
-            await expect(RemoteMachine.connect(CONTAINER, { privateKey: 'PRIVATE', username: 'de ploy; id' })).rejects.toThrow(/^bad user name "de ploy; id"/);
+            for (const bad of ['de ploy; id', '-oProxyCommand=id', '.hidden', '', 'a/b', 'back\\slash', 'new\nline']) {
+                await expect(RemoteMachine.connect(CONTAINER, { privateKey: 'PRIVATE', username: bad })).rejects.toThrow(
+                    new Error(`bad login name ${JSON.stringify(bad)}: letters, digits, underscores, dots, dashes and at signs, not beginning with a dash or a dot`));
+            }
             expect(connect).toHaveBeenCalledTimes(1);
+        });
+
+        it('a login the machine names its own way is one to log in as: capitals, dots, a directory\'s name@domain (a user this makes is named more narrowly)', async () => {
+            const connect = jest.spyOn(SSHService, 'connect').mockResolvedValue(scriptedSession().ssh);
+            for (const username of ['john.doe', 'Admin', 'jdoe@example.com', 'svc_backup-2', '9front']) {
+                const m = await RemoteMachine.connect(CONTAINER, { privateKey: 'PRIVATE', username });
+                expect([m.username, connect.mock.lastCall]).toEqual([username, [{ host: CONTAINER.host, port: CONTAINER.port, username, privateKey: 'PRIVATE' }]]);
+            }
+            // Making one is another matter: every image family must take the name, and sudo skips a sudoers file with a dot in its name.
+            await expect(new RemoteMachine(scriptedSession().ssh, ROOT).addUser('john.doe')).rejects.toThrow(/^bad user name "john.doe"/);
         });
 
         it('a server with no ssh endpoint (not running yet, or created with no key) says so, by provider and id, and dials nothing', async () => {
@@ -132,8 +168,15 @@ describe('RemoteMachine', () => {
             const env = { GREETING: "it's $HOME; `id` \"quoted\"", EMPTY: '', _N1: '42' };
             const r = await new RemoteMachine(ssh, ROOT).run('pwd; printf "%s|%s|%s|" "$GREETING" "$EMPTY" "$_N1"; cat', { cwd: "it's a dir", env, stdin: 'from stdin\n' });
             expect(r.stdout.split('\n')).toEqual([expect.stringMatching(/\/it's a dir$/), 'it\'s $HOME; `id` "quoted"||42|from stdin']);
+            // Each on a line of its own that ends the script if it fails, then the command as it was given.
             expect(sent).toEqual([{
-                command: `cd 'it'\\''s a dir' && export GREETING='it'\\''s $HOME; \`id\` "quoted"' && export EMPTY='' && export _N1='42' && pwd; printf "%s|%s|%s|" "$GREETING" "$EMPTY" "$_N1"; cat`,
+                command: [
+                    `cd -- ${word("it's a dir")} || exit`,
+                    `export GREETING=${word('it\'s $HOME; `id` "quoted"')} || exit`,
+                    `export EMPTY='' || exit`,
+                    `export _N1='42' || exit`,
+                    'pwd; printf "%s|%s|%s|" "$GREETING" "$EMPTY" "$_N1"; cat',
+                ].join('\n'),
                 options: { stdin: 'from stdin\n' },
             }]);
         });
@@ -143,6 +186,27 @@ describe('RemoteMachine', () => {
             const e = await new RemoteMachine(ssh, ROOT).run('touch ran-anyway', { cwd: 'no-such-dir' }).catch((x) => x);
             expect(e).toBeInstanceOf(RemoteCommandError);
             expect(() => statSync(join(DIR, 'ran-anyway'))).toThrow(/ENOENT/);
+        });
+
+        it('a directory that is not there stops ALL of the command, whatever it is made of: `a; b`, lines, `a || b` (none of it runs in the login\'s home instead)', async () => {
+            // The session's home is DIR: a statement that ran "anywhere else" would leave its mark there.
+            const commands = ['echo first; touch ran-after-semicolon', 'echo first\ntouch ran-on-next-line', 'false || touch ran-after-or', 'echo first & touch ran-in-background; wait'];
+            for (const [login, how] of [[ROOT, 'run'], [UBUNTU, 'sudo'], [CONTAINER, 'sudo']] as const) {
+                for (const command of commands) {
+                    const { ssh } = localSession();
+                    const e: RemoteCommandError = await new RemoteMachine(ssh, login)[how](command, { cwd: 'no-such-dir', env: { A: 'b' } }).catch((x) => x);
+                    expect([how, command, e instanceof RemoteCommandError]).toEqual([how, command, true]);
+                    // The directory's own failure is the command's: its status, and what the shell said of it.
+                    expect(e.code).toBeGreaterThan(0);
+                    expect([e.stdout, e.stderr]).toEqual(['', expect.stringMatching(/no-such-dir/)]);
+                }
+            }
+            expect(readdirSync(DIR).filter((f) => f.startsWith('ran-'))).toEqual([]);
+            // With the directory there, the same commands run, in it.
+            mkdirSync(join(DIR, 'there'), { recursive: true });
+            const { ssh } = localSession();
+            const ok = await new RemoteMachine(ssh, ROOT).run('echo first; touch ran-after-semicolon', { cwd: 'there' });
+            expect([ok, readdirSync(join(DIR, 'there'))]).toEqual([{ stdout: 'first', stderr: '', code: 0 }, ['ran-after-semicolon']]);
         });
 
         it('one that does not exit 0 throws RemoteCommandError: who ran what where, its status and all it wrote; its message ends on the command\'s own last lines', async () => {
@@ -185,7 +249,7 @@ describe('RemoteMachine', () => {
         it('a root login runs it as it is: no sudo, which a container may not have', async () => {
             const { ssh, sent } = localSession();
             const r = await new RemoteMachine(ssh, CONTAINER).sudo('echo "as root"', { env: { A: 'b' } });
-            expect([r, sent, sudoLog()]).toEqual([{ stdout: 'as root', stderr: '', code: 0 }, [{ command: `export A='b' && echo "as root"`, options: {} }], '']);
+            expect([r, sent, sudoLog()]).toEqual([{ stdout: 'as root', stderr: '', code: 0 }, [{ command: `export A='b' || exit\necho "as root"`, options: {} }], '']);
         });
 
         it('any other login goes through passwordless sudo: the whole command, its directory and environment with it, as one script root runs', async () => {
@@ -195,9 +259,33 @@ describe('RemoteMachine', () => {
             expect(r.stdout.split('\n')).toEqual([expect.stringMatching(/\/app$/), "o'brien says it's ", 'piped']);
             expect(sudoLog()).toBe('sudo -n\n');
             expect(sent).toEqual([{
-                command: `sudo -n sh -c 'cd '\\''app'\\'' && export WHO='\\''o'\\''\\'\\'''\\''brien'\\'' && pwd; echo "$WHO says it'\\''s $1"; cat'`,
+                command: asRootOf(`cd -- 'app' || exit\nexport WHO=${word("o'brien")} || exit\npwd; echo "$WHO says it's $1"; cat`),
                 options: { stdin: 'piped' },
             }]);
+            // Written out once in full, so the helper above is pinned too.
+            expect(asRootOf("echo 'hi'")).toBe(`sudo -n sh -c 'exec "$(command -v bash || command -v sh)" -c "$1"' asap-vps 'echo '\\''hi'\\'''`);
+        });
+
+        it('root\'s shell is bash where the machine has it and sh where it has none (an Alpine image): the command runs either way', async () => {
+            // A machine with no bash at all: its PATH holds sh, the stand-in sudo and the plain tools, nothing else.
+            const bare = join(DIR, 'no-bash-bin');
+            mkdirSync(bare);
+            for (const tool of ['sh', 'cat', 'echo']) symlinkSync(['/bin', '/usr/bin'].map((d) => join(d, tool)).find((at) => existsSync(at))!, join(bare, tool));
+            symlinkSync(join(BIN, 'sudo'), join(bare, 'sudo'));
+            const on = (path: string) => {
+                const ssh = { execCommand: async (command: string, options?: { stdin?: string }) => {
+                    const r = spawnSync('/bin/sh', ['-c', command], { cwd: DIR, input: options?.stdin ?? '', encoding: 'utf8', env: { PATH: path, HOME: DIR } });
+                    return { stdout: r.stdout.trim(), stderr: r.stderr.trim(), code: r.status, signal: r.signal };
+                } };
+                return new RemoteMachine(ssh as unknown as NodeSSH, UBUNTU);
+            };
+            expect(spawnSync('/bin/sh', ['-c', 'command -v bash'], { env: { PATH: bare }, encoding: 'utf8' }).status).not.toBe(0);
+            expect(await on(bare).sudo('echo "ran: $(cat)"', { stdin: 'piped in' })).toEqual({ stdout: 'ran: piped in', stderr: '', code: 0 });
+            // The session a SetupPipeline's steps run on goes the same way: it ran under `sudo -n bash -c` before, which such a machine has not.
+            expect(await on(bare).root.execCommand('echo "step ran"')).toMatchObject({ stdout: 'step ran', stderr: '', code: 0 });
+            // Where bash is there it is bash that runs it: what a step written for bash needs.
+            expect(await on(`${BIN}:/bin:/usr/bin`).sudo('[[ a == a ]] && echo "a bash test"')).toEqual({ stdout: 'a bash test', stderr: '', code: 0 });
+            expect(await on(`${BIN}:/bin:/usr/bin`).root.execCommand('[[ a == a ]] && echo "a bash test"')).toMatchObject({ stdout: 'a bash test', code: 0 });
         });
 
         it('a login that may not sudo gets sudo\'s own refusal, as the error of the command it asked for', async () => {
@@ -233,8 +321,36 @@ describe('RemoteMachine', () => {
             const { ssh, sent } = localSession();
             await new RemoteMachine(ssh, UBUNTU).writeFile('-secret', 'k', { mode: '600' });
             expect([(statSync(join(DIR, '-secret')).mode & 0o777).toString(8), sudoLog()]).toEqual(['600', '']);
-            expect(sent).toEqual([{ command: `cat > '-secret' && chmod -- '600' '-secret'`, options: { stdin: 'k' } }]);
+            // Closed to everyone but its writer first, written, and given its mode last.
+            expect(sent).toEqual([{ command: `umask 077 && : >> '-secret' && chmod -- 600 '-secret' && cat > '-secret' && chmod -- '600' '-secret'`, options: { stdin: 'k' } }]);
             expect(await new RemoteMachine(ssh, UBUNTU).readFile('-secret')).toBe('k');
+        });
+
+        it('with a mode the text is at no time in a file open to others: one that is there is narrowed before it is written, and stays closed when its mode or its owner cannot be set', async () => {
+            const { ssh } = localSession();
+            const m = new RemoteMachine(ssh, UBUNTU);
+            const mode = (file: string) => (statSync(join(DIR, file)).mode & 0o777).toString(8);
+            // A file that is there, open to all: the secret replaces what it held, under 600.
+            writeFileSync(join(DIR, 'open.env'), 'old');
+            chmodSync(join(DIR, 'open.env'), 0o644);
+            await m.writeFile('open.env', 'TOKEN=secret', { mode: '600' });
+            expect([readFileSync(join(DIR, 'open.env'), 'utf8'), mode('open.env')]).toEqual(['TOKEN=secret', '600']);
+            // A mode chmod does not take: the write is thrown, and the text it left is no one else's to read (it was 644 before this was fixed).
+            await expect(m.writeFile('new.env', 'TOKEN=secret', { mode: 'not-a-mode' })).rejects.toBeInstanceOf(RemoteCommandError);
+            expect(mode('new.env')).toBe('600');
+            chmodSync(join(DIR, 'open.env'), 0o644);
+            await expect(m.writeFile('open.env', 'TOKEN=other', { mode: 'not-a-mode' })).rejects.toBeInstanceOf(RemoteCommandError);
+            expect(mode('open.env')).toBe('600');
+            // An owner that cannot be given (no such user): thrown, and the file is still closed.
+            await expect(m.writeFile('owned.env', 'TOKEN=secret', { mode: '644', owner: 'no-such-user-of-this-machine' })).rejects.toBeInstanceOf(RemoteCommandError);
+            expect(mode('owned.env')).toBe('600');
+            // A wider mode is given all the same, once the text is in: 644 is 644.
+            await m.writeFile('public.txt', 'hello', { mode: '644' });
+            expect([readFileSync(join(DIR, 'public.txt'), 'utf8'), mode('public.txt')]).toEqual(['hello', '644']);
+            // With no mode, nothing of this: the file is written as the login's umask makes it, as before.
+            const plain = scriptedSession();
+            await new RemoteMachine(plain.ssh, ROOT).writeFile('/etc/motd', 'hi\n');
+            expect(plain.sent).toEqual([{ command: `cat > '/etc/motd'`, options: { stdin: 'hi\n' } }]);
         });
 
         it('writeFile with an owner, or with sudo, writes as root (through sudo for a login that is not root); with sudo false the login writes it even so', async () => {
@@ -245,8 +361,9 @@ describe('RemoteMachine', () => {
             await new RemoteMachine(owned.ssh, ROOT).writeFile('/etc/app/app.conf', 'a=1\n', { owner: 'app' });
             await new RemoteMachine(owned.ssh, ROOT).writeFile('/etc/motd', 'hi\n', { sudo: true });
             expect(owned.sent).toEqual([
-                { command: `sudo -n sh -c 'cat > '\\''/etc/app/app.conf'\\'' && chmod -- '\\''640'\\'' '\\''/etc/app/app.conf'\\'' && chown -- '\\''app:www-data'\\'' '\\''/etc/app/app.conf'\\'''`, options: { stdin: 'a=1\n' } },
-                { command: `sudo -n sh -c 'cat > '\\''/etc/motd'\\'''`, options: { stdin: 'hi\n' } },
+                // Its owner, then its mode: both once the text is in a file that is its writer's alone.
+                { command: asRootOf(`umask 077 && : >> '/etc/app/app.conf' && chmod -- 600 '/etc/app/app.conf' && cat > '/etc/app/app.conf' && chown -- 'app:www-data' '/etc/app/app.conf' && chmod -- '640' '/etc/app/app.conf'`), options: { stdin: 'a=1\n' } },
+                { command: asRootOf(`cat > '/etc/motd'`), options: { stdin: 'hi\n' } },
                 { command: `cat > 'mine' && chown -- 'ubuntu' 'mine'`, options: { stdin: 'x' } },
                 { command: `cat > '/etc/app/app.conf' && chown -- 'app' '/etc/app/app.conf'`, options: { stdin: 'a=1\n' } },
                 { command: `cat > '/etc/motd'`, options: { stdin: 'hi\n' } },
@@ -273,7 +390,7 @@ describe('RemoteMachine', () => {
             expect(await new RemoteMachine(ssh, UBUNTU).readFile('shadow', { sudo: true })).toBe('root:*:1::\n');
             expect(await new RemoteMachine(ssh, ROOT).readFile('shadow', { sudo: true })).toBe('root:*:1::\n');
             expect(await new RemoteMachine(ssh, UBUNTU).readFile('shadow')).toBe('root:*:1::\n');
-            expect(sent.slice(1).map((s) => s.command)).toEqual([`sudo -n sh -c 'cat -- '\\''shadow'\\'''`, `cat -- 'shadow'`, `cat -- 'shadow'`]);
+            expect(sent.slice(1).map((s) => s.command)).toEqual([asRootOf(`cat -- 'shadow'`), `cat -- 'shadow'`, `cat -- 'shadow'`]);
             expect(sudoLog()).toBe('sudo -n\n');
         });
 
@@ -290,7 +407,7 @@ describe('RemoteMachine', () => {
         const KEY = testPublicKey("deploy's laptop");
 
         it('addUser sends the script that makes the user, on the input of a shell root runs: as it is for a root login, through sudo for any other', async () => {
-            for (const [endpoint, command] of [[CONTAINER, 'sh -s'], [UBUNTU, `sudo -n sh -c 'sh -s'`]] as const) {
+            for (const [endpoint, command] of [[CONTAINER, 'sh -s'], [UBUNTU, asRootOf('sh -s')]] as const) {
                 const { ssh, sent } = scriptedSession();
                 await new RemoteMachine(ssh, endpoint).addUser('deploy', { publicKeys: [KEY], sudo: true, shell: '/bin/bash' });
                 expect(sent).toEqual([{ command, options: { stdin: addUserScript('deploy', { publicKeys: [KEY], sudo: true, shell: '/bin/bash' }) } }]);
@@ -320,7 +437,7 @@ describe('RemoteMachine', () => {
             expect(own.sent).toEqual([
                 { command: 'sh -s', options: { stdin: authorizeKeysScript([KEY], 'ubuntu') } },
                 { command: 'sh -s', options: { stdin: authorizeKeysScript([KEY], 'ubuntu') } },
-                { command: `sudo -n sh -c 'sh -s'`, options: { stdin: authorizeKeysScript([KEY], 'deploy') } },
+                { command: asRootOf('sh -s'), options: { stdin: authorizeKeysScript([KEY], 'deploy') } },
                 { command: 'sh -s', options: { stdin: authorizeKeysScript([KEY], 'deploy') } },
             ]);
             await expect(new RemoteMachine(own.ssh, ROOT).authorizeKeys(['nope'])).rejects.toThrow(/^bad public key "nope"/);
@@ -337,7 +454,7 @@ describe('RemoteMachine', () => {
             expect([deploy.login, deploy.ssh, root.login]).toEqual([`deploy@${CONTAINER.host}`, second.ssh, `root@${CONTAINER.host}`]);
             // The new user's root goes through its sudo; the first session's is the session itself.
             await deploy.sudo('id -u');
-            expect([second.sent, first.sent, first.mock.dispose.mock.calls.length]).toEqual([[{ command: `sudo -n sh -c 'id -u'`, options: {} }], [], 0]);
+            expect([second.sent, first.sent, first.mock.dispose.mock.calls.length]).toEqual([[{ command: asRootOf('id -u'), options: {} }], [], 0]);
         });
     });
 
@@ -349,7 +466,7 @@ describe('RemoteMachine', () => {
             const root = new RemoteMachine(asUbuntu.ssh, UBUNTU).root;
             expect(root).not.toBe(asUbuntu.ssh);
             await root.execCommand('apt-get install -y nginx');
-            expect(asUbuntu.sent).toEqual([{ command: `sudo -n bash -c 'apt-get install -y nginx'` }]);
+            expect(asUbuntu.sent).toEqual([{ command: asRootOf('apt-get install -y nginx') }]);
         });
 
         it('close ends the session, and only this one', async () => {

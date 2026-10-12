@@ -11,7 +11,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { testPublicKey } from '../../testing/fakes/util';
 import { shellQuote } from './container';
-import { addUserScript, authorizeKeysScript, checkPublicKeys, checkUsername, sshdBootScript, USERNAME } from './sshd';
+import { addUserScript, authorizeKeysScript, checkLoginName, checkPublicKeys, checkUsername, LOGIN_NAME, sshdBootScript, USERNAME } from './sshd';
 
 type Tool = 'useradd' | 'adduser' | 'usermod' | 'sshd' | 'sudo' | 'apt-get' | 'apk' | 'dnf' | 'yum' | 'getent' | 'bash';
 
@@ -30,6 +30,10 @@ type Box = {
     env?: Record<string, string>,
     /** A user known to getent alone (a directory service): not in the passwd file. */
     directoryUser?: string,
+    /** A box whose passwd file has no root: nowhere to put root's keys. */
+    noRoot?: boolean,
+    /** A stand-in that fails each time it is called (it is still written down). */
+    fail?: 'chown' | 'ssh-keygen' | 'sshd',
 };
 
 const SHELLS = ['/bin/dash', '/bin/sh'].filter((s) => existsSync(s));
@@ -47,6 +51,8 @@ writeFileSync(STUB, [
     'name=$(basename "$0")',
     // `id` is a question, not a change: it is not written down.
     'case $name in id) ;; *) { printf \'%s\' "$name"; for a in "$@"; do printf \' [%s]\' "$a"; done; echo; } >> "$BOX_LOG";; esac',
+    // The one tool this box has broken: called, and failing.
+    '[ "$name" = "$BOX_FAIL" ] && exit 1',
     'case $name in',
     // `id -u`: who runs this; `id -u <name>`: whether the box has the user; `id -gn <name>`: its group, named as it is.
     '    id)',
@@ -85,7 +91,7 @@ function runOn(script: string, box: Box = {}, o: { shell?: string, command?: str
     const [bin, root, log] = [join(dir, 'bin'), join(dir, 'root'), join(dir, 'calls.log')];
     for (const d of [bin, join(root, 'etc'), join(root, 'run'), join(root, 'home'), join(root, 'root')]) mkdirSync(d, { recursive: true });
     writeFileSync(log, '');
-    writeFileSync(join(root, 'etc/passwd'), [`root:x:0:0:root:${join(root, 'root')}:/bin/sh`, ...(box.users ?? []).map((u, i) => `${u}:x:${1000 + i}:${1000 + i}::${join(root, 'home', u)}:/bin/sh`)].join('\n') + '\n');
+    writeFileSync(join(root, 'etc/passwd'), [...(box.noRoot ? [] : [`root:x:0:0:root:${join(root, 'root')}:/bin/sh`]), ...(box.users ?? []).map((u, i) => `${u}:x:${1000 + i}:${1000 + i}::${join(root, 'home', u)}:/bin/sh`)].join('\n') + '\n');
     for (const u of [...(box.users ?? []), ...(box.directoryUser ? [box.directoryUser] : [])]) mkdirSync(join(root, 'home', u), { recursive: true });
     if (box.shadow) writeFileSync(join(root, 'etc/shadow'), Object.entries(box.shadow).map(([u, p]) => `${u}:${p}:19000:0:99999:7:::`).join('\n') + '\n');
     // The plain tools the scripts use, from this machine; nothing else is on the PATH.
@@ -98,7 +104,7 @@ function runOn(script: string, box: Box = {}, o: { shell?: string, command?: str
     if (/(^|[\s"'=:])\/(etc|run|usr|sbin|root|home)\b/.test(here.split(dir).join('BOX'))) throw new Error('the script names a path of this machine');
     const env = {
         PATH: bin, BOX_STUB: STUB, BOX_BIN: bin, BOX_ROOT: root, BOX_LOG: log, BOX_UID: String(box.uid ?? 0),
-        BOX_SETENV: box.setEnv === false ? '1' : '0', BOX_DIRECTORY_USER: box.directoryUser ?? '', ...(box.env ?? {}),
+        BOX_SETENV: box.setEnv === false ? '1' : '0', BOX_DIRECTORY_USER: box.directoryUser ?? '', BOX_FAIL: box.fail ?? '', ...(box.env ?? {}),
     };
     let [status, stdout, stderr] = [0, '', ''];
     try {
@@ -144,9 +150,44 @@ describe('user names and keys are checked before any script is written', () => {
         }
         expect(() => addUserScript('deploy', { publicKeys: ['nope'] })).toThrow(/^bad public key "nope"/);
         expect(() => addUserScript('Deploy')).toThrow(/^bad user name "Deploy"/);
-        expect(() => authorizeKeysScript([KEY_A], 'a b')).toThrow(/^bad user name "a b"/);
+        expect(() => authorizeKeysScript([KEY_A], 'a b')).toThrow(/^bad login name "a b"/);
         expect(() => authorizeKeysScript(['x'], 'root')).toThrow(/^bad public key "x"/);
         for (const shell of ['bash', '/bin/ba sh', '/bin/sh; id', '']) expect(() => addUserScript('deploy', { shell })).toThrow(new Error(`bad shell ${JSON.stringify(shell)}: the absolute path of one (/bin/bash)`));
+    });
+
+    it('a key is one line of the file, whatever its lines are: a second key behind a line break is not smuggled in, with a comment on the first or without', () => {
+        const [type, blob] = KEY_A.split(' ');
+        const bare = `${type} ${blob}`;
+        expect(checkPublicKeys([bare])).toEqual([bare]);
+        for (const two of [`${bare}\n${KEY_B}`, `${KEY_A}\n${KEY_B}`, `${bare}\r\n${KEY_B}`, `${bare}\r${KEY_B}`, `${type}\n${blob}`, `${bare}\0${KEY_B}`]) {
+            expect(() => checkPublicKeys([two])).toThrow(/^bad public key /);
+            expect(() => authorizeKeysScript([two], 'root')).toThrow(/^bad public key /);
+        }
+    });
+
+    it('a key may carry the options authorized_keys takes before it; what is before a key and is no option is refused', () => {
+        const withOptions = [
+            `no-pty ${KEY_A}`, `restrict,pty ${KEY_A}`, `from="10.0.0.0/8,192.168.1.*" ${KEY_A}`,
+            `command="echo \\"read only\\"; exit",no-port-forwarding,from="*.example.com" ${KEY_A}`, `environment="A=b c",expiry-time="20270101" ${KEY_B}`,
+            // A key whose type is all letters and dashes reads as a key, not as an option before one.
+            'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQC7 old@box', 'ssh-dss AAAAB3NzaC1kc3MAAACBAP7 older@box',
+        ];
+        expect(checkPublicKeys(withOptions)).toEqual(withOptions);
+        for (const bad of [`no pty ${KEY_A}`, `from="unterminated ${KEY_A}`, `from=10.0.0.0/8 ${KEY_A}`, `no-pty, ${KEY_A}`, `no-pty not-a-key AAAA`, `1bad ${KEY_A}`, 'no-pty', `no-pty ${KEY_A}\n${KEY_B}`]) {
+            expect(() => checkPublicKeys([bad])).toThrow(/^bad public key /);
+        }
+    });
+
+    it('a login a machine has is named more widely than a user this makes: capitals, dots, name@domain; nothing a shell, awk or chown would read as more than a name', () => {
+        for (const ok of ['root', 'john.doe', 'Admin', 'jdoe@example.com', 'svc_backup-2', '9front', '_x', 'x'.repeat(256)]) {
+            expect([LOGIN_NAME.test(ok), checkLoginName(ok), authorizeKeysScript([KEY_A], ok).includes(`asap_vps_keys '${ok}' `)]).toEqual([true, ok, true]);
+        }
+        for (const bad of ['', '-x', '.hidden', '@home', 'a b', 'a;id', 'a:b', 'a/b', 'back\\slash', "o'brien", '$(id)', 'a\nb', 'root\n', 'x'.repeat(257)]) {
+            expect(() => checkLoginName(bad)).toThrow(new Error(`bad login name ${JSON.stringify(bad)}: letters, digits, underscores, dots, dashes and at signs, not beginning with a dash or a dot`));
+        }
+        expect(() => checkLoginName(undefined as never)).toThrow(/^bad login name undefined/);
+        // What may log in is not what may be made: every image family must take a new user's name.
+        expect(() => addUserScript('john.doe')).toThrow(/^bad user name "john.doe"/);
     });
 });
 
@@ -301,6 +342,35 @@ describe.each(SHELLS)('sshdBootScript: an SSH server for a container, under %s',
         const user = runOn(start([KEY_A]), { uid: 1000 }, { shell, command: ['echo', 'must not run'] });
         expect([user.status, user.stdout, user.calls]).toEqual([1, '', []]);
         expect(user.stderr).toBe('asap-vps: an SSH server needs a container that starts as root\nasap-vps: no SSH server could be started in this container: it does not start\n');
+    });
+
+    it('a container whose SSH server could not be set up does not start, at whatever step: its keys not written, its host keys not made, sshd not starting. Never up with nobody able to log in', () => {
+        // Each is a step `set -e` would have stopped at, were it not ignored where this runs (the left side of `||`).
+        const cases: Array<[string, Box, string[]]> = [
+            ['no root in the passwd file: nowhere to put the keys', { noRoot: true }, ['asap-vps: no user root on this machine', 'asap-vps: the keys that log in could not be written']],
+            ['the keys\' file cannot be made root\'s own', { fail: 'chown' }, ['asap-vps: the keys that log in could not be written']],
+            ['no host keys', { fail: 'ssh-keygen' }, ['asap-vps: the SSH server\'s host keys could not be made']],
+            ['sshd does not start', { fail: 'sshd' }, []],
+        ];
+        for (const [what, box, said] of cases) {
+            const r = runOn(start([KEY_A]), box, { shell, command: ['echo', 'must not run'] });
+            expect([what, r.status, r.stdout]).toEqual([what, 1, '']);
+            expect(r.stderr.trim().split('\n')).toEqual([...said, 'asap-vps: no SSH server could be started in this container: it does not start']);
+            // Nothing after the step that failed: above all, no sshd started for keys that are not there.
+            if (box.fail !== 'sshd') expect(r.calls.filter((c) => c.startsWith('sshd [-e]'))).toEqual([]);
+        }
+        // The same steps, none failing, on the same box: it starts, and hands over.
+        const ok = runOn(start([KEY_A]), {}, { shell, command: ['echo', 'handed over'] });
+        expect([ok.status, ok.stdout, ok.stderr]).toEqual([0, 'handed over\n', '']);
+    });
+
+    it('the same holds under a caller\'s own `set -e`, and without one: the start script decides, not the shell\'s options', () => {
+        for (const prefix of ['', 'set -e\n', 'set -eu\n']) {
+            const failed = runOn(`${prefix}${start([KEY_A])}`, { noRoot: true }, { shell, command: ['echo', 'must not run'] });
+            expect([prefix, failed.status, failed.stdout]).toEqual([prefix, 1, '']);
+            const ok = runOn(`${prefix}${start([KEY_A])}`, {}, { shell, command: ['echo', 'handed over'] });
+            expect([prefix, ok.status, ok.stdout]).toEqual([prefix, 0, 'handed over\n']);
+        }
     });
 
     it('a script of the caller\'s own runs after the SSH server and before the command, which keeps its own arguments', () => {

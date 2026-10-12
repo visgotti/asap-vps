@@ -10,7 +10,7 @@
 // tools in utils/sshd.spec.ts, and on rented machines by the *Ssh.live suites.
 
 import { ChildProcess, execFileSync, spawn } from 'child_process';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { createServer } from 'net';
 import { tmpdir, userInfo } from 'os';
 import { join } from 'path';
@@ -22,7 +22,8 @@ import { createSSHKeyPair } from './utils';
 const wanted = (process.env.ASAP_VPS_LOCAL ?? '').split(',').map((s) => s.trim()).includes('sshd');
 
 (wanted ? describe : describe.skip)(`RemoteMachine over a real session: a throwaway sshd of this machine${wanted ? '' : ' (npm run test:ssh runs it)'}`, () => {
-    const dir = mkdtempSync(join(tmpdir(), 'asap-vps-local-sshd-'));
+    // Made when the suite runs, not when it is declared: jest runs this body for a skipped suite too, whose afterAll never comes.
+    let dir: string;
     let sshd: ChildProcess;
     let endpoint: SSHEndpoint;
     let key: SSHKeyData;
@@ -30,6 +31,7 @@ const wanted = (process.env.ASAP_VPS_LOCAL ?? '').split(',').map((s) => s.trim()
     const log: string[] = [];
 
     beforeAll(async () => {
+        dir = mkdtempSync(join(tmpdir(), 'asap-vps-local-sshd-'));
         key = await createSSHKeyPair('asap-vps-local');
         const port = await new Promise<number>((resolve) => {
             const probe = createServer().listen(0, '127.0.0.1', () => {
@@ -56,7 +58,7 @@ const wanted = (process.env.ASAP_VPS_LOCAL ?? '').split(',').map((s) => s.trim()
     afterAll(async () => {
         await machine?.close();
         sshd?.kill();
-        rmSync(dir, { recursive: true, force: true });
+        if (dir) rmSync(dir, { recursive: true, force: true });
     });
 
     it('logs in as the endpoint says, and runs a command in a directory, with an environment and an input, whatever is in them', async () => {
@@ -65,6 +67,21 @@ const wanted = (process.env.ASAP_VPS_LOCAL ?? '').split(',').map((s) => s.trim()
         const env = { GREETING: "it's $HOME; `id` \"quoted\"", EMPTY: '' };
         const r = await machine.run('pwd -P; printf "%s|%s|" "$GREETING" "$EMPTY"; cat; echo to-stderr >&2', { cwd: dir, env, stdin: 'from stdin' });
         expect(r).toEqual({ stdout: `${execFileSync('/bin/sh', ['-c', 'cd "$1" && pwd -P', 'sh', dir], { encoding: 'utf8' }).trim()}\nit's $HOME; \`id\` "quoted"||from stdin`, stderr: 'to-stderr', code: 0 });
+    });
+
+    it('a directory that is not there ends the whole command over a real session too: the half after a `;` does not run', async () => {
+        // The second half names its file in full, so it would be written wherever the shell stood: it must not be written at all.
+        const mark = join(dir, 'ran-anyway');
+        const failed: RemoteCommandError = await machine.run(`echo first; touch '${mark}'`, { cwd: join(dir, 'no-such-dir'), env: { A: 'b' } }).catch((e) => e);
+        expect([failed instanceof RemoteCommandError, failed.stdout, existsSync(mark)]).toEqual([true, '', false]);
+        expect(failed.code).toBeGreaterThan(0);
+        expect(failed.stderr).toMatch(/no-such-dir/);
+        // A secret written with a mode is never open to others, and reads back as it was written.
+        const secret = join(dir, 'app.env');
+        writeFileSync(secret, 'old');
+        chmodSync(secret, 0o644);
+        await machine.writeFile(secret, 'TOKEN=secret\n', { mode: '600' });
+        expect([(statSync(secret).mode & 0o777).toString(8), await machine.readFile(secret)]).toEqual(['600', 'TOKEN=secret\n']);
     });
 
     it('a command that fails throws what it wrote and how it ended; one a signal ended has no status', async () => {

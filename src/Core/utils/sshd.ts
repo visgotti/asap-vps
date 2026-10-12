@@ -8,8 +8,17 @@
 import { shellQuote } from './container';
 import { parseSSHPublicKey } from './ssh';
 
-/** A user name every image family takes: a lowercase letter or underscore, then letters, digits, underscores and dashes, 32 in all. */
+/** A name for a user this makes, which every image family takes: a lowercase letter or underscore, then letters, digits, underscores and dashes, 32 in all. */
 export const USERNAME = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+/**
+ * The name of a login a machine already has: wider than USERNAME, since a
+ * machine names its own (capitals and dots on a RHEL family or a
+ * directory-backed one: `Admin`, `john.doe`, `jdoe@example.com`). Letters,
+ * digits, underscores, dots, dashes and at signs, not beginning with a dash
+ * or a dot: nothing a shell, awk or chown reads as anything but a name.
+ */
+export const LOGIN_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,255}$/;
 
 /** What a user is made with (RemoteMachine.addUser). */
 export type RemoteUser = {
@@ -21,7 +30,7 @@ export type RemoteUser = {
     shell?: string,
 };
 
-/** `name` as a user name (USERNAME), or the error that says it is not one. */
+/** `name` as the name of a user to make (USERNAME), or the error that says it is not one. */
 export function checkUsername(name: string): string {
     if (typeof name !== 'string' || !USERNAME.test(name)) {
         throw new Error(`bad user name ${JSON.stringify(name)}: a lowercase letter or underscore, then letters, digits, underscores and dashes (32 at most)`);
@@ -29,15 +38,38 @@ export function checkUsername(name: string): string {
     return name;
 }
 
-/** Each key as its authorized_keys line (one line, trimmed), or the error that says which is not an OpenSSH public key. */
+/** `name` as the name of a login the machine has (LOGIN_NAME), or the error that says it is not one. */
+export function checkLoginName(name: string): string {
+    if (typeof name !== 'string' || !LOGIN_NAME.test(name)) {
+        throw new Error(`bad login name ${JSON.stringify(name)}: letters, digits, underscores, dots, dashes and at signs, not beginning with a dash or a dot`);
+    }
+    return name;
+}
+
+/** authorized_keys' options before a key: `no-pty`, `from="10.0.0.0/8"`, comma-separated, a value in double quotes (sshd(8), AUTHORIZED_KEYS FILE FORMAT). */
+const KEY_OPTIONS = /^[A-Za-z-]+(?:="(?:[^"\\]|\\.)*")?(?:,[A-Za-z-]+(?:="(?:[^"\\]|\\.)*")?)*[ \t]+(.+)$/;
+
+/**
+ * Each key as its authorized_keys line (one line, trimmed), or the error that
+ * says which is not one: an OpenSSH public key, with the options
+ * authorized_keys takes before it or without. A text of more than one line is
+ * refused, whatever its lines are: each key is one line of the file.
+ */
 export function checkPublicKeys(publicKeys: readonly string[]): string[] {
     return publicKeys.map((key) => {
-        try {
-            parseSSHPublicKey(String(key));
-        } catch {
+        const line = String(key).trim();
+        const isKey = (text: string | undefined) => {
+            try {
+                return text !== undefined && !!parseSSHPublicKey(text);
+            } catch {
+                return false;
+            }
+        };
+        // A key as it is; else one with options before it (a key's own type is never read as an option: the plain reading comes first).
+        if (/[\r\n\0]/.test(line) || !(isKey(line) || isKey(KEY_OPTIONS.exec(line)?.[1]))) {
             throw new Error(`bad public key ${JSON.stringify(String(key).slice(0, 40))}: not an OpenSSH public key line (ssh-ed25519 AAAA... comment)`);
         }
-        return String(key).trim();
+        return line;
     });
 }
 
@@ -63,30 +95,32 @@ const INSTALL = [
  * (sshd takes no key from a file anyone else can write).
  */
 const KEYS = [
+    // Each step says for itself that it failed: a shell ignores `set -e` in a function called on the left of `||` (sshdBootScript calls it there).
     'asap_vps_keys() {',
     '    user=$1; shift',
     '    home=$(awk -F: -v u="$user" \'$1 == u { print $6 }\' /etc/passwd)',
     '    [ -n "$home" ] || home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)',
     '    [ -n "$home" ] || { echo "asap-vps: no user $user on this machine" >&2; return 1; }',
-    '    mkdir -p "$home/.ssh"',
-    '    touch "$home/.ssh/authorized_keys"',
+    '    mkdir -p "$home/.ssh" || return 1',
+    '    touch "$home/.ssh/authorized_keys" || return 1',
     '    for key in "$@"; do',
-    '        grep -qxF -- "$key" "$home/.ssh/authorized_keys" || printf \'%s\\n\' "$key" >> "$home/.ssh/authorized_keys"',
+    '        grep -qxF -- "$key" "$home/.ssh/authorized_keys" || printf \'%s\\n\' "$key" >> "$home/.ssh/authorized_keys" || return 1',
     '    done',
-    '    chmod 700 "$home/.ssh"',
-    '    chmod 600 "$home/.ssh/authorized_keys"',
-    '    chown -R "$user:$(id -gn "$user")" "$home/.ssh"',
+    '    chmod 700 "$home/.ssh" || return 1',
+    '    chmod 600 "$home/.ssh/authorized_keys" || return 1',
+    '    chown -R "$user:$(id -gn "$user")" "$home/.ssh" || return 1',
     '}',
 ];
 
 /**
- * A script that makes `publicKeys` log in as `user` (who must exist), each
- * key once however often it runs: what RemoteMachine.authorizeKeys runs, and
+ * A script that makes `publicKeys` log in as `user` (who must exist: a
+ * login of the machine's own, by any name it has), each key once however
+ * often it runs: what RemoteMachine.authorizeKeys runs, and
  * what a VM's first boot runs for keys its platform's launch does not take.
  */
 export function authorizeKeysScript(publicKeys: readonly string[], user: string): string {
     const keys = checkPublicKeys(publicKeys);
-    return ['set -eu', ...KEYS, `asap_vps_keys ${[checkUsername(user), ...keys].map(shellQuote).join(' ')}`, ''].join('\n');
+    return ['set -eu', ...KEYS, `asap_vps_keys ${[checkLoginName(user), ...keys].map(shellQuote).join(' ')}`, ''].join('\n');
 }
 
 /**
@@ -151,18 +185,20 @@ export function sshdBootScript(publicKeys: readonly string[]): string {
         '# asap-vps: an SSH server for this container (CreateServerOptions.sshKeyIds), started before its command.',
         ...INSTALL,
         ...KEYS,
+        // Called on the left of `||` (below), where a shell ignores `set -e`, here and in what this calls: each step that can
+        // fail ends it by hand, so a container whose keys were not written is not one that starts with nobody able to log in.
         'asap_vps_sshd() (',
-        '    set -eu',
+        '    set -u',
         '    [ "$(id -u)" = 0 ] || { echo "asap-vps: an SSH server needs a container that starts as root" >&2; exit 1; }',
         '    PATH="$PATH:/usr/sbin:/sbin"',
         '    if ! command -v sshd >/dev/null 2>&1; then',
         '        asap_vps_install openssh-server openssh openssh-server || { echo "asap-vps: this image has no sshd, and no package manager this knows (apt-get, apk, dnf, yum) to install one with" >&2; exit 1; }',
         '    fi',
-        '    sshd=$(command -v sshd)',
+        '    sshd=$(command -v sshd) || { echo "asap-vps: OpenSSH was installed, but there is no sshd to run" >&2; exit 1; }',
         // Debian's sshd wants its privilege-separation directory; the host keys are made where the image has none.
-        '    mkdir -p /run/sshd',
-        '    ssh-keygen -A >/dev/null',
-        `    asap_vps_keys root${keys.map((k) => ` ${shellQuote(k)}`).join('')}`,
+        '    mkdir -p /run/sshd || exit 1',
+        '    ssh-keygen -A >/dev/null || { echo "asap-vps: the SSH server\'s host keys could not be made" >&2; exit 1; }',
+        `    asap_vps_keys root${keys.map((k) => ` ${shellQuote(k)}`).join('')} || { echo "asap-vps: the keys that log in could not be written" >&2; exit 1; }`,
         // On the command line, where they come before whatever the image's own sshd_config says.
         '    set -- -o PermitRootLogin=prohibit-password -o PubkeyAuthentication=yes -o PasswordAuthentication=no',
         // The container's own search paths for a session, where they are plain enough to pass on and this sshd knows SetEnv (OpenSSH 7.8).

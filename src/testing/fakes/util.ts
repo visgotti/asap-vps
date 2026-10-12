@@ -46,7 +46,10 @@ export function scriptKeys(script: unknown, user: string): string[] | undefined 
     for (const line of String(script ?? '').split('\n')) {
         const m = /^\s*asap_vps_keys\s+(.*)$/.exec(line);
         if (!m) continue;
-        const words = [...m[1].matchAll(/'((?:[^']|'\\'')*)'|(\S+)/g)].map((w) => (w[1] !== undefined ? w[1].replace(/'\\''/g, "'") : w[2]));
+        const all = [...m[1].matchAll(/'((?:[^']|'\\'')*)'|(\S+)/g)];
+        // The call's own words: what follows a bare `||`, `&&` or `;` is another command (what the script does when this one fails).
+        const end = all.findIndex((w) => w[1] === undefined && /^(\|\||&&|;)$/.test(w[2]));
+        const words = (end < 0 ? all : all.slice(0, end)).map((w) => (w[1] !== undefined ? w[1].replace(/'\\''/g, "'") : w[2]));
         if (words[0] === user) return words.slice(1);
     }
     return undefined;
