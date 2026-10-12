@@ -15,6 +15,8 @@ import { RemoteMachine } from '../Core/RemoteMachine';
 import { createSSHKeyPair } from '../Core/utils';
 import { AuthError, CapacityError, ProviderError, RemoteCommandError } from '../errors';
 import { providerInfo } from '../Providers/registry';
+import { askedPorts } from '../Providers/VastAI/mappers';
+import type { VastInstance } from '../Providers/VastAI/types';
 import type { CreateServerOptions, Server } from '../types';
 import {
     ComputeSubject, deleteRunKeys, endRun, liveOptions, liveRequested, loadCredentials, newRunName, providerFromEnv, runMatcher, startWatchdog, sweepLeftovers,
@@ -22,8 +24,6 @@ import {
 } from './live';
 
 const WAIT = { intervalMs: 10_000, timeoutMs: 15 * 60_000 };
-/** A machine that has just come up may not take logins yet, and a container may be installing its SSH server. */
-const FIRST_LOGIN = { maxRetries: 60, retryTimeout: 10_000 };
 const LOGIN = { maxRetries: 6, retryTimeout: 5000 };
 
 export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
@@ -122,13 +122,26 @@ export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
             const said = Object.entries((server.raw ?? {}) as Record<string, unknown>).filter(([k]) => /runtype|^ssh_(host|port|idx)$|^ssh$|^ports$|direct_port|^onstart$/.test(k));
             log(`${server.id}: its record says ${JSON.stringify(Object.fromEntries(said))}`);
             expect(server.ssh).toEqual({ host: expect.any(String), port: expect.any(Number), username: login });
-            const machine = await RemoteMachine.connect(server, { privateKey: first.privateKey, retry: FIRST_LOGIN }).catch(async (e) => {
+            if (container) {
+                // Both ports it was made to expose are mapped in what waitUntilRunning returned: the SSH server's and the caller's own.
+                expect(server.ports?.filter((x) => x.publicPort != null).map((x) => `${x.privatePort}/${x.protocol}`)).toEqual(expect.arrayContaining(['22/tcp', '8080/tcp']));
+            }
+            if (id === 'vast') {
+                // What Vast's own record says the instance was launched to expose (its env's `-p` flags, by name alone): what the wait for its ports reads.
+                const instance = server.raw as VastInstance;
+                const flags = (Array.isArray(instance.extra_env) ? instance.extra_env.map(([k]) => k) : Object.keys(instance.extra_env ?? {})).filter((k) => /^-[pv]\b/.test(k));
+                log(`${server.id}: its record's extra_env is ${Array.isArray(instance.extra_env) ? 'pairs' : typeof instance.extra_env}, with the flags ${JSON.stringify(flags)}`);
+                expect(askedPorts(instance)).toEqual(expect.arrayContaining([{ privatePort: 22, protocol: 'tcp' }, { privatePort: 8080, protocol: 'tcp' }]));
+            }
+            // The documented way in, as it is: what waitUntilRunning returned, with the time RemoteMachine gives a server's first login by default.
+            const dialed = Date.now();
+            const machine = await RemoteMachine.connect(server, { privateKey: first.privateKey }).catch(async (e) => {
                 // A container that could start no SSH server says why in its log.
                 const logs = supports(p, 'logs') ? await p.getServerLogs(server.id).catch(() => '') : '';
                 throw new Error(`no SSH session to ${server.id} at ${server.ssh?.host}:${server.ssh?.port}: ${(e as Error).message}${logs ? `\n${logs.slice(-2000)}` : ''}`);
             });
             const sessions = [machine];
-            log(`${server.id}: logged in as ${machine.login}, ${Math.round((Date.now() - rented!.at) / 1000)} s after the create`);
+            log(`${server.id}: logged in as ${machine.login}, ${Math.round((Date.now() - rented!.at) / 1000)} s after the create, ${Math.round((Date.now() - dialed) / 1000)} s after waitUntilRunning returned it`);
             try {
                 expect((await machine.run('id -un')).stdout).toBe(login);
                 expect((await machine.sudo('id -u')).stdout).toBe('0');
@@ -147,10 +160,24 @@ export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
                     expect(session[0]).toBe(own.PATH);
                     expect(session[1] ?? '').toBe(own.LD_LIBRARY_PATH ?? '');
                 }
-                // A key that was not named does not log in.
-                await expect(RemoteMachine.connect(server, { privateKey: deployKeys.privateKey, retry: { maxRetries: 1, retryTimeout: 0 } })).rejects.toThrow();
+                // A directory that is not there ends the whole command: its second half does not run where the login stood.
+                const stray: RemoteCommandError = await machine.run('echo first; touch /tmp/asap-vps-ran-anyway', { cwd: '/no/such/dir' }).catch((e) => e);
+                expect([stray instanceof RemoteCommandError, stray.stdout, (await machine.run('test -e /tmp/asap-vps-ran-anyway', { check: false })).code === 0]).toEqual([true, '', false]);
+                // A secret written with a mode is the login's alone, on a file that was there and open as on a new one.
+                await machine.run('echo old > /tmp/asap-vps-secret && chmod 644 /tmp/asap-vps-secret');
+                await machine.writeFile('/tmp/asap-vps-secret', 'TOKEN=secret\n', { mode: '600' });
+                expect([(await machine.run('stat -c %a /tmp/asap-vps-secret')).stdout, await machine.readFile('/tmp/asap-vps-secret')]).toEqual(['600', 'TOKEN=secret\n']);
+                // Exactly the keys named are the login's, each once, and no other: what refuses any other key (a container's are written by the library's own start).
+                if (container) {
+                    const key = (line: string) => line.trim().split(/\s+/).slice(0, 2).join(' ');
+                    const authorized = (await machine.readFile('/root/.ssh/authorized_keys')).trim().split('\n').map(key);
+                    expect(authorized.sort()).toEqual([key(first.publicKey), key(second.publicKey)].sort());
+                }
+                // A key that was not named does not log in: no session, whether the server says so at once or the attempt runs out.
+                await expect(RemoteMachine.connect(server, { privateKey: deployKeys.privateKey, retry: { maxRetries: 1, retryTimeout: 0 } }))
+                    .rejects.toThrow(/All configured authentication methods failed|Timed out while waiting for handshake/);
                 // The second key named logs in too (on Lambda, the one the library adds at the first boot).
-                const other = await RemoteMachine.connect(server, { privateKey: second.privateKey, retry: FIRST_LOGIN });
+                const other = await RemoteMachine.connect(server, { privateKey: second.privateKey });
                 sessions.push(other);
                 expect((await other.run('id -un')).stdout).toBe(login);
 
@@ -164,6 +191,9 @@ export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
                 await deploy.writeFile('/etc/asap-vps-live.conf', "mark='it''s here'\n", { owner: 'root', mode: '600' });
                 expect(await deploy.readFile('/etc/asap-vps-live.conf', { sudo: true })).toBe("mark='it''s here'\n");
                 await expect(deploy.readFile('/etc/asap-vps-live.conf')).rejects.toBeInstanceOf(RemoteCommandError);
+                // As a login that is not root, a missing directory ends a command run as root too (through sudo), all of it.
+                const strayRoot: RemoteCommandError = await deploy.sudo('echo first; touch /tmp/asap-vps-root-ran-anyway', { cwd: '/no/such/dir' }).catch((e) => e);
+                expect([strayRoot instanceof RemoteCommandError, (await machine.run('test -e /tmp/asap-vps-root-ran-anyway', { check: false })).code === 0]).toEqual([true, false]);
                 // The right to sudo is taken back by the same call; the login stays.
                 await machine.addUser('deploy', { sudo: false });
                 await expect(deploy.sudo('true')).rejects.toBeInstanceOf(RemoteCommandError);
