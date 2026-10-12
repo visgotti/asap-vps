@@ -1,14 +1,9 @@
 # Quick start
 
-> **Status.** These docs describe the capability-based API on the `feat/capabilities` branch ([pull request #2](https://github.com/visgotti/asap-vps/pull/2)). It replaces the initializer API of the `0.0.22` release on npm, so until a new release is published, clone the repository and build it.
-
 ## Install
 
 ```bash
-git clone https://github.com/visgotti/asap-vps.git
-cd asap-vps
-git checkout feat/capabilities
-npm install && npm run build      # dist/ holds the JavaScript and the .d.ts files this site's editors use
+npm install asap-vps      # Node 18 or newer
 ```
 
 The library runs on Node (it uses the global `fetch`) and has one runtime dependency, `node-ssh`, for logging into the servers it rents.
