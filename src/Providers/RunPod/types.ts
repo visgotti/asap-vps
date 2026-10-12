@@ -78,6 +78,8 @@ export type RunPodPod = {
     startedAt?: string | null,
     /** The actions the current status allows. */
     actions?: string[],
+    /** The ports it was made to expose, each `<port>/<tcp|http>`: asked for, not yet where they are (`runtime.ports`). */
+    ports?: string[] | null,
     runtime?: { uptime?: number, ports?: Array<{ private: number, public?: number | null, type?: string, ip?: string | null }> } | null,
     ssh?: { proxy?: RunPodSshEndpoint | null, direct?: RunPodSshEndpoint | null },
     /** Its disk of its own (`persistent`) or the network volume it mounts (`network`, at most one): never both. */

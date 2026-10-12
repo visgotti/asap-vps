@@ -60,6 +60,13 @@ describe('Vast instances', () => {
         // A binding that is null among the port's bindings is no binding.
         expect(toServer({ id: 9, ports: { '443/tcp': [null, { HostIp: '0.0.0.0', HostPort: '41000' }] } } as unknown as VastInstance).ports)
             .toEqual([{ privatePort: 443, publicPort: 41000, ip: undefined, protocol: 'tcp' }]);
+        // A port bound on both address families is listed twice by Vast, with one public port (seen live 2026-10-12): one mapping. Two public ports are two.
+        const both = { '22/tcp': [{ HostIp: '0.0.0.0', HostPort: '61385' }, { HostIp: '::', HostPort: '61385' }], '8080/tcp': [{ HostIp: '0.0.0.0', HostPort: '61386' }, { HostIp: '::', HostPort: '61390' }],
+            '8080/udp': [{ HostIp: '0.0.0.0', HostPort: '61386' }] };
+        expect(toServer({ id: 9, public_ipaddr: '198.51.100.7', ports: both } as unknown as VastInstance).ports).toEqual([
+            { privatePort: 22, publicPort: 61385, ip: '198.51.100.7', protocol: 'tcp' }, { privatePort: 8080, publicPort: 61386, ip: '198.51.100.7', protocol: 'tcp' },
+            { privatePort: 8080, publicPort: 61390, ip: '198.51.100.7', protocol: 'tcp' }, { privatePort: 8080, publicPort: 61386, ip: '198.51.100.7', protocol: 'udp' },
+        ]);
     });
 
     it('where to log in: the machine\'s address and the port mapped to the container\'s 22; Vast\'s own proxy where none is mapped; nowhere where it gives neither', () => {

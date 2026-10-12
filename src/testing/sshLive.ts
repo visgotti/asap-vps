@@ -40,6 +40,13 @@ export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
         let keyIds: Set<string> | undefined;
         let watchdog: { doneFile: string } | undefined;
         let refused = false;
+        /** What the run rented, for what it cost: the offer's price and when its server was asked for. */
+        let rented: { pricePerHour: number, at: number } | undefined;
+        const log = (m: string) => void process.stdout.write(`[${new Date().toISOString().slice(11, 19)}] ${id}: ${m}\n`);
+        /** A server as a read of it showed it: its status, where it is logged in to, and its ports. */
+        const shown = (s: Server | null) => (s
+            ? `${s.status} (${s.providerStatus}), ssh ${s.ssh ? `${s.ssh.username}@${s.ssh.host}:${s.ssh.port}` : 'none'}, ports ${JSON.stringify(s.ports?.map((x) => `${x.privatePort}/${x.protocol}->${x.publicPort}`) ?? [])}`
+            : 'gone');
 
         /** The cheapest offers in stock, tried in turn: one that is taken, or whose host cannot start the server, moves on to the next. */
         const rentRunning = async (o: Omit<CreateServerOptions, 'offer'>): Promise<Server> => {
@@ -48,11 +55,25 @@ export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
             for (const offer of offers) {
                 let made: Server | undefined;
                 try {
+                    log(`renting ${offer.gpuCount}x ${offer.gpu} (${offer.id}) in ${offer.regions[0]} at $${offer.pricePerHour.toFixed(3)}/h as ${o.name}`);
+                    rented = { pricePerHour: offer.pricePerHour, at: Date.now() };
                     made = await p.createServer({ ...o, offer });
-                    await p.waitUntilRunning(made.id, WAIT);
-                    // Where sshd is may be known a moment after the server reads as running (a container's mapped port).
-                    return (await p.waitForServer(made.id, (s) => s?.status === 'running' && !!s.ssh, WAIT))!;
+                    // What each read says while it comes up, where it changes: when the platform says it runs, and when it says where to log in.
+                    const read = p.getServer.bind(p);
+                    let last = '';
+                    p.getServer = async (serverId: string) => {
+                        const s = await read(serverId);
+                        if (shown(s) !== last) log(`  ${Math.round((Date.now() - rented!.at) / 1000)} s: ${last = shown(s)}`);
+                        return s;
+                    };
+                    try {
+                        // The documented way in: what waitUntilRunning returns is what RemoteMachine.connect takes.
+                        return await p.waitUntilRunning(made.id, WAIT);
+                    } finally {
+                        p.getServer = read;
+                    }
                 } catch (e) {
+                    log(`${offer.id} did not give a server to log in to: ${(e as Error).message.slice(0, 300)}`);
                     if (!(e instanceof CapacityError) && !(made && e instanceof ProviderError)) throw e;
                     if (made) expect(await p.deleteServerAndWait(made.id, WAIT)).toBe(true);
                 }
@@ -92,9 +113,14 @@ export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
             const named = [await keysOf.addSSHKey(first.publicKey, `${runName}-a`), await keysOf.addSSHKey(second.publicKey, `${runName}-b`)];
             const server = await rentRunning({
                 name: runName, sshKeyIds: named.map((k) => k.id),
-                ...(container ? { image: TEST_IMAGE, minCudaVersion: TEST_IMAGE_CUDA, command: ['sleep', 'infinity'] } : {}),
+                // A port of the caller's own beside the SSH server's, to see both mapped.
+                ...(container ? { image: TEST_IMAGE, minCudaVersion: TEST_IMAGE_CUDA, command: ['sleep', 'infinity'], ports: ['8080/tcp'] } : {}),
             });
             const login = id === 'lambda' ? 'ubuntu' : 'root';
+            log(`${server.id}: waitUntilRunning returned it ${Math.round((Date.now() - rented!.at) / 1000)} s after the create, as ${shown(server)}`);
+            // What the platform's own record says of where to log in, by field name (nothing of it is a secret).
+            const said = Object.entries((server.raw ?? {}) as Record<string, unknown>).filter(([k]) => /runtype|^ssh_(host|port|idx)$|^ssh$|^ports$|direct_port|^onstart$/.test(k));
+            log(`${server.id}: its record says ${JSON.stringify(Object.fromEntries(said))}`);
             expect(server.ssh).toEqual({ host: expect.any(String), port: expect.any(Number), username: login });
             const machine = await RemoteMachine.connect(server, { privateKey: first.privateKey, retry: FIRST_LOGIN }).catch(async (e) => {
                 // A container that could start no SSH server says why in its log.
@@ -102,11 +128,27 @@ export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
                 throw new Error(`no SSH session to ${server.id} at ${server.ssh?.host}:${server.ssh?.port}: ${(e as Error).message}${logs ? `\n${logs.slice(-2000)}` : ''}`);
             });
             const sessions = [machine];
+            log(`${server.id}: logged in as ${machine.login}, ${Math.round((Date.now() - rented!.at) / 1000)} s after the create`);
             try {
                 expect((await machine.run('id -un')).stdout).toBe(login);
                 expect((await machine.sudo('id -u')).stdout).toBe('0');
                 // A session finds what the image's own processes find (a container's PATH and library path).
                 expect((await machine.run('nvidia-smi -L')).stdout).toMatch(/^GPU \d+: /m);
+                if (container) {
+                    // The start handed over to the command: it runs, beside the SSH server.
+                    const processes = (await machine.run('for f in /proc/[0-9]*/cmdline; do tr "\\0" " " < "$f" 2>/dev/null; echo; done')).stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+                    log(`${server.id}: runs ${JSON.stringify(processes.filter((l) => !l.startsWith('sh -c for f in') && !l.startsWith('tr ')).map((l) => l.slice(0, 100)))}`);
+                    expect(processes).toContain('sleep infinity');
+                    expect(processes.some((l) => /sshd/.test(l))).toBe(true);
+                    // A session's search paths are the container's own: the ones its first process was started with.
+                    const own = Object.fromEntries((await machine.run('tr "\\0" "\\n" < /proc/1/environ')).stdout.split('\n').filter((l) => /^(PATH|LD_LIBRARY_PATH)=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+                    const session = (await machine.run('echo "$PATH"; echo "${LD_LIBRARY_PATH:-}"')).stdout.split('\n');
+                    log(`${server.id}: the container's own ${JSON.stringify(own)}; a session's ${JSON.stringify(session)}`);
+                    expect(session[0]).toBe(own.PATH);
+                    expect(session[1] ?? '').toBe(own.LD_LIBRARY_PATH ?? '');
+                }
+                // A key that was not named does not log in.
+                await expect(RemoteMachine.connect(server, { privateKey: deployKeys.privateKey, retry: { maxRetries: 1, retryTimeout: 0 } })).rejects.toThrow();
                 // The second key named logs in too (on Lambda, the one the library adds at the first boot).
                 const other = await RemoteMachine.connect(server, { privateKey: second.privateKey, retry: FIRST_LOGIN });
                 sessions.push(other);
@@ -130,6 +172,8 @@ export function describeLiveSsh(id: 'runpod' | 'vast' | 'lambda'): void {
                 await Promise.all(sessions.map((s) => s.close().catch(() => undefined)));
             }
             expect(await p.deleteServerAndWait(server.id, WAIT)).toBe(true);
+            const seconds = Math.round((Date.now() - rented!.at) / 1000);
+            log(`${server.id} is deleted, verified, ${seconds} s after its create: about $${(rented!.pricePerHour * seconds / 3600).toFixed(3)} at its offer's price`);
         }, 45 * 60_000);
     });
 }

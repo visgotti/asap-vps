@@ -213,6 +213,21 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
     }
 
     /**
+     * A pod reads as RUNNING before RunPod has published its ports: with no
+     * port mappings and no direct SSH endpoint, then all of them together
+     * (seen live 2026-10-12: RUNNING 2 s after the create, its ports and its
+     * endpoint within the next 40 s; RunPod's reference: `direct` is "absent
+     * while the pod is provisioning"). Until each port the pod was made to
+     * expose has its public one, and a pod made to be logged in to (22/tcp
+     * among them) its endpoint, there is nowhere to reach it yet.
+     */
+    protected override comingUp(server: Server<RunPodPod>): boolean {
+        const asked = server.raw.ports ?? [];
+        const published = new Set((server.ports ?? []).filter((x) => x.publicPort != null).map((x) => `${x.privatePort}/${x.protocol}`));
+        return asked.some((x) => !published.has(x)) || (asked.includes('22/tcp') && !server.ssh);
+    }
+
+    /**
      * Boots the pod on its host again, and waits until it is running. A host
      * that rented the GPU out meanwhile either refuses the start or resumes the
      * pod with none (that pod is stopped again): either way this throws
