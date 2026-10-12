@@ -281,6 +281,7 @@ Every provider names its places its own way (`tor1`, `fr-par-2`, `us-east-1`, `E
 - Each offer carries `locations`: its regions with the country each is in. A server carries its `country`.
 - `COUNTRY_TYPES` lists the countries the providers have machines in. Any other ISO code is taken (Vast is a marketplace).
 - A value that is no ISO code is refused, not read as nowhere.
+- The list is the places allowed: an empty one allows none (no offers). Only leaving `countries` out allows any.
 
 ### Images by the library's names
 
@@ -306,6 +307,7 @@ Every provider names its places its own way (`tor1`, `fr-par-2`, `us-east-1`, `E
   - A CUDA version NVIDIA does not publish for that Ubuntu (CUDA 13 on 20.04, CUDA 12.4 on 24.04).
   - An Ubuntu the provider has no image of. DigitalOcean's NVIDIA image is 24.04 only, and it has none for an AMD size; Scaleway and Lambda have 22.04 and 24.04.
   - On Scaleway, the pair it cannot boot: its plain Ubuntu boots only types without GPUs, its GPU OS only GPU types.
+  - On DigitalOcean, `{ os, cuda }` on a size without GPUs: its NVIDIA images boot its GPU sizes only.
 - A spec with a typo in it is a `ProviderError` that lists the members.
 
 ### SSH keys
@@ -342,7 +344,7 @@ A container's `ports` are read the same way on every provider:
 | `startServer` | the server runs | One that runs already is left as it is. A VM's public address is still `waitUntilRunning`'s to wait for. No stock to come back to is a `CapacityError`, and it stays stopped. |
 | `restartServer` | the server was seen not to run, and runs again | A stopped server is refused (start it). One that errors, stops or is deleted instead of coming back is thrown at once. |
 
-- Where the status never shows the reboot (a Lambda instance reads as active throughout), a restart returns after the server has read as running four times in a row: thirty seconds at the default pace.
+- Where the status never shows the reboot (a Lambda instance reads as active throughout), a restart returns once the server has read as running for thirty seconds: four reads at the default pace, and as many as span thirty seconds at any other `intervalMs`.
 - A status can lag a reboot by longer. When it matters that the machine really booted again, ask the machine (its boot id over SSH, a mark in its log).
 
 ## Cost
@@ -409,13 +411,13 @@ The same lines work with a `DigitalOcean`, `Scaleway`, `LambdaCloud` or `VastAI`
 
 | Method | What it does |
 |---|---|
-| `RemoteMachine.connect(server, { privateKey, username?, decryptionKey?, retry? })` | A session to a running server, or to an `{ host, port, username }` given as it is. It logs in as the server's own login unless `username` names another. A server with no `ssh` endpoint (not running yet, or made with no key) says so. |
-| `run(command, { cwd?, env?, stdin?, check? })` | The command as the login: `{ stdout, stderr, code }`. An exit other than 0 throws `RemoteCommandError` unless `check` is false. |
-| `sudo(command, o?)` | The command as root: as it is where the login is root, through passwordless `sudo` where it is not. |
-| `readFile(path, { sudo? })`, `writeFile(path, text, { mode?, owner?, sudo? })` | A text file, as it is. The text goes over the session's input, never into a command line. |
+| `RemoteMachine.connect(server, { privateKey, username?, decryptionKey?, retry? })` | A session to a running server, or to an `{ host, port, username }` given as it is. It logs in as the server's own login unless `username` names another. A server's first login is tried for three minutes unless `retry` says, since its SSH server may still be coming up. A server with no `ssh` endpoint (not running yet, or made with no key) says so. |
+| `run(command, { cwd?, env?, stdin?, check? })` | The command as the login: `{ stdout, stderr, code }`. An exit other than 0 throws `RemoteCommandError` unless `check` is false. A `cwd` that is not there ends the whole command: none of it runs elsewhere. |
+| `sudo(command, o?)` | The command as root: as it is where the login is root, through passwordless `sudo` where it is not (by bash where the machine has it, else sh). |
+| `readFile(path, { sudo? })`, `writeFile(path, text, { mode?, owner?, sudo? })` | A text file, as it is. The text goes over the session's input, never into a command line. With a `mode`, the file is closed to everyone but its writer before the text goes in, and gets its mode after. |
 | `upload(local, remote)`, `download(remote, local)` | A file over SFTP, as the login. |
 | `addUser(name, { publicKeys?, sudo?, shell? })` | Makes a user, or brings an existing one to what is asked: a home, no password, the keys that log in as it, and with `sudo: true` passwordless root (`sudo: false` takes it back). The same on Debian, Alpine and RHEL family images; done again, it changes nothing. |
-| `authorizeKeys(publicKeys, user?)` | Adds keys to the ones that log in as `user` (default: the login itself), each once. |
+| `authorizeKeys(publicKeys, user?)` | Adds keys to the ones that log in as `user` (default: the login itself), each once. A key may carry `authorized_keys` options before it (`from="10.0.0.0/8" ssh-ed25519 ...`). |
 | `as(name, { privateKey })` | A second session to the same machine as another user. |
 | `root` | The session with everything done as root (node-ssh's `NodeSSH`): what a `SetupPipeline`'s steps run on. `ssh` is the bare session. |
 | `close()` | Ends the session. |
@@ -445,7 +447,7 @@ Three things follow:
   - With an image of your own, pass `command` as the whole command line (`["python", "serve.py"]`, not arguments to the image's entrypoint): the SSH server's start takes the entrypoint's place, then runs the command.
   - Without one, the create is refused before anything is rented.
 - **The image must start as root**, and have either `sshd` or a package manager to install it with (apt-get, apk, dnf or yum; an install adds some seconds to the first boot).
-  - Where neither holds, the container does not start, and its log says why (`getServerLogs` on RunPod).
+  - Where neither holds, or its keys or host keys can't be written, the container does not start, and its log says why (`getServerLogs` on RunPod). It never starts with nobody able to log in.
 - **To use an image's own SSH setup instead**, leave `sshKeyIds` out and use the platform's way:
   - RunPod: `providerOptions: { startSsh: true }` with `env: { PUBLIC_KEY }` and `ports: ["22/tcp"]`, in an image built for it.
   - Vast: `providerOptions: { runtype: "ssh" }`.
@@ -454,7 +456,7 @@ Three things follow:
 
 A user made with `addUser` is an ordinary one:
 
-- Log in as it from anywhere: `RemoteMachine.connect(server, { privateKey, username: "deploy" })`.
+- Log in as it from anywhere: `RemoteMachine.connect(server, { privateKey, username: "deploy" })`. Any login the machine has can be named (`john.doe`, `Admin`); a user `addUser` makes is lowercase letters, digits, underscores and dashes.
 - To have it from a VM's first boot, without logging in at all, pass the same script as user data: `userData: "#!/bin/sh\n" + addUserScript("deploy", { publicKeys, sudo: true })`.
 - In a pipeline it is `new AddUserStep("deploy", { publicKeys, sudo: true })`.
 
@@ -664,6 +666,7 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
   - The keys are sent as `PUBLIC_KEY` too, so `env.PUBLIC_KEY` can't be given with `sshKeyIds`.
 - A pod reads as running before RunPod has published its ports (seen live: running 2 s after the create with no port mappings; its ports and its SSH endpoint together within the next 40 s):
   - `waitUntilRunning` returns a pod only once every port it exposes has its public one and, where it is to be logged in to, its SSH endpoint. What it returns is what `RemoteMachine.connect` takes.
+  - An `http` port counts once RunPod lists it: it is reached through RunPod's proxy by its own number, and may have no public port.
   - `getServer` and `listServers` show the pod as RunPod does, ports or not.
 - A stopped pod can resume without its GPU: `startServer` then stops it again and throws `CapacityError`.
 - A pod rented by an offer goes to the offer's first data center with stock, as on every provider:
@@ -678,15 +681,16 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
 <summary><b>Vast.ai</b></summary>
 
 - Offers:
-  - A search returns at most 64 offers, so `listOffers` asks Vast for the vendor and the models' compute capability, then pages by price.
+  - A search returns at most 64 offers, so `listOffers` asks Vast for the vendor, the models' compute capability and the countries, then pages by price.
+  - Vast's search returns a part of the market, not all of it (seen live 2026-10-12: 243 offers worldwide read to the end, 3 of them in Japan; a search of Japan alone gave 25). So what you ask for is searched for, not filtered out of that part afterwards.
   - Paging is by price alone: past 64 offers at one exact price, the rest at that price are skipped, but no dearer offer is. A model filter avoids such a tie.
   - Each offer is one machine, whose `regions` are its location and its `machine:<id>`. A `region` asked for must be one of the offer's.
   - An interruptible offer's id carries its bid.
 - Ports are mapped to random public ports: read them from the server's `ports`.
 - SSH:
   - `sshKeyIds` starts the library's SSH server in the container (as its entrypoint, ahead of its command and of a `userData` script) and maps its port 22.
-  - `server.ssh` is the machine's address and that port.
-  - An instance launched in Vast's own `ssh` mode reports Vast's proxy instead; one launched with `sshKeyIds` has none (seen live).
+  - `server.ssh` is the machine's address and that port. `waitUntilRunning` returns an instance once each port it was launched to expose is mapped.
+  - An instance launched in Vast's own `ssh` mode reports Vast's proxy instead; one launched with `sshKeyIds` has none (seen live), and is never given one.
   - `providerOptions.runtype` is Vast's own launch mode, and can't be given with `sshKeyIds`.
 - Vast takes no `tags`.
 - Price:
