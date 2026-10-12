@@ -10,7 +10,7 @@ import { sshKeyFingerprint } from '../../Core/utils';
 import { NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
 import { FAKE_SCALEWAY_PROJECT, fakeScaleway, FakeScalewayOptions } from '../../testing/fakes/scaleway';
 import { testPublicKey } from '../../testing/fakes/util';
-import { isScalewayZone, SCALEWAY_ENUMS } from './mappers';
+import { countryOf, isScalewayZone, SCALEWAY_ENUMS } from './mappers';
 import { Scaleway } from './Scaleway';
 import type { ScalewayParams } from './types';
 
@@ -60,6 +60,15 @@ describe('Scaleway as a VPS host: the library\'s enums', () => {
             await vps.deleteServer((await vps.createServer({ ...server, image: machine })).id);
             expect(creates(fake).pop()?.body.image).toBe(label);
         }
+    });
+
+    it('a zone or a region is in the country its name begins with', () => {
+        expect(['fr-par-1', 'fr-par-3', 'nl-ams-2', 'pl-waw-3', 'it-mil-1', 'fr-par', 'nl-ams', 'pl-waw', 'it-mil'].map(countryOf)).toEqual(['FR', 'FR', 'NL', 'PL', 'IT', 'FR', 'NL', 'PL', 'IT']);
+    });
+
+    it('names each Ubuntu asked for with cuda by its GPU OS image\'s label', () => {
+        expect(SCALEWAY_ENUMS.machines).toEqual({ ubuntu24: 'ubuntu_noble', ubuntu22: 'ubuntu_jammy', ubuntu20: 'ubuntu_focal' });
+        expect(SCALEWAY_ENUMS.cudaMachines).toEqual({ ubuntu24: 'ubuntu_noble_gpu_os_13_nvidia', ubuntu22: 'ubuntu_jammy_gpu_os_12' });
     });
 
     it('maps the Scaleway members of REGION_TYPES onto its zones, and refuses any other before anything is created', async () => {

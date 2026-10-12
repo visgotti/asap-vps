@@ -4,11 +4,11 @@
 // say, and sending the key only to the provider's own API.
 
 import { CapabilityDescriptor, requireCapability, supports } from '../capabilities';
-import { MACHINE_TYPES, REGION_TYPES } from '../constants';
+import { CUDA_TYPES, MACHINE_TYPES, REGION_TYPES } from '../constants';
 import { NotSupportedError, ProviderError, TransportError } from '../errors';
-import type { CreateServerOptions, Offer, Server, Volume, VolumeMount, WaitOptions } from '../types';
+import type { ContainerSpec, CreateServerOptions, ImageChoice, ImageSpec, Offer, Server, ServerStatus, Volume, VolumeMount, WaitOptions } from '../types';
 import { ComputeProvider, EnumTranslations } from './ComputeProvider';
-import { ApiClient } from './utils';
+import { ApiClient, containerBootScript } from './utils';
 
 const SCRIPTED_CAPABILITIES = {
     compute: { kind: 'vm', gpu: true, cpu: false, userData: true, liveAvailability: true },
@@ -18,7 +18,9 @@ const SCRIPTED_CAPABILITIES = {
 class ScriptedProvider extends ComputeProvider {
     readonly id = 'scripted';
     readonly capabilities = SCRIPTED_CAPABILITIES;
-    protected readonly enums: EnumTranslations = { regions: { [REGION_TYPES.PARIS]: 'par-1' }, machines: { [MACHINE_TYPES.UBUNTU_24]: 'noble' } };
+    protected readonly enums: EnumTranslations = {
+        regions: { [REGION_TYPES.PARIS]: 'par-1' }, machines: { [MACHINE_TYPES.UBUNTU_24]: 'noble' }, cudaMachines: { [MACHINE_TYPES.UBUNTU_24]: 'noble-gpu' },
+    };
     deletes = 0;
     reads = 0;
     /** What the last create named, in the platform's names. */
@@ -66,6 +68,46 @@ class ScriptedProvider extends ComputeProvider {
 
     mounts(m: VolumeMount[]) {
         return this.mountsOf(m);
+    }
+
+    vmImage(image: ImageChoice | undefined, cudaMachines?: EnumTranslations['cudaMachines']) {
+        return cudaMachines ? this.imageName(image, cudaMachines) : this.imageName(image);
+    }
+
+    containerImage(image: ImageChoice | undefined) {
+        return this.containerImageName(image);
+    }
+
+    container(o: Parameters<ScriptedProvider['containerOf']>[0]) {
+        return this.containerOf(o);
+    }
+
+    minCuda(o: { minCudaVersion?: string, image?: ImageChoice, container?: ContainerSpec }) {
+        return this.minCudaOf(o);
+    }
+
+    userData(o: { userData?: string, container?: ContainerSpec }, gpu = false) {
+        return this.userDataWith(o, gpu);
+    }
+
+    stopped(o?: WaitOptions) {
+        return this.waitUntilStopped('s1', o);
+    }
+
+    started(o?: WaitOptions) {
+        return this.waitUntilRunning('s1', { ...o, requireIp: false });
+    }
+
+    restarted(o?: WaitOptions, passing?: ServerStatus[]) {
+        return this.waitUntilRestarted('s1', o, passing);
+    }
+
+    refusal(status: ServerStatus) {
+        return this.notRunning('s1', status);
+    }
+
+    ports(ports?: string[]) {
+        return this.portsOf(ports);
     }
 
     private server(o: Partial<Server>): Server {
@@ -228,6 +270,201 @@ describe('ComputeProvider', () => {
         });
         await p.createServer({ name: 'n', offer, region: 'par-2' });
         expect(p.created).toEqual({ region: 'par-2', image: undefined });
+    });
+
+    it('a VM\'s image: `{ os }` is the member; `{ os, cuda }` is the platform\'s GPU image of that Ubuntu, or the one the caller has for what is rented; one it has none of is refused', () => {
+        const p = new ScriptedProvider([]);
+        expect(p.vmImage({ os: MACHINE_TYPES.UBUNTU_24 })).toBe('noble');
+        expect(p.vmImage({ os: 'ubuntu24', cuda: CUDA_TYPES.CUDA_12_8 })).toBe('noble-gpu');
+        expect(p.vmImage({ os: 'ubuntu24', cuda: '13.4' }, { [MACHINE_TYPES.UBUNTU_24]: 'noble-8gpu' })).toBe('noble-8gpu');
+        // The caller's table is for images asked for with cuda only.
+        expect(p.vmImage(MACHINE_TYPES.UBUNTU_24, { [MACHINE_TYPES.UBUNTU_24]: 'noble-8gpu' })).toBe('noble');
+        expect(p.vmImage('my-image')).toBe('my-image');
+        expect(p.vmImage(undefined)).toBeUndefined();
+        expect(() => p.vmImage({ os: 'ubuntu22', cuda: '12.8' })).toThrow(expect.objectContaining({
+            name: 'NotSupportedError', message: 'scripted: image "ubuntu22" with cuda (scripted has no GPU image of that Ubuntu) is not supported',
+        }));
+        expect(() => p.vmImage({ os: 'ubuntu24', cuda: '12.8' }, {})).toThrow(/image "ubuntu24" with cuda/);
+        expect(() => p.vmImage({ os: 'ubuntu22' })).toThrow('scripted: image "ubuntu22" (MACHINE_TYPES has no scripted image by that name) is not supported');
+        class NoGpuImages extends ScriptedProvider {
+            protected readonly enums: EnumTranslations = { machines: { [MACHINE_TYPES.UBUNTU_24]: 'noble' } };
+        }
+        expect(() => new NoGpuImages([]).vmImage({ os: 'ubuntu24', cuda: '12.8' })).toThrow(NotSupportedError);
+    });
+
+    it('a spec that names what the enums do not have is this provider\'s error, for a VM and for a container', () => {
+        const p = new ScriptedProvider([]);
+        const bad = { os: 'ubuntu24', cuda: '12.7' } as unknown as ImageSpec;
+        for (const read of [() => p.vmImage(bad), () => p.containerImage(bad), () => p.minCuda({ image: bad })]) {
+            expect(read).toThrow(expect.objectContaining({ name: 'ProviderError', provider: 'scripted', message: expect.stringMatching(/^scripted: bad image cuda "12\.7": use a CUDA_TYPES member \(11\.8, /) }));
+        }
+    });
+
+    it('a container\'s image: the library\'s names are Docker Hub\'s images, the same whatever the platform maps; its own reference passes as it is', () => {
+        const p = new ScriptedProvider([]);
+        expect(p.containerImage(MACHINE_TYPES.UBUNTU_24)).toBe('ubuntu:24.04');
+        expect(p.containerImage({ os: 'ubuntu22' })).toBe('ubuntu:22.04');
+        expect(p.containerImage({ os: 'ubuntu24', cuda: '12.8' })).toBe('nvidia/cuda:12.8.2-base-ubuntu24.04');
+        expect(p.containerImage('ghcr.io/acme/app:1')).toBe('ghcr.io/acme/app:1');
+        expect(p.containerImage(undefined)).toBeUndefined();
+        // What no image exists for is not supported, as on a VM: one error class for it, whatever the platform runs.
+        expect(() => p.containerImage({ os: 'ubuntu24', cuda: '12.4' })).toThrow(expect.objectContaining({
+            name: 'NotSupportedError', message: 'scripted: image "ubuntu24" with cuda "12.4" (NVIDIA publishes no CUDA 12.4 image of Ubuntu 24.04: it has 20.04, 22.04) is not supported',
+        }));
+        expect(() => p.vmImage({ os: 'ubuntu22', cuda: '12.8' })).toThrow(NotSupportedError);
+    });
+
+    it('ports are read the same way for every provider: a number and a protocol, or this provider\'s refusal', () => {
+        const p = new ScriptedProvider([]);
+        expect(p.ports(['8000/tcp', '53/UDP', '8888/http', '22'])).toEqual([
+            { port: 8000, protocol: 'tcp' }, { port: 53, protocol: 'udp' }, { port: 8888, protocol: 'http' }, { port: 22, protocol: 'tcp' },
+        ]);
+        expect(p.ports(undefined)).toEqual([]);
+        expect(() => p.ports(['80/tcp', '80:8080'])).toThrow(expect.objectContaining({ name: 'ProviderError', message: 'scripted: bad port "80:8080": use <port>/<tcp|udp|http>, the port from 1 to 65535' }));
+    });
+
+    it('a container platform\'s container carries its image as a registry reference, top-level or in `container`', () => {
+        const p = new ScriptedProvider([]);
+        expect(p.container({ image: { os: 'ubuntu24', cuda: '12.8' }, env: { A: 'b' }, command: ['run'], ports: ['80/tcp'], registryAuth: { username: 'u', password: 'p' } })).toEqual({
+            image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', env: { A: 'b' }, command: ['run'], ports: ['80/tcp'], registryAuth: { username: 'u', password: 'p' },
+        });
+        expect(p.container({ image: 'busybox' })).toEqual({ image: 'busybox' });
+        // Named by the library's enums and given no command, it is kept up, as a VM stays up.
+        expect(p.container({ image: MACHINE_TYPES.UBUNTU_24 })).toEqual({ image: 'ubuntu:24.04', command: ['sleep', 'infinity'] });
+        expect(p.container({ container: { image: { os: 'ubuntu24', cuda: '12.8' }, env: { A: 'b' } } })).toEqual({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', env: { A: 'b' }, command: ['sleep', 'infinity'] });
+        expect(() => p.container({ image: { os: 'ubuntu20', cuda: '13.0' } })).toThrow(expect.objectContaining({ name: 'NotSupportedError' }));
+        expect(p.container({ container: { image: MACHINE_TYPES.UBUNTU_22, command: ['sleep', 'infinity'] } })).toEqual({ image: 'ubuntu:22.04', command: ['sleep', 'infinity'] });
+        expect(p.container({})).toBeUndefined();
+        expect(() => p.container({ image: 'busybox', env: { A: 'b' }, container: { image: 'busybox' } })).toThrow('scripted: pass "container" or "image", "env", not both');
+    });
+
+    it('a container\'s host must run the CUDA its image is asked for by, unless minCudaVersion says otherwise', () => {
+        const p = new ScriptedProvider([]);
+        expect(p.minCuda({ image: { os: 'ubuntu24', cuda: '12.8' } })).toBe('12.8');
+        expect(p.minCuda({ image: { os: 'ubuntu24', cuda: '12.8' }, minCudaVersion: '13.0' })).toBe('13.0');
+        expect(p.minCuda({ container: { image: { os: 'ubuntu22', cuda: CUDA_TYPES.CUDA_13_1 } } })).toBe('13.1');
+        // A VM's OS image says nothing of the container it runs.
+        expect(p.minCuda({ image: { os: 'ubuntu24', cuda: '12.8' }, container: { image: 'busybox' } })).toBeUndefined();
+        for (const none of [{}, { image: MACHINE_TYPES.UBUNTU_24 }, { image: { os: MACHINE_TYPES.UBUNTU_24 } }, { image: 'nvidia/cuda:12.8.1-base-ubuntu24.04' }]) expect(p.minCuda(none)).toBeUndefined();
+    });
+
+    it('a VM runs a container whose image is named by the library\'s enums as the registry reference it stands for', () => {
+        const p = new ScriptedProvider([]);
+        expect(p.userData({ container: { image: { os: 'ubuntu24', cuda: '12.8' } } }, true))
+            .toBe(containerBootScript({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', command: ['sleep', 'infinity'] }, { gpu: true }));
+        expect(p.userData({ container: { image: MACHINE_TYPES.UBUNTU_24 } })).toContain("docker pull 'ubuntu:24.04'\n");
+        expect(() => p.userData({ container: { image: { os: 'ubuntu20', cuda: '13.0' } } })).toThrow(expect.objectContaining({
+            name: 'NotSupportedError', message: 'scripted: container: image "ubuntu20" with cuda "13.0" (NVIDIA publishes no CUDA 13.0 image of Ubuntu 20.04: it has 22.04, 24.04) is not supported',
+        }));
+        expect(() => p.userData({ container: { image: { os: 'ubuntu26' } as never } })).toThrow(expect.objectContaining({ name: 'ProviderError', message: expect.stringMatching(/^scripted: container: bad image os "ubuntu26"/) }));
+        expect(() => p.userData({ container: { image: 'busybox', ports: ['80:8080'] } })).toThrow('scripted: container: bad port "80:8080": use <port>/<tcp|udp|http>, the port from 1 to 65535');
+        expect(() => p.userData({ container: { image: '' } })).toThrow('scripted: a container needs an image');
+        expect(p.userData({})).toBeUndefined();
+    });
+
+    describe('what a stop, a start and a restart wait on', () => {
+        const fast = { intervalMs: 0, timeoutMs: 1000 };
+        const once = { intervalMs: 0, timeoutMs: 0 };
+
+        it('a stop: until the server is stopped; one that is gone, errors or is deleted instead did not stop', async () => {
+            const p = new ScriptedProvider([{ status: 'running' }, { status: 'stopping' }, { status: 'stopped', providerStatus: 'off' }]);
+            expect(await p.stopped(fast)).toMatchObject({ id: 's1', status: 'stopped', providerStatus: 'off' });
+            expect(p.reads).toBe(3);
+            await expect(new ScriptedProvider([{ status: 'stopping' }, null]).stopped(fast))
+                .rejects.toMatchObject({ name: 'NotFoundError', message: 'scripted: server s1 disappeared while it was stopping' });
+            for (const status of ['error', 'terminating', 'terminated'] as const) {
+                await expect(new ScriptedProvider([{ status }]).stopped(fast)).rejects.toMatchObject({ name: 'ProviderError', message: `scripted: server s1 is ${status} (x): it did not stop` });
+            }
+            // Anything else is not stopped yet: read until the wait runs out, which says what it read last.
+            for (const status of ['running', 'pending', 'stopping', 'unknown'] as const) {
+                await expect(new ScriptedProvider([{ status }]).stopped(once)).rejects.toMatchObject({ code: 'timeout', message: `scripted: timed out after 0 s waiting for server s1: ${status} (x)` });
+            }
+        });
+
+        it('a start: until the server runs, with a public address or without (waitUntilRunning waits for a VM\'s); one that errors or disappears did not start', async () => {
+            const p = new ScriptedProvider([{ status: 'stopped' }, { status: 'pending' }, { status: 'running' }]);
+            const up = await p.started(fast);
+            expect([up.status, up.ip, p.reads]).toEqual(['running', undefined, 3]);
+            // The same server, to waitUntilRunning: a VM, still without its address.
+            await expect(new ScriptedProvider([{ status: 'running' }]).waitUntilRunning('s1', once)).rejects.toMatchObject({ code: 'timeout' });
+            await expect(new ScriptedProvider([{ status: 'error' }]).started(fast)).rejects.toThrow('scripted: server s1 is error (x)');
+            // Gone is not found, to a start as to a stop and a restart.
+            await expect(new ScriptedProvider([null]).started(fast)).rejects.toMatchObject({ name: 'NotFoundError', message: 'scripted: server s1 disappeared before it was running' });
+            await expect(new ScriptedProvider([null]).waitUntilRunning('s1', fast)).rejects.toMatchObject({ name: 'NotFoundError', message: 'scripted: server s1 disappeared before it was running' });
+            await expect(new ScriptedProvider([{ status: 'stopped' }]).started(once)).rejects.toMatchObject({ code: 'timeout', message: 'scripted: timed out after 0 s waiting for server s1: stopped (x)' });
+        });
+
+        it('a restart: until the server runs again after it was seen not to; the status of before the reboot, read first, is not its end', async () => {
+            // Still reported as it was (running) for two reads, then down, then up.
+            const p = new ScriptedProvider([{ status: 'running' }, { status: 'running' }, { status: 'pending' }, { status: 'stopping' }, { status: 'unknown' }, { status: 'running', providerStatus: 'up' }]);
+            expect(await p.restarted(fast)).toMatchObject({ status: 'running', providerStatus: 'up' });
+            expect(p.reads).toBe(6);
+            // Seen down at once, it is back the first time it runs.
+            const quick = new ScriptedProvider([{ status: 'pending' }, { status: 'running' }]);
+            await quick.restarted(fast);
+            expect(quick.reads).toBe(2);
+        });
+
+        it('a restart of a server whose status shows no reboot is over once it has read as running four times: the time a platform is given to show one', async () => {
+            expect(ComputeProvider.RESTART_SETTLE_READS).toBe(4);
+            const slept: number[] = [];
+            const steady = new ScriptedProvider([{ status: 'running' }], async (ms) => { slept.push(ms); });
+            await steady.restarted();
+            expect(steady.reads).toBe(4);
+            // At the default pace, thirty seconds.
+            expect(slept).toEqual([10_000, 10_000, 10_000]);
+        });
+
+        it('a restart whose server is gone, errors, stops or is deleted instead did not restart, and says so at once; a status the platform shows of a reboot is waited through', async () => {
+            await expect(new ScriptedProvider([{ status: 'pending' }, null]).restarted(fast))
+                .rejects.toMatchObject({ name: 'NotFoundError', message: 'scripted: server s1 disappeared while it was restarting' });
+            for (const status of ['error', 'stopped', 'terminating', 'terminated'] as const) {
+                const p = new ScriptedProvider([{ status: 'running' }, { status }]);
+                await expect(p.restarted(fast)).rejects.toMatchObject({ name: 'ProviderError', message: `scripted: server s1 is ${status} (x): it did not restart` });
+                expect(p.reads).toBe(2);
+            }
+            // A platform whose rebooting server reads as an error, or as stopped, says which: that one is no failure, the others still are.
+            const unhealthy = new ScriptedProvider([{ status: 'error' }, { status: 'error' }, { status: 'running' }]);
+            expect((await unhealthy.restarted(fast, ['error'])).status).toBe('running');
+            expect(unhealthy.reads).toBe(3);
+            await expect(new ScriptedProvider([{ status: 'stopped' }]).restarted(fast, ['error'])).rejects.toThrow('scripted: server s1 is stopped (x): it did not restart');
+            const stopStart = new ScriptedProvider([{ status: 'stopped' }, { status: 'pending' }, { status: 'running' }]);
+            expect((await stopStart.restarted(fast, ['stopped'])).status).toBe('running');
+            await expect(new ScriptedProvider([{ status: 'error' }]).restarted(fast, ['stopped'])).rejects.toThrow('scripted: server s1 is error (x): it did not restart');
+            // One that never comes back is the timeout, which says what it read last.
+            await expect(new ScriptedProvider([{ status: 'error' }]).restarted(once, ['error'])).rejects.toMatchObject({ code: 'timeout', message: 'scripted: timed out after 0 s waiting for server s1: error (x)' });
+            await expect(new ScriptedProvider([{ status: 'pending' }]).restarted(once)).rejects.toMatchObject({ code: 'timeout', message: 'scripted: timed out after 0 s waiting for server s1: pending (x)' });
+        });
+
+        it('the refusal of a restart of a server that does not run says what it is, and what to do', () => {
+            const e = new ScriptedProvider([]).refusal('stopped');
+            expect(e).toMatchObject({ name: 'ProviderError', provider: 'scripted', code: 'not_running', message: 'scripted: server s1 is stopped: only a server that runs is restarted (start it)' });
+        });
+
+        it('a stop and a start need no options: a server that is there already is read once, and a stop waits ten minutes, read every five seconds', async () => {
+            const [off, on] = [new ScriptedProvider([{ status: 'stopped' }]), new ScriptedProvider([{ status: 'running', ip: '203.0.113.7' }])];
+            expect([(await off.stopped()).status, (await on.started()).status]).toEqual(['stopped', 'running']);
+            expect([off.reads, on.reads]).toEqual([1, 1]);
+            const slept: number[] = [];
+            const never = new ScriptedProvider([{ status: 'running' }], async (ms) => { slept.push(ms); });
+            await expect(never.stopped()).rejects.toMatchObject({ code: 'timeout', message: 'scripted: timed out after 600 s waiting for server s1: running (x)' });
+            expect(slept).toEqual(Array(120).fill(5000));
+            // An option given as undefined is the default, not a wait without end.
+            slept.length = 0;
+            await expect(new ScriptedProvider([{ status: 'running' }], async (ms) => { slept.push(ms); }).stopped({ timeoutMs: undefined, intervalMs: undefined }))
+                .rejects.toMatchObject({ code: 'timeout', message: 'scripted: timed out after 600 s waiting for server s1: running (x)' });
+            expect(slept).toEqual(Array(120).fill(5000));
+            await expect(new ScriptedProvider([{ status: 'running' }]).stopped({ timeoutMs: NaN })).rejects.toThrow('asap-vps: bad timeoutMs NaN: use a number of milliseconds, 0 or more');
+        });
+
+        it('each waits as long as it is told, and as often', async () => {
+            for (const wait of ['stopped', 'started', 'restarted'] as const) {
+                const slept: number[] = [];
+                const p = new ScriptedProvider([{ status: 'pending' }, { status: 'pending' }, { status: wait === 'stopped' ? 'stopped' : 'running' }], async (ms) => { slept.push(ms); });
+                await p[wait]({ intervalMs: 7, timeoutMs: 60_000 });
+                expect(slept).toEqual([7, 7]);
+            }
+        });
     });
 
     it('a provider with no names for the library\'s enums refuses every member of them', async () => {

@@ -29,9 +29,9 @@ const created = await scaleway.createServer({ name: "api-1", offer, region: offe
 const server = await scaleway.waitUntilRunning(created.id);
 console.log(server.id, server.status, server.ip); // a zoned id: <zone>/<uuid>
 
-await scaleway.stopServer(server.id); // poweroff: the slot is released
+await scaleway.stopServer(server.id); // poweroff, waited for: the slot is released
 console.log("stopped, cost now:", await scaleway.getServerCost(server.id)); // null: only volumes and IPs bill
-await scaleway.startServer(server.id); // needs stock again
+await scaleway.startServer(server.id); // needs stock again; returns once it runs
 await scaleway.deleteServerAndWait(server.id); // also deletes the volumes it made
 ```
 

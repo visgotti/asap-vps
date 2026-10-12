@@ -6,12 +6,15 @@
 // method its capabilities do not declare fails here, not on a rented GPU.
 
 import { CAPABILITY_METHODS, CapabilityName, requireCapability, supports } from '../capabilities';
+import { RemoteMachine } from '../Core/RemoteMachine';
+import { SSHService } from '../Core/SSHService';
 import { canonicalGpu, sshKeyFingerprint } from '../Core/utils';
-import { AuthError, CapacityError, NotSupportedError } from '../errors';
+import { CUDA_TYPES, MACHINE_TYPES } from '../constants';
+import { AuthError, CapacityError, NotSupportedError, ProviderError } from '../errors';
 import { testPublicKey } from '../testing/fakes/util';
 import { CONTRACT_SUBJECTS } from '../testing/subjects';
 import type { VolumeKindTraits } from '../capabilities';
-import type { ContainerSpec, Offer, OfferQuery } from '../types';
+import type { ContainerSpec, CreateServerOptions, Offer, OfferQuery } from '../types';
 import type { AnyProvider } from './registry';
 
 const fast = { intervalMs: 0, timeoutMs: 5000 };
@@ -182,17 +185,53 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         const [offer] = await provider.listOffers(GPU);
         const s = await provider.createServer({ name: 'gpu-contract-stop', offer: offer.id, region: offer.regions[0], ...(await subject.extra(provider)) });
         await provider.waitUntilRunning(s.id, fast);
-        await provider.stopServer(s.id);
-        expect((await provider.waitForServer(s.id, (x) => x?.status === 'stopped', fast))?.status).toBe('stopped');
+        // A stop returns with the server stopped: nothing is left to wait for.
+        await expect(provider.stopServer(s.id, fast)).resolves.toBeUndefined();
+        expect((await provider.getServer(s.id))?.status).toBe('stopped');
+        // Stopped already: it stays so.
+        await expect(provider.stopServer(s.id, fast)).resolves.toBeUndefined();
+        expect((await provider.getServer(s.id))?.status).toBe('stopped');
         // Stopped, it bills only its disk: no run bills at its rate. Where a stopped server bills in full, its run goes on.
         const whileStopped = await provider.getServerCost(s.id);
         if (provider.capabilities.power.stoppedBilling === 'full') expect(whileStopped?.pricePerHour).toBeCloseTo(offer.pricePerHour, 9);
         else expect(whileStopped).toBeNull();
-        await provider.startServer(s.id);
+        // And a start, with it running.
+        await expect(provider.startServer(s.id, fast)).resolves.toBeUndefined();
+        expect((await provider.getServer(s.id))?.status).toBe('running');
         expect((await provider.waitUntilRunning(s.id, fast)).status).toBe('running');
+        // Without wait options each waits by its own defaults, to the same end.
+        await provider.stopServer(s.id);
+        expect((await provider.getServer(s.id))?.status).toBe('stopped');
+        await provider.startServer(s.id);
+        expect((await provider.getServer(s.id))?.status).toBe('running');
         // Running again, it bills at its rate again.
         expect((await provider.getServerCost(s.id))?.pricePerHour).toBeCloseTo(offer.pricePerHour, 9);
+        // A start of a server that runs already returns at once, and leaves it running.
+        await expect(provider.startServer(s.id, fast)).resolves.toBeUndefined();
+        expect((await provider.getServer(s.id))?.status).toBe('running');
+        // A stop or a start of a server the provider does not have is refused: nothing is taken for done.
+        await expect(provider.stopServer(subject.unknownId, fast)).rejects.toBeInstanceOf(ProviderError);
+        await expect(provider.startServer(subject.unknownId, fast)).rejects.toBeInstanceOf(ProviderError);
         expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
+    });
+
+    it('a wait option that is no number of milliseconds is refused, and one given as undefined is the default: never a wait without end', async () => {
+        const made = subject.make().provider;
+        if (!supports(made, 'power')) return;
+        const [offer] = await made.listOffers(GPU);
+        const s = await made.createServer({ name: 'gpu-contract-waits', offer: offer.id, region: offer.regions[0], ...(await subject.extra(made)) });
+        await made.waitUntilRunning(s.id, fast);
+        // Refused before anything is asked of the platform: the server runs on.
+        await expect(made.stopServer(s.id, { timeoutMs: NaN })).rejects.toThrow('asap-vps: bad timeoutMs NaN: use a number of milliseconds, 0 or more');
+        await expect(made.stopServer(s.id, { intervalMs: -1 })).rejects.toThrow('asap-vps: bad intervalMs -1: use a number of milliseconds, 0 or more');
+        await expect(made.startServer(s.id, { timeoutMs: -1 })).rejects.toThrow('asap-vps: bad timeoutMs -1: use a number of milliseconds, 0 or more');
+        if (supports(made, 'restart')) await expect(made.restartServer(s.id, { timeoutMs: NaN })).rejects.toThrow('asap-vps: bad timeoutMs NaN: use a number of milliseconds, 0 or more');
+        expect((await made.getServer(s.id))?.status).toBe('running');
+        await expect(made.stopServer(s.id, { timeoutMs: undefined, intervalMs: undefined })).resolves.toBeUndefined();
+        expect((await made.getServer(s.id))?.status).toBe('stopped');
+        await expect(made.startServer(s.id, { timeoutMs: undefined, intervalMs: undefined })).resolves.toBeUndefined();
+        expect((await made.getServer(s.id))?.status).toBe('running');
+        expect(await made.deleteServerAndWait(s.id, fast)).toBe(true);
     });
 
     it('restarts where it can', async () => {
@@ -200,7 +239,94 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         const [offer] = await provider.listOffers(GPU);
         const s = await provider.createServer({ name: 'gpu-contract-restart', offer: offer.id, region: offer.regions[0], ...(await subject.extra(provider)) });
         await provider.waitUntilRunning(s.id, fast);
+        // A restart returns with the server running, with wait options and without.
+        await expect(provider.restartServer(s.id, fast)).resolves.toBeUndefined();
+        expect((await provider.getServer(s.id))?.status).toBe('running');
         await expect(provider.restartServer(s.id)).resolves.toBeUndefined();
+        expect((await provider.getServer(s.id))?.status).toBe('running');
+        // A restart is of a server that runs: one that is stopped is refused at once, and stays stopped (start it).
+        if (supports(provider, 'power')) {
+            await provider.stopServer(s.id, fast);
+            const refusal = await provider.restartServer(s.id, fast).catch((e) => e);
+            expect(refusal).toBeInstanceOf(ProviderError);
+            expect(refusal.code).not.toBe('timeout');
+            expect((await provider.getServer(s.id))?.status).toBe('stopped');
+        }
+        await expect(provider.restartServer(subject.unknownId, fast)).rejects.toBeInstanceOf(ProviderError);
+        expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
+    });
+
+    it('the keys named at a create log in to the server, at its ssh endpoint, on every provider: those alone, or with the account\'s others where it says so (sshKeys.atCreate)', async () => {
+        const { provider: made, fake } = subject.make();
+        const provider = requireCapability(made, 'sshKeys');
+        const fingerprints = (keys: string[]) => keys.map((k) => sshKeyFingerprint(k)).sort();
+        const [offer] = await provider.listOffers(GPU);
+        const [a, b, other] = [testPublicKey('a'), testPublicKey('b'), testPublicKey('other')];
+        const [ka, kb] = [await provider.addSSHKey(a, 'gpu-contract-a'), await provider.addSSHKey(b, 'gpu-contract-b')];
+        await provider.addSSHKey(other, 'gpu-contract-other');
+        const extra = await subject.extra(provider);
+        const create = (sshKeyIds: Array<string | number>) => provider.createServer({ ...extra, name: 'gpu-contract-keys', offer, sshKeyIds } as CreateServerOptions);
+        // A key the account does not hold is refused, and nothing is rented.
+        const before = (await provider.listServers()).length;
+        await expect(create(['no-such-key-of-this-account'])).rejects.toBeInstanceOf(ProviderError);
+        expect((await provider.listServers()).length).toBe(before);
+        const s = await provider.waitUntilRunning((await create([ka.id, kb.id])).id, fast);
+        // Where its sshd is, and as whom to log in: the same three facts whatever rents it.
+        expect(s.ssh).toEqual({ host: expect.any(String), port: expect.any(Number), username: subject.sshUser ?? 'root' });
+        expect(s.ssh!.port).toBeGreaterThan(0);
+        // Something answers there, and takes both keys named.
+        const taken = fingerprints(fake.machine!(s.ssh!.host, s.ssh!.port)!.keys);
+        expect(taken).toEqual(expect.arrayContaining(fingerprints([a, b])));
+        if (provider.capabilities.sshKeys.atCreate === 'chosen') expect(taken).toEqual(fingerprints([a, b]));
+        else expect(taken).toContain(sshKeyFingerprint(other));
+        // The session is the same thing on every provider: where it is and who it is, from the server alone.
+        const connect = jest.spyOn(SSHService, 'connect').mockResolvedValue({ execCommand: async () => ({ stdout: 'ok', stderr: '', code: 0, signal: null }), dispose: async () => undefined } as never);
+        try {
+            const machine = await RemoteMachine.connect(s, { privateKey: 'PRIVATE' });
+            expect(connect).toHaveBeenCalledWith({ ...s.ssh, privateKey: 'PRIVATE' });
+            expect([machine.endpoint, machine.username, (await machine.run('true')).stdout]).toEqual([s.ssh, s.ssh!.username, 'ok']);
+        } finally {
+            connect.mockRestore();
+        }
+        expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
+    });
+
+    it('a question by country means the same everywhere: the offers with stock there, their regions narrowed to it, and a server rented from one is in it', async () => {
+        const { provider } = subject.make();
+        const all = await provider.listOffers(GPU);
+        // Every place of every offer says its country, in the provider's own way of naming places.
+        expect(all.flatMap((o) => o.locations ?? []).filter((l) => !/^[A-Z]{2}$/.test(l.country ?? ''))).toEqual([]);
+        for (const o of all) expect(o.locations?.map((l) => l.region)).toEqual(o.regions);
+        const country = all[0].locations![0].country!;
+        const there = await provider.listOffers({ ...GPU, countries: [country.toLowerCase()] });
+        expect(there.length).toBeGreaterThan(0);
+        expect(there.flatMap((o) => o.locations!.map((l) => l.country))).toEqual(there.flatMap((o) => o.regions.map(() => country)));
+        expect(there.map((o) => o.id)).toEqual(all.filter((o) => o.locations!.some((l) => l.country === country)).map((o) => o.id));
+        // Nowhere it has machines: nothing, and no error. A country that is no code is refused.
+        expect(await provider.listOffers({ ...GPU, countries: ['AQ'] })).toEqual([]);
+        await expect(provider.listOffers({ ...GPU, countries: ['Antarctica'] })).rejects.toThrow('asap-vps: bad country "Antarctica": use an ISO 3166-1 alpha-2 code, e.g. US');
+        const s = await provider.createServer({ name: 'gpu-contract-country', offer: there[0], ...(await subject.extra(provider)) } as CreateServerOptions);
+        expect((await provider.waitUntilRunning(s.id, fast)).country).toBe(country);
+        expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
+    });
+
+    it('an image by the library\'s names is the same call everywhere: Ubuntu 24.04 ready for CUDA boots on its GPU offer, and a combination no image exists for is not supported', async () => {
+        const { provider, fake } = subject.make();
+        const cuda = CUDA_TYPES.CUDA_12_8;
+        const [offer] = await provider.listOffers({ ...GPU, minCudaVersion: cuda });
+        const base = { name: 'gpu-contract-image', offer, ...(await subject.extra(provider)) };
+        const s = await provider.createServer({ ...base, image: { os: MACHINE_TYPES.UBUNTU_24, cuda } } as CreateServerOptions);
+        expect((await provider.waitUntilRunning(s.id, fast)).status).toBe('running');
+        // A container platform runs NVIDIA's image for it, kept up; a VM boots its own GPU image.
+        if (provider.capabilities.compute.kind === 'container') {
+            expect(subject.runOf?.(fake)).toMatchObject({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04' });
+        }
+        const before = (await provider.listServers()).length;
+        const none = await provider.createServer({ ...base, name: 'gpu-contract-no-image', image: { os: MACHINE_TYPES.UBUNTU_20, cuda: CUDA_TYPES.CUDA_13_0 } } as CreateServerOptions).catch((e) => e);
+        expect([none.name, none.provider]).toEqual(['NotSupportedError', provider.id]);
+        const typo = await provider.createServer({ ...base, name: 'gpu-contract-typo', image: { os: 'ubuntu24', cuda: '12.7' } } as unknown as CreateServerOptions).catch((e) => e);
+        expect([typo.name, typo.message]).toEqual(['ProviderError', expect.stringMatching(new RegExp(`^${provider.id}: bad image cuda "12\\.7": use a CUDA_TYPES member`))]);
+        expect((await provider.listServers()).length).toBe(before);
         expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
     });
 

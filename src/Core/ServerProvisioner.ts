@@ -3,7 +3,7 @@ import type { NodeSSH } from 'node-ssh';
 import { posix } from 'path';
 import type { Capable, ComputeTraits, ICompute, ISSHKeys, SSHKeyTraits } from '../capabilities';
 import { PLATFORM } from '../constants';
-import { NotSupportedError, ProviderError } from '../errors';
+import { ProviderError } from '../errors';
 import type { CreateServerOptions, PlatformTypes, Server, SetupPipelineOptions, SetupStepResult, SSHKeyData, SSHRetryOptions, WaitOptions } from '../types';
 import { SetupPipeline } from './SetupPipeline';
 import { SSHService } from './SSHService';
@@ -98,10 +98,14 @@ export type ProvisionOptions<T extends PlatformTypes = PlatformTypes> = {
 
 /**
  * Rents a server, waits until it runs, then runs a SetupPipeline on it over
- * ssh as the login its image has: the same run for a VPS and a GPU VM, on any
- * provider that can rent one and register a key. Steps expect root: with
- * another login (Lambda's ubuntu) every command goes through sudo. A fresh key
- * pair is made for each run and authorized on the server alone (sshKeyIds).
+ * ssh as the login its image has: the same run for a VPS, a GPU VM and a
+ * container, on any provider that can rent one and register a key (a
+ * container's SSH server is the library's: its `serverOptions` name an image
+ * by the library's enums, or a `command`). Steps expect root: with another
+ * login (Lambda's ubuntu) every command goes through sudo. A step that needs
+ * what a container has none of (an init system, a firewall) fails as it
+ * would on any machine without it. A fresh key pair is made for each run and
+ * authorized on the server alone (sshKeyIds).
  */
 export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
     constructor(private readonly provider: ProvisionTarget<T>) {}
@@ -111,9 +115,6 @@ export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
         configurePipeline: (pipeline: SetupPipeline, server: Server<T['server']>) => void | Promise<void>,
     ): Promise<ProvisionResult<Server<T['server']>>> {
         const p = this.provider;
-        if (p.capabilities.compute.kind !== 'vm') {
-            throw new NotSupportedError(p.id, 'provisioning over ssh (a container provider runs an image: put the setup in it)');
-        }
         const {
             sshKeyName = `provision-${Date.now()}`,
             platform,
@@ -202,7 +203,7 @@ export function asRoot(ssh: NodeSSH, username: string): NodeSSH {
             const staged = `.asap-vps-upload-${randomBytes(8).toString('hex')}`;
             await ssh.putFile(localFile, staged, sftp, transferOptions);
             const remote = unix(remoteFile);
-            const moved = await sudo(`mkdir -p -- ${shellQuote(posix.dirname(remote))} && mv -f -- ${shellQuote(staged)} ${shellQuote(remote)} && chown root:root -- ${shellQuote(remote)}`);
+            const moved = await sudo(`mkdir -p -- ${shellQuote(posix.dirname(remote))} && mv -f -- ${shellQuote(staged)} ${shellQuote(remote)} && chown -- root:root ${shellQuote(remote)}`);
             if (moved.code === 0) return;
             // Not left in the login's home; removed as root, which may own it by now.
             await sudo(`rm -f -- ${shellQuote(staged)}`).catch(() => undefined);

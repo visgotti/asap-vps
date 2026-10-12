@@ -13,8 +13,9 @@
 // (createVolume formats them), and kept when the droplet is deleted.
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
+import { MACHINE_TYPES } from '../../constants';
 import { ComputeProvider } from '../../Core/ComputeProvider';
-import { filterOffers, findSSHKey, pickSSHKeys, pollUntil, sshKeyFingerprint, timeLeft } from '../../Core/utils';
+import { Deadline, filterOffers, findSSHKey, pickSSHKeys, pollUntil, sshKeyFingerprint, timeLeft, waitOf } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, QuotaError, quotedMessage } from '../../errors';
 import type {
     CreateServerOptions, CreateVolumeOptions, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerImage, ServerListOptions, Volume,
@@ -36,7 +37,7 @@ export const DIGITALOCEAN_CAPABILITIES = {
     // A powered-off droplet still bills in full.
     power: { stoppedBilling: 'full' },
     restart: {},
-    sshKeys: { appliedAtBoot: false },
+    sshKeys: { atCreate: 'chosen', appliedAtBoot: false },
     // Snapshots boot in the regions they are in; a transfer adds one.
     images: { scope: 'region' },
     imageCopy: {},
@@ -63,6 +64,14 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
     static readonly NVIDIA_8GPU_IMAGE = 'gpu-h100x8-base';
     /** The AMD counterpart, with ROCm. */
     static readonly AMD_IMAGE = 'gpu-amd-base';
+    /** A size with AMD GPUs, by its slug ('gpu-mi300x8-1536gb'). */
+    static readonly AMD_SIZE = /^gpu-mi\d/;
+    /** A size with eight GPUs, by its slug ('gpu-h100x8-640gb'). */
+    static readonly X8_SIZE = /^gpu-[a-z0-9]+x8-/;
+    /** The longest a clean shutdown is given before the power is cut. */
+    static readonly SHUTDOWN_MS = 3 * 60_000;
+    /** The longest an action of a droplet's (a power-off, a power-on, a reboot, a volume's attach) is waited for. */
+    static readonly ACTION_MS = 10 * 60_000;
     /** What a size without GPUs boots by default: Ubuntu 24.04. */
     static readonly CPU_IMAGE = 'ubuntu-24-04-x64';
     /** How a droplet is billed, GPU or not: per second, at least 60 s or $0.01, powered off or not. */
@@ -98,7 +107,8 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
     /**
      * A droplet of the offer's size in its region. `image` defaults to
      * DigitalOcean's GPU image for a GPU size's vendor and GPU count, and to
-     * Ubuntu 24.04 for any other size. `sshKeyIds` names keys of the account: an
+     * Ubuntu 24.04 for any other size; `{ os, cuda }` is its NVIDIA image for the
+     * size (Ubuntu 24.04 only), refused on an AMD size. `sshKeyIds` names keys of the account: an
      * id or DigitalOcean's (MD5) fingerprint goes to DigitalOcean as it is,
      * which refuses one the account does not hold; a name, a public key or a
      * SHA256 fingerprint is looked up first, and one the account does not hold
@@ -111,7 +121,11 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         const { id: size, offer, region } = this.resolveOffer(o);
         this.checkFixedGpuCount(o, offer ? offer.gpuCount : DigitalOcean.gpuCountOf(size) ?? (size.startsWith('gpu-') ? undefined : 0));
         if (!region) throw new ProviderError(this.id, 'a droplet needs a region (one of the offer\'s regions)');
-        const image = this.imageName(o.image) ?? DigitalOcean.defaultImage(size, offer);
+        // An AMD size boots no NVIDIA image (cudaImages has none for it): said with what it does boot.
+        if (this.imageSpec(o.image)?.cuda !== undefined && DigitalOcean.AMD_SIZE.test(size)) {
+            throw new NotSupportedError(this.id, `image with cuda on ${size} (an AMD GPU: its image, the default, has ROCm)`);
+        }
+        const image = this.imageName(o.image, DigitalOcean.cudaImages(size)) ?? DigitalOcean.defaultImage(size, offer);
         const attached = await this.attachable(o, region);
         const volumes = attached.blocks.map((v) => v.id);
         const vpc = this.shareVpc(attached.shares.map((m) => m.share), o.providerOptions?.vpc_uuid);
@@ -181,9 +195,19 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
     /** DigitalOcean's recommended image: AMD (ROCm), 8-GPU NVIDIA, single-GPU NVIDIA, or plain Ubuntu for a size without GPUs. */
     static defaultImage(sizeSlug: string, offer?: Offer<unknown>): string {
         if (offer ? offer.gpuCount === 0 : !sizeSlug.startsWith('gpu-')) return DigitalOcean.CPU_IMAGE;
-        if (/^gpu-mi\d/.test(sizeSlug)) return DigitalOcean.AMD_IMAGE;
-        if (/^gpu-[a-z0-9]+x8-/.test(sizeSlug)) return DigitalOcean.NVIDIA_8GPU_IMAGE;
+        if (DigitalOcean.AMD_SIZE.test(sizeSlug)) return DigitalOcean.AMD_IMAGE;
+        if (DigitalOcean.X8_SIZE.test(sizeSlug)) return DigitalOcean.NVIDIA_8GPU_IMAGE;
         return DigitalOcean.NVIDIA_IMAGE;
+    }
+
+    /**
+     * DigitalOcean's images with the NVIDIA driver and CUDA for a size, by the
+     * Ubuntu they are: the 8-GPU image for an x8 size, the single-GPU one for
+     * any other, both Ubuntu 24.04; none for an AMD size, whose image has ROCm.
+     */
+    static cudaImages(sizeSlug: string): Readonly<Partial<Record<MACHINE_TYPES, string>>> {
+        if (DigitalOcean.AMD_SIZE.test(sizeSlug)) return {};
+        return { [MACHINE_TYPES.UBUNTU_24]: DigitalOcean.X8_SIZE.test(sizeSlug) ? DigitalOcean.NVIDIA_8GPU_IMAGE : DigitalOcean.NVIDIA_IMAGE };
     }
 
     // ── power, restart ───────────────────────────────────────────────────
@@ -194,28 +218,69 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
      * shutdown that completes was issued, not obeyed ("this action guarantees
      * that the command is issued, not that it succeeds"): the droplet is read,
      * and powered off if it is still on. A stopped droplet still bills in full.
+     * The whole of it has thirteen minutes, or `o.timeoutMs`: the shutdown
+     * three of them and never more than half, the power-off the rest. A
+     * power-off DigitalOcean refuses or does not finish is no failure when the
+     * droplet is off all the same (a slow shutdown finished meanwhile).
      */
-    public async stopServer(id: string): Promise<void> {
+    public async stopServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, { timeoutMs: DigitalOcean.SHUTDOWN_MS + DigitalOcean.ACTION_MS });
+        const left = timeLeft(wait);
         const s = await this.getServer(id);
         if (!s) throw new NotFoundError(this.id, `no droplet ${id}`);
         if (s.status === 'stopped') return;
         try {
-            await this.action(id, 'shutdown', { timeoutMs: 3 * 60_000 });
-            const after = await this.api.getDroplet(id);
-            if (!after) throw new NotFoundError(this.id, `droplet ${id} is gone`);
-            if (after.status === 'off') return;
+            await this.action(id, 'shutdown', { ...left(), timeoutMs: Math.min(DigitalOcean.SHUTDOWN_MS, wait.timeoutMs / 2) });
+            if (await this.power(id) === 'off') return;
         } catch (e) {
             if (e instanceof NotFoundError) throw e;
         }
-        await this.action(id, 'power_off');
+        try {
+            await this.action(id, 'power_off', left());
+        } catch (e) {
+            if (e instanceof NotFoundError || await this.power(id) !== 'off') throw e;
+        }
     }
 
-    public async startServer(id: string): Promise<void> {
-        await this.action(id, 'power_on');
+    /**
+     * `power_on`, waited for (ten minutes unless `o.timeoutMs` says); a droplet
+     * that is on already is left as it is, and one DigitalOcean refuses to
+     * power on because it is on by now (another start got there first) is
+     * started all the same.
+     */
+    public async startServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const left = timeLeft(waitOf(o, { timeoutMs: DigitalOcean.ACTION_MS }));
+        if (await this.power(id, `no droplet ${id}`) === 'active') return;
+        try {
+            await this.action(id, 'power_on', left());
+        } catch (e) {
+            if (!(e instanceof ProviderError) || e.status !== 422 || await this.power(id) !== 'active') throw e;
+        }
+        await this.active(id, left());
     }
 
-    public async restartServer(id: string): Promise<void> {
-        await this.action(id, 'reboot');
+    /**
+     * `reboot`, waited for (ten minutes unless `o.timeoutMs` says): the action
+     * completes once the droplet has booted again. A droplet that is off is
+     * refused: a restart is of a server that runs.
+     */
+    public async restartServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const left = timeLeft(waitOf(o, { timeoutMs: DigitalOcean.ACTION_MS }));
+        if (await this.power(id, `no droplet ${id}`) === 'off') throw this.notRunning(id, 'stopped');
+        await this.action(id, 'reboot', left());
+        await this.active(id, left());
+    }
+
+    /** Whether the droplet is on (`active`), `off`, or still `new`; one DigitalOcean no longer has is a NotFoundError that says `gone`. */
+    private async power(id: string, gone = `droplet ${id} is gone`): Promise<DigitalOceanDropletData['status']> {
+        const droplet = await this.api.getDroplet(id);
+        if (!droplet) throw new NotFoundError(this.id, gone);
+        return droplet.status;
+    }
+
+    /** After an action that leaves a droplet on: it is read as on (one deleted meanwhile is gone), and waited for if DigitalOcean does not say so yet. */
+    private async active(id: string, o: Deadline): Promise<void> {
+        if (await this.power(id) !== 'active') await this.waitUntilRunning(id, { ...o, requireIp: false });
     }
 
     // ── SSH keys ─────────────────────────────────────────────────────────
@@ -277,7 +342,7 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         let done: DigitalOceanImageData;
         try {
             done = await this.poll(read, (i) => i.status === 'available' || i.status === 'deleted',
-                { timeoutMs: 60 * 60_000, intervalMs: 15_000, ...o, what: `import of ${o.name}`, describe: (i) => i.status ?? '?' });
+                { ...waitOf(o, { timeoutMs: 60 * 60_000, intervalMs: 15_000 }), what: `import of ${o.name}`, describe: (i) => i.status ?? '?' });
         } catch (e) {
             // Still importing when the wait ran out: deleted, so it is not left to bill.
             await this.deleteImage(String(image.id)).catch(() => undefined);
@@ -294,7 +359,7 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
      */
     public async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<DigitalOceanImageData>> {
         const path = `/v2/droplets/${encodeURIComponent(serverId)}`;
-        await this.act(`${path}/actions`, { type: 'snapshot', name: o.name }, { timeoutMs: 30 * 60_000, ...o });
+        await this.act(`${path}/actions`, { type: 'snapshot', name: o.name }, waitOf(o, { timeoutMs: 30 * 60_000 }));
         // The action names no image: the droplet's newest snapshot of that name is it.
         const snaps = (await this.api.all<DigitalOceanImageData>(`${path}/snapshots`, 'snapshots'))
             .filter((s) => s.name === o.name)
@@ -436,7 +501,7 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         const exist = await Promise.all(holders.map(async (d) => (await this.api.getDroplet(d)) !== null));
         if (exist.some(Boolean)) return v;
         const after = await this.poll(() => this.api.getVolume(v.id), (x) => !x || !x.droplet_ids?.some((d) => holders.includes(d)),
-            { timeoutMs: 5 * 60_000, ...o, what: `volume ${v.name}`, describe: (x) => `attached to droplet ${x?.droplet_ids?.join(', ')}, which is gone` });
+            { ...waitOf(o, { timeoutMs: 5 * 60_000 }), what: `volume ${v.name}`, describe: (x) => `attached to droplet ${x?.droplet_ids?.join(', ')}, which is gone` });
         if (!after) throw new NotFoundError(this.id, `no volume ${v.id}`);
         return after;
     }
@@ -510,7 +575,7 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         const { share } = await this.api.call<{ share: DigitalOceanNfsShare }>('POST', '/v2/nfs', { ...body, ...o.providerOptions });
         try {
             const ready = await this.poll(() => this.findShare(share.id), (x) => !x || x.status !== 'CREATING',
-                { timeoutMs: o.timeoutMs ?? 10 * 60_000, intervalMs: o.intervalMs ?? 5000, what: `share ${o.name}`, describe: (x) => String(x?.status) });
+                { ...waitOf(o, { timeoutMs: 10 * 60_000, intervalMs: 5000 }), what: `share ${o.name}`, describe: (x) => String(x?.status) });
             if (!ready) throw new NotFoundError(this.id, `share ${o.name} disappeared while it was made`);
             if (ready.status !== 'ACTIVE') throw new ProviderError(this.id, `share ${o.name} is ${ready.status}, not ACTIVE`);
             return toNfsVolume(ready);
@@ -524,7 +589,7 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
     private async deleteShare(s: DigitalOceanNfsShare, o: WaitOptions = {}): Promise<void> {
         await falseIfNotFound(this.api.call('DELETE', `/v2/nfs/${encodeURIComponent(s.id)}?region=${encodeURIComponent(s.region)}`));
         await this.poll(() => this.findShare(s.id), (x) => !x,
-            { timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 3000, what: `delete of share ${s.name}`, describe: (x) => String(x?.status) });
+            { ...waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 3000 }), what: `delete of share ${s.name}`, describe: (x) => String(x?.status) });
     }
 
     /**
@@ -543,39 +608,42 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
 
     /** A volume action on a droplet, waited for (actions of a volume are actions like a droplet's). */
     private async volumeAction(v: DigitalOceanVolumeData, type: 'attach' | 'detach', serverId: string, o: WaitOptions): Promise<void> {
-        await this.act(`/v2/volumes/${encodeURIComponent(v.id)}/actions`, { type, droplet_id: Number(serverId), region: v.region.slug }, { timeoutMs: 10 * 60_000, ...o });
+        await this.act(`/v2/volumes/${encodeURIComponent(v.id)}/actions`, { type, droplet_id: Number(serverId), region: v.region.slug }, waitOf(o, { timeoutMs: DigitalOcean.ACTION_MS }));
     }
 
     /** A droplet action, waited for: the droplet takes no other action until it completes. */
-    private async action(id: string, type: string, o: WaitOptions = {}): Promise<void> {
-        await this.act(`/v2/droplets/${encodeURIComponent(id)}/actions`, { type }, { timeoutMs: 10 * 60_000, ...o });
+    private async action(id: string, type: string, o: Deadline): Promise<void> {
+        await this.act(`/v2/droplets/${encodeURIComponent(id)}/actions`, { type }, waitOf(o, { timeoutMs: DigitalOcean.ACTION_MS }));
     }
 
     /**
      * Asks for an action on a droplet (its own, or a volume's on it) and waits
-     * until it is done, all within `o.timeoutMs`. A droplet takes one action at
-     * a time: while one is in progress (its create too, until it is active)
+     * until it is done, all within `o.timeoutMs` (of a longer wait, a timeout
+     * reports the whole: `o.budgetMs`). A droplet takes one action at a time:
+     * while one is in progress (its create too, until it is active)
      * DigitalOcean refuses another with a 422 "Droplet already has a pending
      * event", and starts nothing, so it is asked again until the wait ends.
      */
-    private async act(path: string, body: object, o: WaitOptions & { timeoutMs: number }): Promise<void> {
+    private async act(path: string, body: object, o: Deadline & { timeoutMs: number }): Promise<void> {
         const left = timeLeft(o);
+        const { timeoutMs } = o;
+        const { intervalMs, budgetMs = timeoutMs } = waitOf(o, { intervalMs: 5000 });
         const { action } = await pollUntil(() => this.api.call<{ action: DigitalOceanAction }>('POST', path, body), () => true, {
-            timeoutMs: o.timeoutMs,
-            intervalMs: o.intervalMs ?? 5000,
+            timeoutMs,
+            intervalMs,
             sleep: this.sleep,
             retryOn: (e) => e instanceof ProviderError && e.status === 422 && /pending event/i.test(e.message),
-            timeoutError: () => new ProviderError(this.id, `timed out after ${Math.round(o.timeoutMs / 1000)} s waiting for the droplet's pending event to end, to ask for ${JSON.stringify(body)}`, { code: 'timeout' }),
+            timeoutError: () => new ProviderError(this.id, `timed out after ${Math.round(budgetMs / 1000)} s waiting for the droplet's pending event to end, to ask for ${JSON.stringify(body)}`, { code: 'timeout' }),
         });
         await this.waitForAction(action.id, left());
     }
 
     /** Poll an action until it completes; an errored action throws. */
-    private async waitForAction(actionId: number, o: WaitOptions): Promise<void> {
+    private async waitForAction(actionId: number, o: Deadline): Promise<void> {
         const action = await this.poll(
             async () => (await this.api.call<{ action: DigitalOceanAction }>('GET', `/v2/actions/${actionId}`)).action,
             (a) => a.status !== 'in-progress',
-            { timeoutMs: 30 * 60_000, ...o, what: `action ${actionId}`, describe: (a) => `${a.type} ${a.status}` });
+            { ...waitOf(o, { timeoutMs: 30 * 60_000 }), what: `action ${actionId}`, describe: (a) => `${a.type} ${a.status}` });
         if (action.status === 'errored') throw new ProviderError(this.id, `action ${actionId} (${action.type}) errored`);
     }
 }

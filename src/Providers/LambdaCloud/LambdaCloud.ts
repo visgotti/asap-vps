@@ -9,18 +9,18 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider } from '../../Core/ComputeProvider';
-import { filterOffers, findSSHKey, isKind, pickSSHKeys, timeLeft } from '../../Core/utils';
+import { authorizeKeysScript, filterOffers, findSSHKey, isKind, pickSSHKeys, timeLeft, waitOf } from '../../Core/utils';
 import { falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
 import type { CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerListOptions, Volume, WaitOptions } from '../../types';
 import { LambdaApi } from './api';
-import { LAMBDA_BILLING, LAMBDA_ID, LAMBDA_MOUNT_PATH, LAMBDA_REFUSED, toOffer, toServer, toSSHKey, toVolume } from './mappers';
+import { LAMBDA_BILLING, LAMBDA_ENUMS, LAMBDA_ID, LAMBDA_MOUNT_PATH, LAMBDA_REFUSED, LAMBDA_SSH_USER, toOffer, toServer, toSSHKey, toVolume } from './mappers';
 import type { LambdaFilesystem, LambdaFilesystemMount, LambdaInstance, LambdaInstanceTypes, LambdaSSHKeyData, LambdaTypes } from './types';
 
 /** What Lambda can do, and how: no stop, and no images of a server. */
 export const LAMBDA_CAPABILITIES = {
     compute: { kind: 'vm', gpu: true, cpu: false, userData: true, liveAvailability: true },
     restart: {},
-    sshKeys: { appliedAtBoot: false },
+    sshKeys: { atCreate: 'chosen', appliedAtBoot: false },
     // Filesystems: any number of instances in its region mount one, at launch, where the launch says; it grows as it fills.
     volumes: { shared: { mount: 'path', size: 'elastic' } },
 } as const satisfies CapabilityDescriptor;
@@ -31,6 +31,7 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
     static readonly capabilities: Caps = LAMBDA_CAPABILITIES;
     readonly id = LAMBDA_ID;
     readonly capabilities: Caps = LAMBDA_CAPABILITIES;
+    protected readonly enums = LAMBDA_ENUMS;
 
     /** Lambda's limits on a launch (spec 1.10.0): names, and tag keys and values. */
     static readonly MAX_NAME = 64;
@@ -48,9 +49,11 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
     }
 
     /**
-     * Lambda requires exactly one SSH key at launch (more can be added in
-     * user-data); `image` is an image id or an image family (default: the latest
-     * Lambda Stack). Tags are `key` or `key=value`, with Lambda's key format.
+     * `sshKeyIds` names at least one key: Lambda's launch takes exactly one,
+     * the first, and the others are added for the same login (ubuntu) by
+     * cloud-init at the first boot; `image` is an image id, an image family (default: the latest
+     * Lambda Stack), a MACHINE_TYPES member (plain Ubuntu) or `{ os, cuda }`
+     * (Lambda Stack on that Ubuntu). Tags are `key` or `key=value`, with Lambda's key format.
      * `mounts` are filesystems of the instance's region, each at its `path`
      * (under /home, /lambda/nfs or /data; default its own mount point,
      * /lambda/nfs/<name>): one elsewhere is refused before anything is launched.
@@ -60,8 +63,7 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
         const { id: type, offer, region } = this.resolveOffer(o);
         this.checkFixedGpuCount(o, offer?.gpuCount ?? LambdaCloud.gpuCountOf(type));
         if (!region) throw new ProviderError(this.id, 'an instance needs a region (one of the offer\'s regions)');
-        if (!o.sshKeyIds?.length) throw new ProviderError(this.id, 'Lambda requires exactly one SSH key (sshKeyIds)');
-        if (o.sshKeyIds.length > 1) throw new NotSupportedError(this.id, 'more than one SSH key at launch');
+        if (!o.sshKeyIds?.length) throw new ProviderError(this.id, 'Lambda requires an SSH key (sshKeyIds): its launch takes exactly one, by name');
         if (o.name.length > LambdaCloud.MAX_NAME) throw new ProviderError(this.id, `an instance name is at most ${LambdaCloud.MAX_NAME} characters`);
         const tags = o.tags?.map((t) => {
             const i = t.indexOf('=');
@@ -73,10 +75,13 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
             return { key, value };
         });
         const mounts = await this.filesystemMounts(o, region);
+        // The launch takes one key, by NAME (an id is resolved; a name is accepted too): the first. The others log in as
+        // the same user from the instance's first boot, where cloud-init adds them.
+        const [first, ...others] = pickSSHKeys(await this.listSSHKeys(), o.sshKeyIds, this.id);
+        const names = [first.name];
+        const moreKeys = others.length ? [`#!/bin/sh\n${authorizeKeysScript(others.map((k) => k.publicKey), LAMBDA_SSH_USER)}`] : [];
         // Lambda's instances have GPUs (a type that lists none is a CPU one).
-        const userData = this.userDataWith(o, (offer?.gpuCount ?? LambdaCloud.gpuCountOf(type) ?? 1) > 0);
-        // Launch takes key NAMES: resolve the ids (a name is accepted too).
-        const names = pickSSHKeys(await this.listSSHKeys(), o.sshKeyIds, this.id).map((k) => k.name);
+        const userData = this.userDataWith(o, (offer?.gpuCount ?? LambdaCloud.gpuCountOf(type) ?? 1) > 0, moreKeys);
         const ref = this.imageName(o.image);
         const image = ref ? (/^([0-9a-f]{32}|[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.test(ref) ? { id: ref } : { family: ref }) : undefined;
         const { data } = await this.api.call<{ data: { instance_ids: string[] } }>('POST', '/api/v1/instance-operations/launch', {
@@ -133,8 +138,15 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
         return true;
     }
 
-    public async restartServer(id: string): Promise<void> {
+    /**
+     * Restarts the instance, and waits until it runs again (waitUntilRestarted):
+     * its health checks may fail while it reboots (`unhealthy`, which reads as
+     * an error), which is waited through.
+     */
+    public async restartServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
         await this.api.call('POST', '/api/v1/instance-operations/restart', { instance_ids: [id] });
+        await this.waitUntilRestarted(id, wait, ['error']);
     }
 
     // ── volumes ──────────────────────────────────────────────────────────
@@ -208,7 +220,7 @@ export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> impleme
             const [all, held] = await Promise.all([this.filesystems(), this.liveMounts()]);
             return all.filter((f) => ids.includes(f.id) && f.is_in_use && !held.has(f.id)).map((f) => f.name);
         }, (stuck) => stuck.length === 0, {
-            timeoutMs: 5 * 60_000, intervalMs: 10_000, ...o,
+            ...waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 10_000 }),
             what: `filesystem(s) to be let go${by ? ` by instance ${by}` : ''}`, describe: (stuck) => `${stuck.join(', ')} in use, by no live instance`,
         });
     }

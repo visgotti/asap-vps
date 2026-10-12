@@ -1,6 +1,6 @@
 {
   "name": "asap-vps",
-  "version": "0.0.22",
+  "version": "0.1.0",
   "description": "Library to help setup/deploy virtual private servers.",
   "main": "dist/index.js",
   "typings": "dist/index.d.ts",
@@ -22,6 +22,7 @@
     "test:scw:volumes": "ASAP_VPS_LIVE=scaleway-vps jest --config jest.live.config.js ScalewayVolumes.live",
     "gpu:smoke": "ts-node --transpile-only scripts/gpu-smoke.ts",
     "test:live": "jest --config jest.live.config.js",
+    "test:ssh": "ASAP_VPS_LOCAL=sshd jest RemoteMachine.local",
     "test:coverage": "jest --coverage",
     "scaleway:spec": "ts-node --transpile-only scripts/scaleway-spec-check.ts",
     "api:spec": "ts-node --transpile-only scripts/api-spec-check.ts",

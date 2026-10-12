@@ -65,6 +65,36 @@ export class NotSupportedError extends ProviderError {
     }
 }
 
+/**
+ * A command run on a machine (RemoteMachine.run, .sudo) that did not exit 0:
+ * what was run, as whom and where, how it ended, and what it wrote. Its
+ * message carries the command's own last word on why (the end of its stderr,
+ * else of its stdout).
+ */
+export class RemoteCommandError extends Error {
+    /** `<user>@<host>`: who ran it, where. */
+    readonly login: string;
+    /** The command as it was asked for (its environment and its input are left out: they may hold secrets). */
+    readonly command: string;
+    /** Its exit status; null when a signal ended it (`signal`). */
+    readonly code: number | null;
+    readonly signal?: string;
+    readonly stdout: string;
+    readonly stderr: string;
+
+    constructor(login: string, command: string, result: { code: number | null, signal?: string | null, stdout: string, stderr: string }) {
+        const said = (result.stderr.trim() || result.stdout.trim()).split('\n').slice(-3).join('\n');
+        super(`${login}: \`${command}\` ${result.code === null ? `was ended by ${result.signal || 'a signal'}` : `exited ${result.code}`}${said ? `: ${said}` : ''}`);
+        this.name = 'RemoteCommandError';
+        this.login = login;
+        this.command = command;
+        this.code = result.code;
+        if (result.signal) this.signal = result.signal;
+        this.stdout = result.stdout;
+        this.stderr = result.stderr;
+    }
+}
+
 /** A request that got no answer, or not all of it (refused, reset, timed out, cut off): what it did is unknown. */
 export class TransportError extends Error {
     readonly cause?: unknown;

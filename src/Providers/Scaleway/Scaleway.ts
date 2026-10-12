@@ -23,17 +23,17 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider, ResolvedMount } from '../../Core/ComputeProvider';
 import { randomBytes } from 'crypto';
-import { filterOffers, findSSHKey, isKind, pickSSHKeys, S3Client, stageDownload, urlSource } from '../../Core/utils';
+import { filterOffers, findSSHKey, isKind, pickSSHKeys, restartWatch, S3Client, stageDownload, timeLeft, urlSource, waitOf } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError, quotedMessage } from '../../errors';
 import type {
-    CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, Server,
-    ServerImage, ServerListOptions, Volume, WaitOptions,
+    CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, ImageSpec, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery,
+    Server, ServerImage, ServerListOptions, Volume, WaitOptions,
 } from '../../types';
 import { ScalewayApi } from './api';
 import {
     BILLING_PER_HOUR, BILLING_PER_MINUTE, CONTAINER_SIZES, CONTAINER_TRANSIENT, containerSizeId, copyTag, ENDPOINT_TAG, endpointUrl, epochMs, FILE_REGIONS, fileSystemMountScript,
-    fileSystemTag, GB, gpuOf, isCopyOf, isScalewayZone, MOUNT_TAG, mountedVolumeIds, parseContainerSizeId, parseRegionalId, parseZonedId, regionOfZone, SCALEWAY_ENUMS, SCALEWAY_ID,
-    SCALEWAY_REFUSED, SCALEWAY_SSH_USER, TMP_BUCKET_PREFIX, toContainerOffer, toEndpoint, toFileSystemVolume, toImage, toImageWithCopies, toOffer, toServer, toVolume, zonedId,
+    fileSystemTag, GB, gpuOf, isCopyOf, isScalewayZone, MOUNT_TAG, mountedVolumeIds, parseContainerSizeId, parseRegionalId, parseZonedId, regionOfZone, SCALEWAY_CPU_IMAGE,
+    SCALEWAY_ENUMS, SCALEWAY_GPU_IMAGE, SCALEWAY_ID, SCALEWAY_REFUSED, SCALEWAY_SSH_USER, TMP_BUCKET_PREFIX, toContainerOffer, toEndpoint, toFileSystemVolume, toImage, toImageWithCopies, toOffer, toServer, toVolume, zonedId,
 } from './mappers';
 import { SCALEWAY_REGIONS } from './types';
 import type {
@@ -48,7 +48,7 @@ export const SCALEWAY_CAPABILITIES = {
     power: { stoppedBilling: 'storage' },
     restart: {},
     // A Project's keys are read at each boot (checked live 2026-10-02): a key deleted from the Project is gone from the server at its next reboot.
-    sshKeys: { appliedAtBoot: true },
+    sshKeys: { atCreate: 'account', appliedAtBoot: true },
     // An image boots in its own zone only: a copy to another is made through Object Storage (export, import, image).
     images: { scope: 'region' },
     imageCopy: {},
@@ -74,10 +74,10 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
     readonly capabilities: Caps = SCALEWAY_CAPABILITIES;
     protected readonly enums = SCALEWAY_ENUMS;
 
-    /** Scaleway's GPU OS image (Marketplace label): Ubuntu 24.04 with the NVIDIA driver, CUDA, Docker and the container toolkit; compatible with every GPU type. */
-    static readonly GPU_IMAGE = 'ubuntu_noble_gpu_os_13_nvidia';
+    /** Scaleway's GPU OS image (Marketplace label): Ubuntu 24.04 with the NVIDIA driver, and Docker with NVIDIA's runtime to run CUDA containers in; it boots every GPU type. */
+    static readonly GPU_IMAGE = SCALEWAY_GPU_IMAGE;
     /** The plain Ubuntu 24.04 a type without GPUs boots by default (the GPU image is for GPU types). */
-    static readonly CPU_IMAGE = 'ubuntu_noble';
+    static readonly CPU_IMAGE = SCALEWAY_CPU_IMAGE;
     /** Scaleway's images log in as root. */
     static readonly SSH_USER = SCALEWAY_SSH_USER;
     /** How a GPU Instance is billed: by the minute. CPU Instances and RENDER-S bill by the hour. */
@@ -118,8 +118,9 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
      * Creates the server in the offer's zone, sets `userData` (cloud-init) and
      * powers it on; returns it `pending`. `image` is a Marketplace label
      * (default: Scaleway's GPU image for a GPU type, plain Ubuntu for any other),
-     * a MACHINE_TYPES member, an image id, or one of listImages (`fr-par-2/<uuid>`,
-     * which fixes the zone). `region` is a zone or a REGION_TYPES member.
+     * a MACHINE_TYPES member (plain Ubuntu: types without GPUs only), `{ os, cuda }`
+     * (the GPU OS image of that Ubuntu: GPU types only), an image id, or one of
+     * listImages (`fr-par-2/<uuid>`, which fixes the zone). `region` is a zone or a REGION_TYPES member.
      * `diskGb` sizes the root volume (default: the image's). The Project's SSH
      * keys are authorized, `sshKeyIds` among them (it must name keys of the
      * Project, by id, name, fingerprint or public key, and cannot exclude the
@@ -136,8 +137,10 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
     public async createServer(o: CreateServerOptions<ScalewayTypes>): Promise<Server<ScalewayServer>> {
         this.rejectOptions(o, SCALEWAY_REFUSED);
         const resolved = this.resolveOffer(o);
-        const image = this.imageName(o.image);
-        let imageRef = image ? parseZonedId(image) : null;
+        // An image by the library's names is Scaleway's label for it on the type rented (imageFor, once the type is read); any other is Scaleway's own name.
+        const spec = this.imageSpec(o.image);
+        const named = spec ? undefined : o.image as string | undefined;
+        let imageRef = named ? parseZonedId(named) : null;
         // An image of another zone than the one asked for: its copy there (copyImage), where it has one.
         if (imageRef && o.region !== undefined) {
             const asked = this.zoneOf(this.regionName(o.region));
@@ -149,6 +152,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const { blocks: mounts, files } = await this.splitMounts(this.mountsOf(o.mounts));
         const zone = this.zoneFor(o, resolved.region, imageRef?.zone, mounts);
         const type = await this.typeOf(zone, resolved.id, resolved.offer);
+        const image = spec ? this.imageFor(spec, resolved.id, !!gpuOf(type)) : named;
         this.checkFileSystems(zone, type, resolved.id, files.map((x) => x.fs));
         this.checkFixedGpuCount(o, gpuOf(type)?.count ?? 0);
         if (o.diskGb !== undefined && !(o.diskGb > 0)) throw new ProviderError(this.id, 'diskGb must be a size in GB above 0');
@@ -225,30 +229,51 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
      * `poweroff`, and waits until it is stopped: the hypervisor slot (a GPU) is
      * released and only the volumes and IPs bill. startServer needs stock again.
      * A server in standby (`stopped in place`, which keeps its slot and bills as
-     * running, though it reads as stopped) is powered off too.
+     * running, though it reads as stopped) is powered off too. It waits for up
+     * to ten minutes, unless `o.timeoutMs` says.
      */
-    public async stopServer(id: string): Promise<void> {
+    public async stopServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
         const s = await this.need(id);
         // Standby (`stopped in place`) keeps the slot and bills as running: it is powered off too.
         if (s.state === 'stopped') return;
         if (s.state !== 'stopping') await this.api.serverAction(s.zone, s.id, { action: 'poweroff' }, true);
-        const stopped = await this.waitFor(s, 'to stop', (x) => x.state === 'stopped' || x.state === 'locked');
+        const stopped = await this.waitFor(s, 'to stop', (x) => x.state === 'stopped' || x.state === 'locked', wait);
         if (!stopped) throw new NotFoundError(this.id, `server ${id} disappeared while it was stopping`);
         if (stopped.state === 'locked') throw new ProviderError(this.id, `server ${id} is locked (${stopped.state_detail || 'no detail'}): it did not stop`);
     }
 
-    /** `poweron`: CapacityError when the slot it released has no stock to come back to. */
-    public async startServer(id: string): Promise<void> {
-        const s = await this.need(id);
-        if (s.state === 'running' || s.state === 'starting') return;
-        if (s.state === 'stopping') await this.waitFor(s, 'to finish stopping', (x) => x.state !== 'stopping');
-        await this.api.serverAction(s.zone, s.id, { action: 'poweron' }, true);
+    /**
+     * `poweron`, and waits until it is running: ten minutes for the whole of
+     * it, unless `o.timeoutMs` says, the wait for a stop in progress included.
+     * CapacityError when the slot it released has no stock to come back to.
+     */
+    public async startServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const left = timeLeft(waitOf(o, { timeoutMs: 10 * 60_000, intervalMs: 5000 }));
+        let s = await this.need(id);
+        if (s.state === 'stopping') {
+            // Powered on only once it has stopped, as it is then: one deleted meanwhile is gone.
+            const stopped = await this.waitFor(s, 'to finish stopping', (x) => x.state !== 'stopping', left());
+            if (!stopped) throw new NotFoundError(this.id, `server ${id} disappeared while it was stopping`);
+            s = stopped;
+        }
+        if (s.state === 'running') return;
+        if (s.state !== 'starting') await this.api.serverAction(s.zone, s.id, { action: 'poweron' }, true);
+        await this.waitUntilUp(s, id, 'start', left());
     }
 
-    /** The `reboot` action; a bare id is asked of every zone. */
-    public async restartServer(id: string): Promise<void> {
+    /**
+     * The `reboot` action, and waits until it runs again (up to ten minutes,
+     * unless `o.timeoutMs` says): once it was seen not to run, or read as
+     * running long enough to say that Scaleway shows no more of the reboot
+     * (restartWatch). A bare id is asked of every zone; a server that is
+     * stopped is refused by Scaleway.
+     */
+    public async restartServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
         const s = await this.need(id);
         await this.api.serverAction(s.zone, s.id, { action: 'reboot' });
+        await this.waitUntilUp(s, id, 'restart', wait);
     }
 
     // ── SSH keys ─────────────────────────────────────────────────────────
@@ -318,7 +343,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         if (!id) throw new ProviderError(this.id, `the backup of server ${serverId} did not say which image it makes`);
         try {
             const image = await this.poll(() => this.api.getImage(s.zone, id), (i) => !i || i.state !== 'creating', {
-                timeoutMs: o.timeoutMs ?? 60 * 60_000, intervalMs: o.intervalMs ?? 15_000, what: `image ${zonedId(s.zone, id)}`, describe: (i) => String(i?.state),
+                ...waitOf(o, { timeoutMs: 60 * 60_000, intervalMs: 15_000 }), what: `image ${zonedId(s.zone, id)}`, describe: (i) => String(i?.state),
             });
             if (!image) throw new NotFoundError(this.id, `image ${zonedId(s.zone, id)} disappeared while it was made`);
             if (image.state === 'error') throw new ProviderError(this.id, `image ${zonedId(s.zone, id)} of server ${serverId} ended in an error`);
@@ -344,7 +369,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const zone = this.zoneOf(this.regionName(o.region));
         const project = this.api.requireProject('import an image');
         const s3 = this.api.objectStorage(regionOfZone(zone), 'importImage');
-        const wait = { timeoutMs: o.timeoutMs ?? 60 * 60_000, intervalMs: o.intervalMs ?? 10_000 };
+        const wait = waitOf(o, { timeoutMs: 60 * 60_000, intervalMs: 10_000 });
         const bucket = `${TMP_BUCKET_PREFIX}${randomBytes(6).toString('hex')}`;
         await s3.createBucket(bucket);
         try {
@@ -396,7 +421,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const targets = [...new Set(regions.map((r) => this.zoneOf(this.regionName(r))))].filter((z) => !have.has(z));
         if (!targets.length) return { ...toImage(source), regions: [...have] };
         const project = this.api.requireProject('copy an image');
-        const wait = { timeoutMs: o.timeoutMs ?? 2 * 60 * 60_000, intervalMs: o.intervalMs ?? 15_000 };
+        const wait = waitOf(o, { timeoutMs: 2 * 60 * 60_000, intervalMs: 15_000 });
         const key = `${source.id}.qcow2`;
         const buckets = new Map<ScalewayRegion, { s3: S3Client, bucket: string }>();
         const bucketIn = async (region: ScalewayRegion) => {
@@ -471,7 +496,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const made = await this.api.createBlockVolume(zone, {
             name: o.name, perf_iops: 5000, project_id: this.api.requireProject('create a volume'), from_empty: { size: Math.ceil(o.sizeGb) * GB }, ...o.providerOptions,
         });
-        const wait = { timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 2000 };
+        const wait = waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 2000 });
         try {
             const v = await this.poll(() => this.api.getBlockVolume(zone, made.id), (x) => !x || x.status !== 'creating', {
                 ...wait, what: `volume ${zonedId(zone, made.id)}`, describe: (x) => String(x?.status),
@@ -498,7 +523,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const region = f.region as ScalewayRegion;
         await this.api.deleteFileSystem(region, f.id);
         await this.poll(() => this.api.getFileSystem(region, f.id), (x) => !x,
-            { timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 2000, what: `delete of filesystem ${f.name}`, describe: (x) => String(x?.status) });
+            { ...waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 2000 }), what: `delete of filesystem ${f.name}`, describe: (x) => String(x?.status) });
     }
 
     /**
@@ -589,8 +614,9 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const c = o.container;
         if (c.registryAuth) throw new NotSupportedError(this.id, 'createEndpoint option "container.registryAuth" (Scaleway pulls a public image, or one of the Project\'s own registry)');
         if (o.idleTimeoutSeconds !== undefined) throw new NotSupportedError(this.id, 'createEndpoint option "idleTimeoutSeconds" (Scaleway stops an idle instance after 15 minutes)');
+        if (o.minCudaVersion !== undefined) throw new NotSupportedError(this.id, 'createEndpoint option "minCudaVersion" (a Serverless Container has no GPU)');
         if (!/^[a-z][a-z0-9-]{0,32}[a-z0-9]$/.test(o.name)) throw new ProviderError(this.id, `endpoint name "${o.name}": 2-34 lowercase letters, digits and dashes, a letter first, no dash last`);
-        const image = this.imageName(c.image);
+        const image = this.containerImageName(c.image);
         if (!image) throw new ProviderError(this.id, 'an endpoint needs an image');
         const port = o.port ?? 80;
         if (!(Number.isInteger(port) && port > 0 && port < 65536)) throw new ProviderError(this.id, `bad port ${port}`);
@@ -603,7 +629,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const size = this.containerSize(o.offer);
         const region = this.providerRegion(o.region);
         const project = this.api.requireProject('create an endpoint');
-        const wait = { timeoutMs: o.timeoutMs ?? 10 * 60_000, intervalMs: o.intervalMs ?? 3000 };
+        const wait = waitOf(o, { timeoutMs: 10 * 60_000, intervalMs: 3000 });
         const ns = await this.api.createContainerNamespace(region, { project_id: project, name: o.name, tags: [ENDPOINT_TAG] });
         try {
             await this.settled(`namespace ${ns.name}`, () => this.api.getContainerNamespace(region, ns.id), wait);
@@ -624,7 +650,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const c = await this.findContainer(id);
         if (!c) return;
         const region = c.region as ScalewayRegion;
-        const gone = { timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 2000 };
+        const gone = waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 2000 });
         await this.api.deleteContainer(region, c.id);
         const ns = await this.api.getContainerNamespace(region, c.namespace_id);
         await this.poll(() => this.api.getContainer(region, c.id), (x) => !x, { ...gone, what: `delete of endpoint ${c.name}`, describe: (x) => String(x?.status) });
@@ -726,7 +752,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         const made = await this.api.createFileSystem(region, { name: o.name, project_id: this.api.requireProject('create a filesystem'), size: size * GB, ...o.providerOptions });
         try {
             const f = await this.poll(() => this.api.getFileSystem(region, made.id), (x) => !x || x.status !== 'creating',
-                { timeoutMs: o.timeoutMs ?? 10 * 60_000, intervalMs: o.intervalMs ?? 3000, what: `filesystem ${o.name}`, describe: (x) => String(x?.status) });
+                { ...waitOf(o, { timeoutMs: 10 * 60_000, intervalMs: 3000 }), what: `filesystem ${o.name}`, describe: (x) => String(x?.status) });
             if (!f) throw new NotFoundError(this.id, `filesystem ${o.name} disappeared while it was made`);
             if (f.status !== 'available') throw new ProviderError(this.id, `filesystem ${o.name} is ${f.status}, not available`);
             return toFileSystemVolume(f);
@@ -922,7 +948,7 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
     /** Reads the volume until it is `status` (an attach or a detach settles in seconds). */
     private async volumeStatus(zone: ScalewayZone, id: string, status: ScalewayBlockVolume['status'], o: WaitOptions): Promise<void> {
         const v = await this.poll(() => this.api.getBlockVolume(zone, id), (x) => !x || x.status === status, {
-            timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 2000, what: `volume ${zonedId(zone, id)} to be ${status}`, describe: (x) => String(x?.status),
+            ...waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 2000 }), what: `volume ${zonedId(zone, id)} to be ${status}`, describe: (x) => String(x?.status),
         });
         if (!v) throw new NotFoundError(this.id, `volume ${zonedId(zone, id)} disappeared`);
     }
@@ -948,10 +974,31 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
         return this.api.serverTypes(zone).catch((): Record<string, ScalewayServerType> => ({}));
     }
 
-    /** Reads the server until `done` accepts it, or it is gone (null), for up to ten minutes: what a stop waits on. */
-    private waitFor(s: ScalewayServer, what: string, done: (x: ScalewayServer) => boolean): Promise<ScalewayServer | null> {
+    /** Reads the server until `done` accepts it, or it is gone (null), for up to ten minutes unless `o` says: what a stop, a start and a restart wait on. */
+    private waitFor(s: ScalewayServer, what: string, done: (x: ScalewayServer) => boolean, o: WaitOptions): Promise<ScalewayServer | null> {
         return this.poll(() => this.api.getServer(s.zone, s.id), (x) => !x || done(x),
-            { timeoutMs: 10 * 60_000, intervalMs: 5000, what: `server ${zonedId(s.zone, s.id)} ${what}`, describe: (x) => String(x?.state) });
+            { ...waitOf(o, { timeoutMs: 10 * 60_000, intervalMs: 5000 }), what: `server ${zonedId(s.zone, s.id)} ${what}`, describe: (x) => String(x?.state) });
+    }
+
+    /** Waits until the server asked to `start` or `restart` is running (a restart: running again, as restartWatch tells it): one that is gone, or locked, did not. */
+    private async waitUntilUp(s: ScalewayServer, id: string, asked: 'start' | 'restart', o: WaitOptions): Promise<void> {
+        const back = asked === 'restart' ? restartWatch(Scaleway.RESTART_SETTLE_READS) : (running: boolean) => running;
+        const up = await this.waitFor(s, `to ${asked}`, (x) => x.state === 'locked' || back(x.state === 'running'), o);
+        if (!up) throw new NotFoundError(this.id, `server ${id} disappeared while it was ${asked}ing`);
+        if (up.state === 'locked') throw new ProviderError(this.id, `server ${id} is locked (${up.state_detail || 'no detail'}): it did not ${asked}`);
+    }
+
+    /**
+     * Scaleway's label for an image named by the library's enums, on the type
+     * rented. Its GPU OS images boot its GPU types and nothing else, and its
+     * plain Ubuntu images everything else (Marketplace:
+     * compatible_commercial_types), so the pair that cannot boot is refused
+     * here, with the one that can.
+     */
+    private imageFor(spec: ImageSpec, type: string, gpu: boolean): string | undefined {
+        if (gpu && spec.cuda === undefined) throw new NotSupportedError(this.id, `image "${spec.os}" on ${type} (a GPU type boots Scaleway's GPU OS images only: ask for it with cuda)`);
+        if (!gpu && spec.cuda !== undefined) throw new NotSupportedError(this.id, `image "${spec.os}" with cuda on ${type} (it has no GPU: Scaleway's GPU OS images boot its GPU types only)`);
+        return this.imageName(spec);
     }
 
     private async need(id: string): Promise<ScalewayServer> {

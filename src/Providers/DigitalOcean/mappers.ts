@@ -5,7 +5,7 @@
 // of the raw records, typed by DigitalOceanTypes.
 
 import type { EnumTranslations } from '../../Core/ComputeProvider';
-import { canonicalGpu, gpuName, sshKeyFingerprint } from '../../Core/utils';
+import { canonicalGpu, gpuName, located, sshKeyFingerprint } from '../../Core/utils';
 import { MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import type { Billing, ImageStatus, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerImage, ServerStatus, Volume, VolumeStatus } from '../../types';
 import type { DigitalOceanDropletData, DigitalOceanDropletStatus, DigitalOceanGpuInfo, DigitalOceanImageData, DigitalOceanNetworkData, DigitalOceanNfsShare, DigitalOceanSizeData, DigitalOceanSSHData, DigitalOceanVolumeData } from './types';
@@ -30,7 +30,7 @@ export const DIGITALOCEAN_BILLING: Billing = Object.freeze({ incrementSeconds: 1
 
 /**
  * The library's enums by DigitalOcean's names: its regions and its Ubuntu
- * images. A region is its first datacenter that takes new resources: San
+ * images (its GPU image of an Ubuntu depends on the size: DigitalOcean.cudaImages). A region is its first datacenter that takes new resources: San
  * Francisco is sfo3, as sfo1 is a legacy datacenter DigitalOcean has closed
  * to them (docs.digitalocean.com/platform/regional-availability); it is still
  * there by its own name, SAN_FRANCISCO_1.
@@ -46,6 +46,9 @@ export const DIGITALOCEAN_ENUMS: EnumTranslations = Object.freeze({
         [REGION_TYPES.SAN_FRANCISCO_1]: 'sfo1',
         [REGION_TYPES.SAN_FRANCISCO_2]: 'sfo2',
         [REGION_TYPES.SAN_FRANCISCO_3]: 'sfo3',
+        // ams2 is closed to new resources, as sfo1 is: Amsterdam is ams3.
+        [REGION_TYPES.AMSTERDAM]: 'ams3',
+        [REGION_TYPES.AMSTERDAM_3]: 'ams3',
     },
     machines: {
         [MACHINE_TYPES.UBUNTU_24]: 'ubuntu-24-04-x64',
@@ -53,6 +56,16 @@ export const DIGITALOCEAN_ENUMS: EnumTranslations = Object.freeze({
         [MACHINE_TYPES.UBUNTU_20]: 'ubuntu-20-04-x64',
     },
 });
+
+/** The country each of DigitalOcean's datacenters is in, by the letters its slug begins with (GET /v2/regions, 2026-10-12). */
+const DATACENTER_COUNTRIES: Readonly<Record<string, string>> = Object.freeze({
+    nyc: 'US', sfo: 'US', atl: 'US', ric: 'US', mkc: 'US', mem: 'US', tor: 'CA', lon: 'GB', ams: 'NL', fra: 'DE', sgp: 'SG', blr: 'IN', syd: 'AU',
+});
+
+/** The country a region is in ('tor1': 'CA'); undefined for a datacenter this does not know. */
+export function countryOf(region: string | undefined): string | undefined {
+    return DATACENTER_COUNTRIES[/^[a-z]+/.exec(region ?? '')?.[0] ?? ''];
+}
 
 /** A GPU model as DigitalOcean writes it ('nvidia_rtx_4000_ada_generation'), by its canonical name. */
 function modelOf(model: string, slug?: string) {
@@ -75,7 +88,7 @@ export function toOffer(s: DigitalOceanSizeData): Offer<DigitalOceanSizeData> {
         id: s.slug,
         pricePerHour: Number(s.price_hourly),
         billing: DIGITALOCEAN_BILLING,
-        regions: s.available ? [...(s.regions ?? [])] : [],
+        ...located(s.available ? s.regions ?? [] : [], countryOf),
         vcpus: s.vcpus,
         memoryGb: s.memory / 1024,
         diskGb: s.disk,
@@ -110,6 +123,7 @@ export function toServer(d: DigitalOceanDropletData): Server<DigitalOceanDroplet
         gpu: info ? gpuOf(info, d.size_slug ?? d.size?.slug) || undefined : undefined,
         gpuCount: info?.count,
         region: d.region?.slug,
+        ...(countryOf(d.region?.slug) ? { country: countryOf(d.region?.slug) } : {}),
         ip: publicIp,
         ipv6: ip(d.networks?.v6, 'public'),
         privateIp: ip(d.networks?.v4, 'private'),

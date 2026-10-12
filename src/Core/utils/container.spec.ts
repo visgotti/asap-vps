@@ -8,7 +8,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, syml
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { ContainerSpec } from '../../types';
-import { cloudInitParts, containerBootScript, shellQuote, VM_CONTAINER_ENV_FILE, VM_CONTAINER_NAME, withUserData } from './container';
+import { cloudInitParts, CONTAINER_KEEP_ALIVE, containerBootScript, parsePort, resolveContainer, shellQuote, VM_CONTAINER_ENV_FILE, VM_CONTAINER_NAME, withUserData } from './container';
 
 const ENV_DIR = VM_CONTAINER_ENV_FILE.replace(/\/[^/]+$/, '');
 
@@ -78,6 +78,41 @@ function runOn(script: string, m: Machine = {}) {
     }
 }
 
+describe('resolveContainer: a container as it runs', () => {
+    it('an image named by the library\'s enums is its registry reference, kept up when it is given no command', () => {
+        expect(CONTAINER_KEEP_ALIVE).toEqual(['sleep', 'infinity']);
+        expect(resolveContainer({ image: 'ubuntu24' })).toEqual({ image: 'ubuntu:24.04', command: ['sleep', 'infinity'] });
+        expect(resolveContainer({ image: { os: 'ubuntu22', cuda: '12.8' }, command: [], env: { A: 'b' } })).toEqual({ image: 'nvidia/cuda:12.8.2-base-ubuntu22.04', command: ['sleep', 'infinity'], env: { A: 'b' } });
+        // The command is its own each time: nothing a caller changes reaches the next container.
+        expect(resolveContainer({ image: 'ubuntu24' }).command).not.toBe(resolveContainer({ image: 'ubuntu24' }).command);
+        expect(Object.isFrozen(CONTAINER_KEEP_ALIVE)).toBe(true);
+    });
+
+    it('its own command is kept; an image of the caller\'s own is as it is, command or none', () => {
+        expect(resolveContainer({ image: { os: 'ubuntu24' }, command: ['nvidia-smi'], ports: ['80/tcp'] })).toEqual({ image: 'ubuntu:24.04', command: ['nvidia-smi'], ports: ['80/tcp'] });
+        const own = { image: 'ghcr.io/acme/app:1' };
+        expect(resolveContainer(own)).toBe(own);
+        // Resolved once, it is as it is: its reference is no name of the library's.
+        const once = resolveContainer({ image: 'ubuntu24', command: ['true'] });
+        expect(resolveContainer(once)).toBe(once);
+    });
+});
+
+describe('parsePort: a port as `ports` writes one', () => {
+    it('is its number and protocol, tcp when none is named, in either case', () => {
+        expect(['8000/tcp', '53/udp', '8888/http', '8000', ' 22/TCP ', '1', '65535/Udp'].map(parsePort)).toEqual([
+            { port: 8000, protocol: 'tcp' }, { port: 53, protocol: 'udp' }, { port: 8888, protocol: 'http' }, { port: 8000, protocol: 'tcp' }, { port: 22, protocol: 'tcp' },
+            { port: 1, protocol: 'tcp' }, { port: 65535, protocol: 'udp' },
+        ]);
+    });
+
+    it('anything else is refused, and a port outside 1-65535', () => {
+        for (const bad of ['80:8080', '80/sctp', 'http', '', '0', '65536', '0/tcp', '70000/tcp', '-1', '8000/', '80/tcp/udp', '8e3']) {
+            expect(() => parsePort(bad)).toThrow(new Error(`bad port "${bad}": use <port>/<tcp|udp|http>, the port from 1 to 65535`));
+        }
+    });
+});
+
 describe('shellQuote: one word of a POSIX shell command', () => {
     it.each([
         ['plain', `'plain'`],
@@ -131,6 +166,18 @@ describe('containerBootScript: a container on a VM, run at the first boot', () =
         ]);
         // No command line holds it.
         expect(r.calls.filter((c) => !c.startsWith('stdin')).join('\n')).not.toContain('s3cret');
+    });
+
+    it('an image named by the library\'s enums is pulled and run as the registry reference it stands for', () => {
+        const byName = containerBootScript({ image: { os: 'ubuntu24', cuda: '12.8' }, command: ['nvidia-smi'] }, { gpu: true });
+        expect(byName).toBe(containerBootScript({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', command: ['nvidia-smi'] }, { gpu: true }));
+        expect(byName).toContain("docker pull 'nvidia/cuda:12.8.2-base-ubuntu24.04'\n");
+        expect(byName).toMatch(/ \$GPUS 'nvidia\/cuda:12\.8\.2-base-ubuntu24\.04' 'nvidia-smi'\n$/);
+        // Given no command, it is kept up: a bare Ubuntu's own command, a shell, would exit at once.
+        expect(containerBootScript({ image: 'ubuntu24' }, { gpu: false })).toMatch(/ \$GPUS 'ubuntu:24\.04' 'sleep' 'infinity'\n$/);
+        expect(containerBootScript({ image: 'ubuntu:24.04' }, { gpu: false })).toMatch(/ \$GPUS 'ubuntu:24\.04'\n$/);
+        // Docker Hub's, whatever the login: the registry logged in to is the one the reference names.
+        expect(containerBootScript({ image: { os: 'ubuntu22' }, registryAuth: { username: 'u', password: 'p' } }, { gpu: false })).toContain(" --password-stdin 'docker.io'\ndocker pull 'ubuntu:22.04'\n");
     });
 
     it('logs in to the image\'s registry when the login names none', () => {

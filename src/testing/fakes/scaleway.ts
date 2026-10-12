@@ -289,8 +289,12 @@ export function fakeScaleway(o: FakeScalewayOptions = {}) {
         }));
     const noStock = (zone: string, type: string) => err(400, 'out_of_stock', `resource ${type} is out of stock in ${zone}`, { resource: type });
 
-    /** The images a type can boot: a GPU OS image only on a GPU type. */
-    const bootable = (label: string, type: any) => !GPU_LABEL.test(label) || (type.gpu ?? 0) > 0;
+    /**
+     * The Marketplace images a type can boot: a GPU OS image on a GPU type and
+     * on no other, a plain one on a type without GPUs and on no GPU type (its
+     * local images' compatible_commercial_types, read 2026-10-12).
+     */
+    const bootable = (label: string, type: any) => GPU_LABEL.test(label) === ((type.gpu ?? 0) > 0);
 
     const createServer = (zone: string, b: any): Response => {
         const type = typesOf(zone)[b.commercial_type];

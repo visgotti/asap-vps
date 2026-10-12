@@ -6,8 +6,7 @@
 
 import type { CapabilityDescriptor, CapabilityName, Capable, With } from '../capabilities';
 import { isRetriable, ProviderError } from '../errors';
-import type { WaitOptions } from '../types';
-import { ApiClient, pollUntil, Sleep } from './utils';
+import { ApiClient, Deadline, pollUntil, Sleep, waitOf } from './utils';
 
 export abstract class BaseProvider<TApi extends ApiClient = ApiClient> implements Capable {
     /** The provider's id: what its records and errors report. */
@@ -43,14 +42,15 @@ export abstract class BaseProvider<TApi extends ApiClient = ApiClient> implement
      * what was last seen.
      */
     protected async poll<T>(read: () => Promise<T>, done: (v: T) => boolean,
-        o: WaitOptions & { what: string, describe?: (v: T) => string }): Promise<T> {
-        const timeoutMs = o.timeoutMs ?? 15 * 60_000;
+        o: Deadline & { what: string, describe?: (v: T) => string }): Promise<T> {
+        // Fifteen minutes, read every ten seconds, unless `o` says; of a longer wait under one deadline, the timeout reports the whole.
+        const { timeoutMs, intervalMs, budgetMs = timeoutMs } = waitOf(o, { timeoutMs: 15 * 60_000, intervalMs: 10_000 });
         return pollUntil(read, done, {
             timeoutMs,
-            intervalMs: o.intervalMs ?? 10_000,
+            intervalMs,
             sleep: this.sleep,
             retryOn: isRetriable,
-            timeoutError: (last) => new ProviderError(this.id, `timed out after ${Math.round(timeoutMs / 1000)} s waiting for ${o.what}: ${
+            timeoutError: (last) => new ProviderError(this.id, `timed out after ${Math.round(budgetMs / 1000)} s waiting for ${o.what}: ${
                 !last.seen ? 'never read' : o.describe ? o.describe(last.value) : String(last.value)}`, { code: 'timeout' }),
         });
     }

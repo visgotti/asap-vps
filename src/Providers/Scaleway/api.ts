@@ -18,7 +18,7 @@
 //   - SSH keys belong to a Project (IAM), and Scaleway applies every key of a
 //     Project at boot to every server created in it.
 
-import { ApiClient, HttpResult, pollUntil, RequestInfo, S3Client } from '../../Core/utils';
+import { ApiClient, HttpResult, pollUntil, RequestInfo, S3Client, waitOf } from '../../Core/utils';
 import { AuthError, CapacityError, falseIfNotFound, isRetriable, NotFoundError, nullIfNotFound, ProviderError, QuotaError, quotedMessage } from '../../errors';
 import type { InitializedSSHKeyData, WaitOptions } from '../../types';
 import { fillPath, queryString, SCALEWAY_ENDPOINTS, ScalewayEndpoint } from './endpoints';
@@ -289,7 +289,7 @@ export class ScalewayApi extends ApiClient {
     async fileSystemState(zone: ScalewayZone, serverId: string, filesystemId: string, state: 'available' | 'gone', o: WaitOptions): Promise<void> {
         const read = async () => (await this.getServer(zone, serverId))?.filesystems?.find((f) => f.filesystem_id === filesystemId)?.state ?? 'gone';
         const last = await pollUntil(read, (s) => s === state || (state === 'available' && s === 'gone'), {
-            timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 2000, sleep: this.sleep, retryOn: isRetriable,
+            ...waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 2000 }), sleep: this.sleep, retryOn: isRetriable,
             timeoutError: (l) => new ProviderError(this.id, `filesystem ${filesystemId} on server ${serverId}: still ${l.seen ? l.value : 'unread'}, not ${state}`, { code: 'timeout' }),
         });
         if (last !== state) throw new ProviderError(this.id, `filesystem ${filesystemId} is no longer attached to server ${serverId}`);
@@ -318,8 +318,7 @@ export class ScalewayApi extends ApiClient {
     async deleteServer(zone: ScalewayZone, id: string, o: WaitOptions = {}): Promise<boolean> {
         const server = await this.getServer(zone, id);
         if (!server) return false;
-        const timeoutMs = o.timeoutMs ?? 5 * 60_000;
-        const intervalMs = o.intervalMs ?? 3000;
+        const { timeoutMs, intervalMs } = waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 3000 });
         const end = Date.now() + timeoutMs;
         const secs = Math.round(timeoutMs / 1000);
         const volumes = Object.values(server.volumes);
@@ -557,8 +556,7 @@ export class ScalewayApi extends ApiClient {
             status = v?.status ?? 'gone';
             return v;
         }, (v) => !v || !busy.includes(v.status), {
-            timeoutMs: o.timeoutMs ?? 2 * 60_000,
-            intervalMs: o.intervalMs ?? 3000,
+            ...waitOf(o, { timeoutMs: 2 * 60_000, intervalMs: 3000 }),
             sleep: this.sleep,
             retryOn: isRetriable,
             timeoutError: () => new ProviderError(this.id, `block volume ${zonedId(zone, id)} is still ${status}: it cannot be deleted yet`, { code: 'timeout' }),

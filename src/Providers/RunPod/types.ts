@@ -134,6 +134,8 @@ export type RunPodCreatePodBody = {
     env?: Record<string, string>,
     /** '<port>/<tcp|http>': RunPod takes no UDP. */
     ports?: string[],
+    /** The container's ENTRYPOINT, in place of the image's own. */
+    entrypoint?: string[],
     cmd?: string[],
     /** The container disk, whole GB. */
     disk: number,

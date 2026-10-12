@@ -1,11 +1,12 @@
-// One provisioner for every provider that can rent a VM and register a key:
-// a VPS and a GPU server set up the same way, against each provider's fake.
+// One provisioner for every provider that can rent a server and register a
+// key: a VPS, a GPU VM and a container set up the same way, against each
+// provider's fake.
 
 import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { NodeSSH } from 'node-ssh';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { PLATFORM } from '../constants';
+import { MACHINE_TYPES, PLATFORM } from '../constants';
 import { NotSupportedError, ProviderError } from '../errors';
 import { DigitalOcean } from '../Providers/DigitalOcean/DigitalOcean';
 import { LambdaCloud } from '../Providers/LambdaCloud/LambdaCloud';
@@ -13,6 +14,8 @@ import { RunPod } from '../Providers/RunPod/RunPod';
 import { fakeDigitalOcean } from '../testing/fakes/digitalocean';
 import { fakeLambda } from '../testing/fakes/lambda';
 import { fakeRunPod } from '../testing/fakes/runpod';
+import { fakeVast } from '../testing/fakes/vast';
+import { VastAI } from '../Providers/VastAI/VastAI';
 import { FAKE_SCALEWAY_PROJECT, fakeScaleway } from '../testing/fakes/scaleway';
 import { Scaleway } from '../Providers/Scaleway/Scaleway';
 import { testPublicKey } from '../testing/fakes/util';
@@ -20,6 +23,7 @@ import { asRoot, ProvisionError, ProvisionTarget, ServerProvisioner } from './Se
 import { SetupPipeline } from './SetupPipeline';
 import { SSHService } from './SSHService';
 import { RunCommandStep } from './steps';
+import { sshKeyFingerprint } from './utils';
 
 const noSleep = async () => {};
 const fast = { intervalMs: 0, timeoutMs: 5000 };
@@ -242,14 +246,33 @@ describe('ServerProvisioner', () => {
         });
     });
 
-    it('a container provider has no host to set up: refused before anything is rented', async () => {
+    it('a container is set up the same way: its SSH server is the library\'s, started for the run\'s key before the command that keeps it up', async () => {
+        for (const make of [
+            () => { const fake = fakeRunPod(); return { fake, p: new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep }), offer: 'NVIDIA RTX A5000' }; },
+            () => { const fake = fakeVast(); return { fake, p: new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep }), offer: '101' }; },
+        ]) {
+            const { fake, p, offer } = make();
+            const r = await new ServerProvisioner(p as ProvisionTarget).provision({ serverOptions: { name: 'setup', offer, image: MACHINE_TYPES.UBUNTU_24 }, ...quick },
+                (pipeline) => void pipeline.addStep(new RunCommandStep(['nvidia-smi -L'], 'check-gpu')));
+            expect(r.server).toMatchObject({ status: 'running', ssh: { host: r.server.ip, username: 'root' } });
+            // What answers at its endpoint takes the run's key, and that alone.
+            expect(fake.machine!(r.server.ssh!.host, r.server.ssh!.port)?.keys.map((k) => sshKeyFingerprint(k))).toEqual([sshKeyFingerprint(r.sshKeyData.publicKey)]);
+            expect(SSHService.connect).toHaveBeenLastCalledWith(expect.objectContaining({ ...r.server.ssh, privateKey: 'PRIVATE' }));
+            expect(r.setupResults).toEqual([expect.objectContaining({ step: 'check-gpu', success: true })]);
+            // The run's key is gone from the account again: its copy on the server is what logs in.
+            expect((await p.listSSHKeys()).map((k) => k.fingerprint)).not.toContain(sshKeyFingerprint(r.sshKeyData.publicKey));
+        }
+    });
+
+    it('an image of the caller\'s own with no command cannot be given an SSH server: refused before anything is rented, and the run\'s key removed', async () => {
         const fake = fakeRunPod();
         const p = new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
-        const before = fake.liveServers();
-        await expect(new ServerProvisioner(p as ProvisionTarget).provision({ serverOptions: { name: 'x', offer: 'NVIDIA RTX A5000', image: 'img' } }, () => {}))
+        const [before, keys] = [fake.liveServers(), (await p.listSSHKeys()).length];
+        await expect(new ServerProvisioner(p as ProvisionTarget).provision({ serverOptions: { name: 'x', offer: 'NVIDIA RTX A5000', image: 'img' }, ...quick }, () => {}))
             .rejects.toBeInstanceOf(NotSupportedError);
         expect(fake.liveServers()).toBe(before);
-        expect(SSHService.createKeys).not.toHaveBeenCalled();
+        expect(await p.listSSHKeys()).toHaveLength(keys);
+        expect(SSHService.connect).not.toHaveBeenCalled();
     });
 
     describe('what every run keeps, whatever the provider', () => {
@@ -377,7 +400,7 @@ describe('asRoot: the steps\' connection on a login that is not root', () => {
         const { ssh, sent, written } = client();
         await asRoot(ssh, 'ubuntu').putFile(join(local, 'app.conf'), '/etc/app/app.conf');
         expect(written).toEqual([expect.stringMatching(STAGED)]);
-        expect(sent()).toEqual([`sudo -n bash -c 'mkdir -p -- ${q('/etc/app')} && mv -f -- ${q(written[0])} ${q('/etc/app/app.conf')} && chown root:root -- ${q('/etc/app/app.conf')}'`]);
+        expect(sent()).toEqual([`sudo -n bash -c 'mkdir -p -- ${q('/etc/app')} && mv -f -- ${q(written[0])} ${q('/etc/app/app.conf')} && chown -- root:root ${q('/etc/app/app.conf')}'`]);
     });
 
     it('putFiles and putDirectory place every file and directory as root: nothing is written outside the login\'s home over SFTP', async () => {
@@ -389,7 +412,7 @@ describe('asRoot: the steps\' connection on a login that is not root', () => {
         for (const w of written) expect(w).toMatch(STAGED);
         const ran = sent().join('\n');
         expect(ran).toContain(`mkdir -p ${q('/opt/app/conf.d')}`);
-        for (const placed of ['/etc/a.conf', '/etc/b.conf', '/opt/app/app.conf', '/opt/app/conf.d/b.conf']) expect(ran).toContain(`chown root:root -- ${q(placed)}`);
+        for (const placed of ['/etc/a.conf', '/etc/b.conf', '/opt/app/app.conf', '/opt/app/conf.d/b.conf']) expect(ran).toContain(`chown -- root:root ${q(placed)}`);
         for (const c of sent()) expect(c).toMatch(/^sudo -n bash -c '/);
     });
 

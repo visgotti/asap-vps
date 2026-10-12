@@ -68,7 +68,7 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         name: 'digitalocean',
         // Size gpu-4000adax1-20gb: price_hourly 0.76, in tor1 only, 8 vCPUs, 32768 MB, 500 GB, one nvidia_rtx4000_ada of 20 GiB.
         cheapestGpuOffer: { provider: 'digitalocean', id: 'gpu-4000adax1-20gb', gpu: 'RTX 4000 Ada', vendor: 'nvidia', gpuCount: 1, vramGb: 20, pricePerHour: 0.76,
-            billing: { incrementSeconds: 1, minimumSeconds: 60, minimumUsd: 0.01 }, regions: ['tor1'], vcpus: 8, memoryGb: 32, diskGb: 500, interruptible: false },
+            billing: { incrementSeconds: 1, minimumSeconds: 60, minimumUsd: 0.01 }, regions: ['tor1'], locations: [{ region: 'tor1', country: 'CA' }], vcpus: 8, memoryGb: 32, diskGb: 500, interruptible: false },
         sshUser: 'root',
         make(o = {}) {
             const fake = fakeDigitalOcean();
@@ -91,7 +91,7 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         name: 'runpod',
         // NVIDIA RTX A5000 on the secure cloud: 0.27 a GPU, 24 GB, stock in US-TX-3 only (EU-RO-1 has none), CUDA 12.8 free (12.4 not).
         cheapestGpuOffer: { provider: 'runpod', id: 'NVIDIA RTX A5000', gpu: 'RTX A5000', vendor: 'nvidia', gpuCount: 1, vramGb: 24, pricePerHour: 0.27,
-            billing: { incrementSeconds: 1, minimumSeconds: 0 }, regions: ['US-TX-3'], cudaVersion: '12.8' },
+            billing: { incrementSeconds: 1, minimumSeconds: 0 }, regions: ['US-TX-3'], locations: [{ region: 'US-TX-3', country: 'US' }], cudaVersion: '12.8' },
         make(o = {}) {
             const fake = fakeRunPod();
             return { fake, provider: new RunPod({ apiKey: o.apiKey ?? 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
@@ -119,7 +119,7 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         name: 'vast',
         // Ask 104: a Tesla T4 with 15360 MB usable (a 16 GB card), dph_total 0.1, in Ohio on machine 14, 4 cores, 16384 MB, 100 GB, CUDA 12.2.
         cheapestGpuOffer: { provider: 'vast', id: '104', gpu: 'T4', vendor: 'nvidia', gpuCount: 1, vramGb: 16, pricePerHour: 0.1, billing: { incrementSeconds: 1, minimumSeconds: 0 },
-            regions: ['Ohio, US', 'machine:14'], interruptible: false, vcpus: 4, memoryGb: 16, diskGb: 100, cudaVersion: '12.2' },
+            regions: ['Ohio, US', 'machine:14'], locations: [{ region: 'Ohio, US', country: 'US' }, { region: 'machine:14', country: 'US' }], interruptible: false, vcpus: 4, memoryGb: 16, diskGb: 100, cudaVersion: '12.2' },
         make(o = {}) {
             const fake = fakeVast();
             // Snapshots go to a registry of the account's.
@@ -160,7 +160,7 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         name: 'lambda',
         // gpu_1x_a10: 75 cents an hour, 'A10 (24 GB PCIe)', capacity in us-east-1, 30 vCPUs, 200 GiB, 1400 GiB.
         cheapestGpuOffer: { provider: 'lambda', id: 'gpu_1x_a10', gpu: 'A10', vendor: 'nvidia', gpuCount: 1, vramGb: 24, pricePerHour: 0.75,
-            billing: { incrementSeconds: 60, minimumSeconds: 0 }, regions: ['us-east-1'], vcpus: 30, memoryGb: 200, diskGb: 1400 },
+            billing: { incrementSeconds: 60, minimumSeconds: 0 }, regions: ['us-east-1'], locations: [{ region: 'us-east-1', country: 'US' }], vcpus: 30, memoryGb: 200, diskGb: 1400 },
         sshUser: 'ubuntu',
         make(o = {}) {
             const fake = fakeLambda();
@@ -178,7 +178,7 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         name: 'scaleway',
         // L4-1-24G: 0.7875 EUR an hour (USD at 1.15), stock in pl-waw-2, 8 vCPUs, 48 GiB, one L4 of 24 GiB.
         cheapestGpuOffer: { provider: 'scaleway', id: 'L4-1-24G', gpu: 'L4', vendor: 'nvidia', gpuCount: 1, vramGb: 24, pricePerHour: 0.7875 * 1.15,
-            billing: { incrementSeconds: 60, minimumSeconds: 0 }, regions: ['pl-waw-2'], vcpus: 8, memoryGb: 48 },
+            billing: { incrementSeconds: 60, minimumSeconds: 0 }, regions: ['pl-waw-2'], locations: [{ region: 'pl-waw-2', country: 'PL' }], vcpus: 8, memoryGb: 48 },
         sshUser: 'root',
         make(o = {}) {
             const fake = fakeScaleway();

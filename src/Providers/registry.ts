@@ -9,10 +9,13 @@ import type { ProviderParams } from '../types';
 import { DigitalOcean } from './DigitalOcean/DigitalOcean';
 import { LambdaCloud } from './LambdaCloud/LambdaCloud';
 import { RunPod } from './RunPod/RunPod';
+import type { RunPodParams } from './RunPod/types';
 import { Scaleway } from './Scaleway/Scaleway';
+import type { ScalewayParams } from './Scaleway/types';
+import type { VastAIParams } from './VastAI/types';
 import { VastAI } from './VastAI/VastAI';
 
-export type ProviderInfo<P = unknown> = {
+export type ProviderInfo<P = unknown, A extends ProviderParams = ProviderParams> = {
     /** The provider's `id`, as its records report it. */
     id: string,
     name: string,
@@ -26,27 +29,30 @@ export type ProviderInfo<P = unknown> = {
      * and zones). A variable that is not set leaves its setting out.
      */
     paramsEnv?: Readonly<Record<string, string>>,
-    create(params: ProviderParams | string): P,
+    /** A provider from its settings (the key and what else this provider takes: `A`), or from its key alone. */
+    create(params: A | string): P,
 };
 
-const info = <P>(i: ProviderInfo<P>) => Object.freeze(i);
+const info = <P, A extends ProviderParams>(i: ProviderInfo<P, A>) => Object.freeze(i);
 
 export const PROVIDERS = Object.freeze({
-    digitalocean: info({ id: 'digitalocean', name: 'DigitalOcean', capabilities: DigitalOcean.capabilities, keyEnv: 'DIGITAL_OCEAN_API_KEY', create: (p) => new DigitalOcean(p) }),
-    runpod: info({ id: 'runpod', name: 'RunPod', capabilities: RunPod.capabilities, keyEnv: 'RUNPOD_API_KEY', create: (p) => new RunPod(p) }),
-    vast: info({ id: 'vast', name: 'Vast.ai', capabilities: VastAI.capabilities, keyEnv: 'VAST_API_KEY', create: (p) => new VastAI(p) }),
-    lambda: info({ id: 'lambda', name: 'Lambda', capabilities: LambdaCloud.capabilities, keyEnv: 'LAMBDA_API_KEY', create: (p) => new LambdaCloud(p) }),
+    digitalocean: info({ id: 'digitalocean', name: 'DigitalOcean', capabilities: DigitalOcean.capabilities, keyEnv: 'DIGITAL_OCEAN_API_KEY', create: (p: ProviderParams | string) => new DigitalOcean(p) }),
+    runpod: info({ id: 'runpod', name: 'RunPod', capabilities: RunPod.capabilities, keyEnv: 'RUNPOD_API_KEY', create: (p: RunPodParams | string) => new RunPod(p) }),
+    vast: info({ id: 'vast', name: 'Vast.ai', capabilities: VastAI.capabilities, keyEnv: 'VAST_API_KEY', create: (p: VastAIParams | string) => new VastAI(p) }),
+    lambda: info({ id: 'lambda', name: 'Lambda', capabilities: LambdaCloud.capabilities, keyEnv: 'LAMBDA_API_KEY', create: (p: ProviderParams | string) => new LambdaCloud(p) }),
     // The secret key (X-Auth-Token); the Project is where servers and SSH keys are created (SCW_DEFAULT_PROJECT_ID).
     scaleway: info({
         id: 'scaleway', name: 'Scaleway', capabilities: Scaleway.capabilities, keyEnv: 'SCW_SECRET_KEY',
         paramsEnv: { projectId: 'SCW_DEFAULT_PROJECT_ID', zones: 'SCW_ZONES', accessKey: 'SCW_ACCESS_KEY' },
-        create: (p) => new Scaleway(p),
+        create: (p: ScalewayParams | string) => new Scaleway(p),
     }),
 });
 
 export type ProviderId = keyof typeof PROVIDERS;
 /** The class `createProvider(id)` builds: DigitalOcean for 'digitalocean', RunPod for 'runpod', ... */
 export type ProviderOf<K extends ProviderId> = ReturnType<(typeof PROVIDERS)[K]['create']>;
+/** What `createProvider(id, ...)` takes besides a bare key: the provider's own settings (ScalewayParams for 'scaleway', with its Project and zones, ...). */
+export type ProviderParamsOf<K extends ProviderId> = Exclude<Parameters<(typeof PROVIDERS)[K]['create']>[0], string>;
 /** Any shipped provider: narrow it by its `id`, or by a capability (`supports(p, 'power')`). */
 export type AnyProvider = ProviderOf<ProviderId>;
 
@@ -70,8 +76,12 @@ export function providerParams(i: ProviderInfo, env: Record<string, string | und
     return params as ProviderParams;
 }
 
-/** A provider by id: createProvider('runpod', process.env.RUNPOD_API_KEY!) is a RunPod. */
-export function createProvider<K extends ProviderId>(id: K, params: ProviderParams | string): ProviderOf<K>;
+/**
+ * A provider by id: createProvider('runpod', process.env.RUNPOD_API_KEY!) is a
+ * RunPod. Its settings are typed by the id too: createProvider('scaleway',
+ * { apiKey, projectId }) takes Scaleway's, and no other provider's.
+ */
+export function createProvider<K extends ProviderId>(id: K, params: ProviderParamsOf<K> | string): ProviderOf<K>;
 export function createProvider(id: string, params: ProviderParams | string): AnyProvider;
 export function createProvider(id: string, params: ProviderParams | string): AnyProvider {
     return providerInfo(id).create(params) as AnyProvider;

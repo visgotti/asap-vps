@@ -11,7 +11,7 @@
 
 import { execFileSync } from 'child_process';
 import type { ICompute } from '../../capabilities';
-import { REGION_TYPES } from '../../constants';
+import { CUDA_TYPES, MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import { containerBootScript } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
 import { fakeDigitalOcean } from '../../testing/fakes/digitalocean';
@@ -180,6 +180,172 @@ describe('DigitalOcean API facts', () => {
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions')).map((c) => c.body.type)).toEqual(['shutdown', 'power_on', 'shutdown']);
     });
 
+    it('a start and a restart wait for their action for 10 minutes, reading every 10 s, or as long and as often as they are told: then a timeout that says what it still is', async () => {
+        for (const [call, type] of [['startServer', 'power_on'], ['restartServer', 'reboot']] as const) {
+            for (const [o, seconds, pauses] of [[undefined, 600, Array(60).fill(10_000)], [{ timeoutMs: 30_000, intervalMs: 1000 }, 30, Array(30).fill(1000)]] as const) {
+                const { p, fake, slept } = clocked();
+                const s = await p.createServer({ name: 'slow', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
+                await running(p, s.id);
+                // A start is of a droplet that is off; from here on no action completes.
+                if (call === 'startServer') await p.stopServer(s.id);
+                fake.state.actionReads = 1e9;
+                slept.length = 0;
+                const e = await p[call](s.id, o).catch((x) => x);
+                const action = [...fake.state.actions.values()].find((a) => a.type === type);
+                expect(e).toMatchObject({ name: 'ProviderError', code: 'timeout', message: `digitalocean: timed out after ${seconds} s waiting for action ${action.id}: ${type} in-progress` });
+                expect(slept).toEqual(pauses);
+                jest.restoreAllMocks();
+            }
+        }
+    });
+
+    it('a stop has 13 minutes, or the time it is told: the clean shutdown 3 of them and never more than half, the power-off the rest; its timeout says the whole', async () => {
+        const stuck = async (o?: { timeoutMs?: number }) => {
+            const { p, fake, slept } = clocked({ actionReads: 1e9 });
+            const s = await p.createServer({ name: 'slow', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
+            await running(p, s.id);
+            slept.length = 0;
+            const e = await p.stopServer(s.id, o).catch((x) => x);
+            jest.restoreAllMocks();
+            return { e, slept, asked: fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions')).map((c) => c.body.type) };
+        };
+        // By default: the shutdown is read for 3 minutes, then the power-off asked for 10 while the droplet is still busy with it.
+        // An option given as undefined is the default too, not a wait without end.
+        for (const o of [undefined, { timeoutMs: undefined }]) {
+            const byDefault = await stuck(o);
+            expect(byDefault.e).toMatchObject({ code: 'timeout', message: 'digitalocean: timed out after 780 s waiting for the droplet\'s pending event to end, to ask for {"type":"power_off"}' });
+            expect(byDefault.slept).toEqual([...Array(18).fill(10_000), ...Array(120).fill(5000)]);
+            expect(byDefault.asked).toEqual(['shutdown', ...Array(121).fill('power_off')]);
+        }
+        // Given a minute: the shutdown has half of it, and the power-off the other half: a droplet that ignores its shutdown is still cut off.
+        const minute = await stuck({ timeoutMs: 60_000 });
+        expect(minute.e).toMatchObject({ code: 'timeout', message: 'digitalocean: timed out after 60 s waiting for the droplet\'s pending event to end, to ask for {"type":"power_off"}' });
+        expect(minute.slept).toEqual([...Array(3).fill(10_000), ...Array(6).fill(5000)]);
+        expect(minute.asked).toEqual(['shutdown', ...Array(7).fill('power_off')]);
+        // Given an hour: the shutdown still has only its 3 minutes, the power-off the rest.
+        const hour = await stuck({ timeoutMs: 3_600_000 });
+        expect(hour.e).toMatchObject({ code: 'timeout', message: 'digitalocean: timed out after 3600 s waiting for the droplet\'s pending event to end, to ask for {"type":"power_off"}' });
+        expect(hour.slept).toEqual([...Array(18).fill(10_000), ...Array(684).fill(5000)]);
+        // A time that is no number is refused before anything is asked of DigitalOcean.
+        const nan = await stuck({ timeoutMs: NaN });
+        expect(nan.e.message).toBe('asap-vps: bad timeoutMs NaN: use a number of milliseconds, 0 or more');
+        expect(nan.asked).toEqual([]);
+    });
+
+    it('a shutdown that outlasts its 3 minutes and finishes while the power-off is asked for is a stop all the same: the power-off DigitalOcean then refuses is no failure', async () => {
+        for (const strictPower of [true, false]) {
+            // 25 reads to finish: 19 of them in the shutdown's 3 minutes, the rest as the power-off is refused for the pending event.
+            const { p, fake } = clocked({ actionReads: 25, strictPower });
+            const s = await p.createServer({ name: 'slow', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
+            await running(p, s.id);
+            await expect(p.stopServer(s.id)).resolves.toBeUndefined();
+            expect(fake.state.droplets.get(s.id).status).toBe('off');
+            const asked = fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions')).map((c) => c.body.type);
+            expect(asked).toEqual(['shutdown', ...Array(7).fill('power_off')]);
+            // Refused as already off (strict), no power-off was ever started; accepted, one was, and was waited for.
+            expect([...fake.state.actions.values()].filter((a) => a.type === 'power_off')).toHaveLength(strictPower ? 0 : 1);
+            jest.restoreAllMocks();
+        }
+    });
+
+    it('a power-off that fails with the droplet still on is the stop\'s failure', async () => {
+        const fake = fakeDigitalOcean({ ignoreShutdown: true });
+        // The guest ignores its shutdown, and DigitalOcean refuses the power-off.
+        const refusing = (async (url: string, init?: RequestInit) => (init?.method === 'POST' && /\/actions$/.test(new URL(url).pathname) && JSON.parse(String(init.body)).type === 'power_off'
+            ? json(422, { id: 'unprocessable_entity', message: 'This Droplet cannot be powered off right now.' }) : fake.fetchImpl(url, init))) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: refusing, sleep: noSleep });
+        const s = await running(p, (await p.createServer({ name: 'stuck', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id);
+        await expect(p.stopServer(s.id)).rejects.toMatchObject({ name: 'ProviderError', status: 422, message: expect.stringMatching(/cannot be powered off right now/) });
+        expect(fake.state.droplets.get(s.id).status).toBe('active');
+    });
+
+    it('a start of a droplet that is on asks nothing of DigitalOcean; one that is off is powered on, and read as on before the start returns', async () => {
+        const { p, fake } = make({ strictPower: true });
+        const s = await running(p, (await p.createServer({ name: 'gpu-s', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id);
+        let from = fake.calls.length;
+        await p.startServer(s.id);
+        expect(fake.calls.slice(from).map(asked)).toEqual([`GET /v2/droplets/${s.id}`]);
+        await p.stopServer(s.id);
+        from = fake.calls.length;
+        await p.startServer(s.id);
+        expect(fake.calls.slice(from).map(asked)).toEqual([`GET /v2/droplets/${s.id}`, `POST /v2/droplets/${s.id}/actions`, 'GET /v2/actions/:id', 'GET /v2/actions/:id', `GET /v2/droplets/${s.id}`]);
+        expect(fake.state.droplets.get(s.id).status).toBe('active');
+        await expect(p.startServer('999999')).rejects.toMatchObject({ name: 'NotFoundError', message: 'digitalocean: no droplet 999999' });
+    });
+
+    it('a power-on DigitalOcean refuses because the droplet is on by now (another start got there first) is a start; refused with it still off, it is the failure', async () => {
+        const fake = fakeDigitalOcean({ strictPower: true });
+        let race: 'on' | 'refuse' | undefined;
+        const racing = (async (url: string, init?: RequestInit) => {
+            const m = init?.method === 'POST' ? /^\/v2\/droplets\/(\d+)\/actions$/.exec(new URL(url).pathname) : null;
+            if (m && race === 'on') fake.state.droplets.get(m[1]).status = 'active';
+            if (m && race === 'refuse') return json(422, { id: 'unprocessable_entity', message: 'Droplet is locked.' });
+            return fake.fetchImpl(url, init);
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: racing, sleep: noSleep });
+        const s = await running(p, (await p.createServer({ name: 'race', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id);
+        await p.stopServer(s.id);
+        race = 'on';
+        await expect(p.startServer(s.id)).resolves.toBeUndefined();
+        // Nothing was started by it: DigitalOcean refused.
+        expect([...fake.state.actions.values()].filter((a) => a.type === 'power_on')).toEqual([]);
+        race = undefined;
+        await p.stopServer(s.id);
+        race = 'refuse';
+        await expect(p.startServer(s.id)).rejects.toMatchObject({ name: 'ProviderError', status: 422, message: expect.stringMatching(/Droplet is locked/) });
+        expect(fake.state.droplets.get(s.id).status).toBe('off');
+    });
+
+    it('a droplet DigitalOcean does not report as on yet when its power-on completes is waited for; one deleted meanwhile is gone, for a start and a restart alike', async () => {
+        const fake = fakeDigitalOcean();
+        // The droplet as DigitalOcean reports it after an action of `type` completes: off for `lag` more reads, or deleted.
+        const after = { type: '', lag: 0, gone: false };
+        const lagging = (async (url: string, init?: RequestInit) => {
+            const path = new URL(url).pathname;
+            const m = (init?.method ?? 'GET') === 'GET' ? /^\/v2\/droplets\/(\d+)$/.exec(path) : null;
+            const done = m && [...fake.state.actions.values()].some((a) => a.dropletId === Number(m[1]) && a.type === after.type && a.status === 'completed');
+            if (m && done && after.gone) fake.state.droplets.delete(m[1]);
+            const r = await fake.fetchImpl(url, init);
+            if (!m || !done || after.gone || after.lag-- <= 0) return r;
+            const body = await r.json();
+            return json(200, { droplet: { ...body.droplet, status: 'off' } });
+        }) as typeof fetch;
+        const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: lagging, sleep: noSleep });
+        const s = await running(p, (await p.createServer({ name: 'lag', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id);
+        await p.stopServer(s.id);
+        Object.assign(after, { type: 'power_on', lag: 3 });
+        const from = fake.calls.length;
+        await p.startServer(s.id, fast);
+        // Read as off once the action was done, then twice more by the wait, then on.
+        expect(fake.calls.slice(from).map(asked).filter((x) => x === `GET /v2/droplets/${s.id}`)).toHaveLength(5);
+        for (const [call, type] of [['restartServer', 'reboot'], ['startServer', 'power_on']] as const) {
+            const d = await running(p, (await p.createServer({ name: `gone-${type}`, offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id);
+            if (call === 'startServer') await p.stopServer(d.id);
+            fake.state.actions.clear();
+            Object.assign(after, { type, lag: 0, gone: true });
+            await expect(p[call](d.id, fast)).rejects.toMatchObject({ name: 'NotFoundError', message: `digitalocean: droplet ${d.id} is gone` });
+            after.gone = false;
+        }
+    });
+
+    it('a restart is of a droplet that runs: one that is off is refused before anything is asked for, and stays off', async () => {
+        const { p, fake } = make();
+        const s = await running(p, (await p.createServer({ name: 'gpu-r', offer: 'gpu-4000adax1-20gb', region: 'tor1' })).id);
+        await p.stopServer(s.id);
+        const from = fake.calls.length;
+        await expect(p.restartServer(s.id)).rejects.toMatchObject({
+            name: 'ProviderError', code: 'not_running', message: `digitalocean: server ${s.id} is stopped: only a server that runs is restarted (start it)`,
+        });
+        expect(fake.calls.slice(from).map(asked)).toEqual([`GET /v2/droplets/${s.id}`]);
+        expect(fake.state.droplets.get(s.id).status).toBe('off');
+        await expect(p.restartServer('999999')).rejects.toMatchObject({ name: 'NotFoundError', message: 'digitalocean: no droplet 999999' });
+        // One that runs: read, rebooted, its action waited for, and read as on.
+        await p.startServer(s.id);
+        const again = fake.calls.length;
+        await p.restartServer(s.id);
+        expect(fake.calls.slice(again).map(asked)).toEqual([`GET /v2/droplets/${s.id}`, `POST /v2/droplets/${s.id}/actions`, 'GET /v2/actions/:id', 'GET /v2/actions/:id', `GET /v2/droplets/${s.id}`]);
+    });
+
     it('falls back to a hard power-off when the clean shutdown errors', async () => {
         const { p, fake } = make({ failShutdown: true });
         const s = await p.createServer({ name: 'gpu-3', offer: 'gpu-4000adax1-20gb', region: 'tor1' });
@@ -217,6 +383,42 @@ describe('DigitalOcean API facts', () => {
         expect(gone).toBeInstanceOf(NotFoundError);
         expect(gone.message).toBe(`digitalocean: droplet ${s.id} is gone`);
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/actions')).map((c) => c.body.type)).toEqual(['shutdown']);
+    });
+
+    it('`{ os, cuda }` is its NVIDIA image for the size, Ubuntu 24.04 only: the 8-GPU one for an x8 size; refused for another Ubuntu and on an AMD size, before anything is created', async () => {
+        const { p, fake } = make();
+        const image = { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 };
+        await p.createServer({ name: 'x1', offer: 'gpu-4000adax1-20gb', region: 'tor1', image });
+        await p.createServer({ name: 'x8', offer: 'gpu-h100x8-640gb', region: 'nyc2', image });
+        // Without cuda it is the plain Ubuntu, on a GPU size too.
+        await p.createServer({ name: 'plain', offer: 'gpu-4000adax1-20gb', region: 'tor1', image: { os: 'ubuntu24' } });
+        const creates = () => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/droplets');
+        expect(creates().map((c) => c.body.image)).toEqual(['gpu-h100x1-base', 'gpu-h100x8-base', 'ubuntu-24-04-x64']);
+        // No image, however it is said (a caller's null, from JSON or a config), is the default for the size: an AMD size's too.
+        for (const [offer, region, image] of [['gpu-4000adax1-20gb', 'tor1', 'gpu-h100x1-base'], ['gpu-mi300x1-192gb', 'atl1', 'gpu-amd-base']] as const) {
+            await p.deleteServer((await p.createServer({ name: 'none', offer, region, image: null as never })).id);
+            expect(creates().pop()?.body.image).toBe(image);
+        }
+        await expect(p.createServer({ name: 'jammy', offer: 'gpu-4000adax1-20gb', region: 'tor1', image: { os: 'ubuntu22', cuda: '12.8' } }))
+            .rejects.toMatchObject({ name: 'NotSupportedError', message: 'digitalocean: image "ubuntu22" with cuda (digitalocean has no GPU image of that Ubuntu) is not supported' });
+        await expect(p.createServer({ name: 'amd', offer: 'gpu-mi300x1-192gb', region: 'atl1', image }))
+            .rejects.toMatchObject({ name: 'NotSupportedError', message: 'digitalocean: image with cuda on gpu-mi300x1-192gb (an AMD GPU: its image, the default, has ROCm) is not supported' });
+        // An AMD size still boots an Ubuntu asked for without cuda.
+        await p.createServer({ name: 'amd-plain', offer: 'gpu-mi300x1-192gb', region: 'atl1', image: MACHINE_TYPES.UBUNTU_24 });
+        expect(creates().map((c) => c.body.image)).toEqual(['gpu-h100x1-base', 'gpu-h100x8-base', 'ubuntu-24-04-x64', 'gpu-h100x1-base', 'gpu-amd-base', 'ubuntu-24-04-x64']);
+        expect(DigitalOcean.cudaImages('gpu-4000adax1-20gb')).toEqual({ ubuntu24: 'gpu-h100x1-base' });
+        expect(DigitalOcean.cudaImages('gpu-h100x8-640gb')).toEqual({ ubuntu24: 'gpu-h100x8-base' });
+        expect(DigitalOcean.cudaImages('s-8vcpu-16gb')).toEqual({ ubuntu24: 'gpu-h100x1-base' });
+        expect(DigitalOcean.cudaImages('gpu-mi300x8-1536gb')).toEqual({});
+    });
+
+    it('a container named by the library\'s enums runs as Docker Hub\'s image for it, on the droplet\'s own OS image', async () => {
+        const { p, fake } = make();
+        const container = { image: { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 }, command: ['nvidia-smi'] };
+        await p.createServer({ name: 'c', offer: 'gpu-4000adax1-20gb', region: 'tor1', container });
+        const body = fake.calls.find((c) => c.method === 'POST' && c.path === '/v2/droplets')?.body;
+        expect(body.image).toBe('gpu-h100x1-base');
+        expect(body.user_data).toBe(containerBootScript({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', command: ['nvidia-smi'] }, { gpu: true }));
     });
 
     it('defaults 8-GPU NVIDIA sizes to the 8-GPU image', async () => {

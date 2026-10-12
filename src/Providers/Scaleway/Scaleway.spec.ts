@@ -16,10 +16,10 @@ import { sshKeyFingerprint } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
 import { FAKE_SCALEWAY_PROJECT, fakeScaleway, FakeScalewayOptions } from '../../testing/fakes/scaleway';
 import { SERVER_TYPES } from '../../testing/fakes/scalewayCatalog';
-import { followingRedirects, json, testPublicKey } from '../../testing/fakes/util';
+import { followingRedirects, json, testPublicKey, waitingClock } from '../../testing/fakes/util';
 import type { Offer } from '../../types';
 import { fileSystemMounts, MOUNT_TAG, mountedVolumeIds, toVolume } from './mappers';
-import { REGION_TYPES } from '../../constants';
+import { CUDA_TYPES, MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import { Scaleway } from './Scaleway';
 import type { ScalewayBlockVolume, ScalewayParams, ScalewayServer, ScalewayZone } from './types';
 
@@ -207,6 +207,40 @@ describe('Scaleway createServer', () => {
         await p.createServer({ name: 'label', offer: 'L4-1-24G', region: 'pl-waw-2', image: 'ubuntu_noble_gpu_os_12' });
         expect(creates(fake).map((c) => c.body.image)).toEqual([GPU_IMAGE, 'ubuntu_noble', 'ubuntu_noble_gpu_os_12']);
         expect([Scaleway.GPU_IMAGE, Scaleway.CPU_IMAGE]).toEqual([GPU_IMAGE, 'ubuntu_noble']);
+    });
+
+    it('an image by the library\'s names is the label that boots the type rented: `{ os, cuda }` the GPU OS image, on a GPU type; an Ubuntu alone the plain one, on a type without GPUs', async () => {
+        const { p, fake } = make();
+        const gpu = { name: 'gpu', offer: 'L4-1-24G', region: 'pl-waw-2' };
+        const cpu = { name: 'cpu', offer: 'DEV1-S', region: 'fr-par-1' };
+        await p.createServer({ ...gpu, image: { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 } });
+        await p.createServer({ ...gpu, image: { os: 'ubuntu22', cuda: '12.8' } });
+        await p.createServer({ ...cpu, image: { os: 'ubuntu24' } });
+        await p.createServer({ ...cpu, image: MACHINE_TYPES.UBUNTU_22 });
+        expect(creates(fake).map((c) => c.body.image)).toEqual([GPU_IMAGE, 'ubuntu_jammy_gpu_os_12', 'ubuntu_noble', 'ubuntu_jammy']);
+    });
+
+    it('the pair Scaleway cannot boot is refused before anything is created, with the one it can: a plain Ubuntu on a GPU type, a GPU OS image on a type without GPUs', async () => {
+        const { p, fake } = make();
+        const gpu = { name: 'gpu', offer: 'L4-1-24G', region: 'pl-waw-2' };
+        const cpu = { name: 'cpu', offer: 'DEV1-S', region: 'fr-par-1' };
+        const servers = fake.state.servers.size;
+        for (const image of [{ os: 'ubuntu24' }, MACHINE_TYPES.UBUNTU_24] as const) {
+            await expect(p.createServer({ ...gpu, image })).rejects.toMatchObject({
+                name: 'NotSupportedError', message: 'scaleway: image "ubuntu24" on L4-1-24G (a GPU type boots Scaleway\'s GPU OS images only: ask for it with cuda) is not supported',
+            });
+        }
+        await expect(p.createServer({ ...cpu, image: { os: 'ubuntu24', cuda: '12.8' } })).rejects.toMatchObject({
+            name: 'NotSupportedError', message: 'scaleway: image "ubuntu24" with cuda on DEV1-S (it has no GPU: Scaleway\'s GPU OS images boot its GPU types only) is not supported',
+        });
+        // It has no GPU OS image of Ubuntu 20.04.
+        await expect(p.createServer({ ...gpu, image: { os: 'ubuntu20', cuda: '12.8' } }))
+            .rejects.toMatchObject({ name: 'NotSupportedError', message: 'scaleway: image "ubuntu20" with cuda (scaleway has no GPU image of that Ubuntu) is not supported' });
+        expect(creates(fake)).toEqual([]);
+        // A label of Scaleway's own is sent as it is, and Scaleway refuses the pair itself.
+        await expect(p.createServer({ ...gpu, image: 'ubuntu_noble' })).rejects.toThrow(/ubuntu_noble is not compatible with L4-1-24G/);
+        await expect(p.createServer({ ...cpu, image: GPU_IMAGE })).rejects.toThrow(/ubuntu_noble_gpu_os_13_nvidia is not compatible with DEV1-S/);
+        expect(fake.state.servers.size).toBe(servers);
     });
 
     it('sends no root volume unless `diskGb` sizes it: Block Storage in bytes, a multiple of 512', async () => {
@@ -454,15 +488,142 @@ describe('Scaleway stop, start, restart', () => {
         await expect(p.stopServer('00000000-0000-4000-8000-0000000000aa')).rejects.toBeInstanceOf(NotFoundError);
     });
 
-    it('starts a stopped server with poweron, and leaves one that runs or starts alone', async () => {
+    it('starts a stopped server with poweron and waits until it runs; one that runs already is left alone', async () => {
         const { p, fake } = make();
         const s = await running(p);
         await p.stopServer(s.id);
+        const raw = () => fake.state.servers.get(s.id).state;
+        expect(raw()).toBe('stopped');
         await p.startServer(s.id);
-        expect(['pending', 'running']).toContain((await p.getServer(s.id))?.status);
+        // It runs when the start returns: nothing is left to wait for.
+        expect(raw()).toBe('running');
+        expect(actions(fake)).toEqual(['poweron', 'poweroff', 'poweron']);
+        const before = fake.calls.length;
         await p.startServer(s.id);
         expect(actions(fake)).toEqual(['poweron', 'poweroff', 'poweron']);
+        // Read once, to see that it runs.
+        expect(fake.calls.slice(before).map((c) => c.method)).toEqual(['GET']);
         expect((await p.waitUntilRunning(s.id, fast)).status).toBe('running');
+    });
+
+    it('a server that is starting already is not powered on again, and is waited for all the same', async () => {
+        const { p, fake } = make({ bootReads: 4 });
+        const s = await running(p);
+        await p.stopServer(s.id);
+        const [zone, id] = s.id.split('/');
+        await p.api.serverAction(zone as ScalewayZone, id, { action: 'poweron' });
+        expect(fake.state.servers.get(s.id).state).toBe('starting');
+        await p.startServer(s.id, fast);
+        expect(actions(fake)).toEqual(['poweron', 'poweroff', 'poweron']);
+        expect(fake.state.servers.get(s.id).state).toBe('running');
+    });
+
+    it('a start and a restart say what the server still is when it does not come up in ten minutes, or in the time given, read every 5 s or as often as told', async () => {
+        // A clock the waits advance: the minutes pass at once.
+        const clock = waitingClock();
+        try {
+            for (const [call, what] of [['startServer', 'start'], ['restartServer', 'restart']] as const) {
+                for (const [o, seconds, pauses] of [[undefined, 600, Array(120).fill(5000)], [{ timeoutMs: 30_000, intervalMs: 10_000 }, 30, Array(3).fill(10_000)]] as const) {
+                    const fake = fakeScaleway();
+                    const slept: number[] = [];
+                    const p = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep: async (ms) => { slept.push(ms); await clock.sleep(ms); } });
+                    const s = await running(p);
+                    if (call === 'startServer') await p.stopServer(s.id);
+                    // From here on it never finishes booting.
+                    fake.state.bootReads = 1_000_000;
+                    slept.length = 0;
+                    await expect(p[call](s.id, o)).rejects.toMatchObject({ name: 'ProviderError', code: 'timeout', message: `scaleway: timed out after ${seconds} s waiting for server ${s.id} to ${what}: starting` });
+                    expect(slept).toEqual(pauses);
+                }
+            }
+            // A stop is told the same way.
+            const fake = fakeScaleway({ stopReads: 1_000_000 });
+            const p = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep: clock.sleep });
+            const s = await running(p);
+            await expect(p.stopServer(s.id, { timeoutMs: 30_000 })).rejects.toMatchObject({ code: 'timeout', message: `scaleway: timed out after 30 s waiting for server ${s.id} to stop: stopping` });
+            // And a start that first waits for that stop to finish has one deadline for both.
+            await expect(p.startServer(s.id, { timeoutMs: 45_000 })).rejects.toMatchObject({ code: 'timeout', message: `scaleway: timed out after 45 s waiting for server ${s.id} to finish stopping: stopping` });
+        } finally {
+            clock.restore();
+        }
+    });
+
+    it('a start that first waits out a stop has one deadline for both, ten minutes or the time it is told: what is left of it to come up in, and the whole of it in its timeout', async () => {
+        for (const [o, seconds] of [[{ timeoutMs: 60_000, intervalMs: 5000 }, 60], [undefined, 600]] as const) {
+            const clock = waitingClock();
+            try {
+                const fake = fakeScaleway({ stopReads: 4 });
+                const p = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep: clock.sleep });
+                const s = await running(p);
+                const [zone, id] = s.id.split('/');
+                await p.api.serverAction(zone as ScalewayZone, id, { action: 'poweroff' });
+                // From here on it never finishes booting.
+                fake.state.bootReads = 1_000_000;
+                clock.slept.length = 0;
+                await expect(p.startServer(s.id, o)).rejects.toMatchObject({ code: 'timeout', message: `scaleway: timed out after ${seconds} s waiting for server ${s.id} to start: starting` });
+                // The stop's wait and the start's are that long together, not each.
+                expect(clock.slept.reduce((a, b) => a + b, 0)).toBe(seconds * 1000);
+                expect(actions(fake)).toEqual(['poweron', 'poweroff', 'poweron']);
+            } finally {
+                clock.restore();
+            }
+        }
+    });
+
+    it('a start of a server deleted while it finishes stopping is not found, and nothing is powered on; one that runs by then is left as it is', async () => {
+        const { p, fake } = make({ stopReads: 3 });
+        const s = await running(p);
+        const [zone, id] = s.id.split('/');
+        await p.api.serverAction(zone as ScalewayZone, id, { action: 'poweroff' });
+        fake.intercept((r) => r.method === 'GET' && r.path.endsWith(`/servers/${id}`), { times: 1, after: () => fake.state.servers.delete(s.id) });
+        await expect(p.startServer(s.id, fast)).rejects.toMatchObject({ name: 'NotFoundError', message: `scaleway: server ${s.id} disappeared while it was stopping` });
+        expect(actions(fake)).toEqual(['poweron', 'poweroff']);
+        // Stopping when the start was asked, running by the time it has stopped (another start got there first): nothing more to do.
+        const other = make({ stopReads: 3 });
+        const o = await running(other.p);
+        await other.p.api.serverAction(zone as ScalewayZone, o.id.split('/')[1], { action: 'poweroff' });
+        other.fake.intercept((r) => r.method === 'GET' && r.path.endsWith(`/servers/${o.id.split('/')[1]}`), { times: 1, after: () => Object.assign(other.fake.state.servers.get(o.id), { state: 'running' }) });
+        await expect(other.p.startServer(o.id, fast)).resolves.toBeUndefined();
+        expect(actions(other.fake)).toEqual(['poweron', 'poweroff']);
+    });
+
+    it('a restart Scaleway shows nothing of (the server reads as running throughout) is over on its fourth read; one it still reports as before for a read is waited for until it is down and up again', async () => {
+        const { p, fake } = make();
+        const s = await running(p);
+        const id = s.id.split('/')[1];
+        const reads = () => fake.calls.filter((c) => c.method === 'GET' && c.path.endsWith(`/servers/${id}`)).length;
+        // Accepted, and the state never leaves running.
+        fake.intercept((r) => r.body?.action === 'reboot', { times: 1, after: () => Object.assign(fake.state.servers.get(s.id), { state: 'running' }) });
+        let before = reads();
+        await p.restartServer(s.id, fast);
+        // Found once, then read four times.
+        expect(reads() - before).toBe(5);
+        // Accepted, still reported as running for one read, then as it boots.
+        fake.intercept((r) => r.body?.action === 'reboot', { times: 1, after: () => Object.assign(fake.state.servers.get(s.id), { state: 'running' }) });
+        let stale = 0;
+        fake.intercept((r) => r.method === 'GET' && r.path.endsWith(`/servers/${id}`), { after: () => { if (++stale === 2) Object.assign(fake.state.servers.get(s.id), { state: 'starting', bootLeft: 3 }); } });
+        before = reads();
+        await p.restartServer(s.id, fast);
+        expect(fake.state.servers.get(s.id).state).toBe('running');
+        // Found; read once as running (as before the reboot: not its end); then as starting, twice; then running.
+        expect(reads() - before).toBe(5);
+    });
+
+    it('a server that locks, or is deleted, while it starts or restarts did not', async () => {
+        for (const [call, action, did, doing] of [['startServer', 'poweron', 'start', 'starting'], ['restartServer', 'reboot', 'restart', 'restarting']] as const) {
+            for (const detail of ['locked for abuse', '']) {
+                const { p, fake } = make();
+                const s = await running(p);
+                if (call === 'startServer') await p.stopServer(s.id);
+                fake.intercept((r) => r.body?.action === action, { after: () => Object.assign(fake.state.servers.get(s.id), { state: 'locked', state_detail: detail }) });
+                await expect(p[call](s.id, fast)).rejects.toMatchObject({ name: 'ProviderError', message: `scaleway: server ${s.id} is locked (${detail || 'no detail'}): it did not ${did}` });
+            }
+            const { p, fake } = make();
+            const s = await running(p);
+            if (call === 'startServer') await p.stopServer(s.id);
+            fake.intercept((r) => r.body?.action === action, { after: () => fake.state.servers.delete(s.id) });
+            await expect(p[call](s.id, fast)).rejects.toMatchObject({ name: 'NotFoundError', message: `scaleway: server ${s.id} disappeared while it was ${doing}` });
+        }
     });
 
     it('starting after the GPU was released needs stock: a CapacityError, and the server stays stopped', async () => {
@@ -474,15 +635,23 @@ describe('Scaleway stop, start, restart', () => {
         expect((await p.getServer(s.id))?.status).toBe('stopped');
         fake.state.stock['pl-waw-2'] = { 'L4-1-24G': 'available' };
         await p.startServer(s.id);
+        expect(fake.state.servers.get(s.id).state).toBe('running');
         expect((await p.waitUntilRunning(s.id, fast)).status).toBe('running');
     });
 
-    it('restarts with the reboot action, which is not repeated on a transient failure', async () => {
+    it('restarts with the reboot action, which is not repeated on a transient failure, and waits until it runs again; a bare id names it as well', async () => {
         const { p, fake } = make();
         const s = await running(p);
+        const before = fake.calls.length;
         await p.restartServer(s.id);
         expect(actions(fake)).toEqual(['poweron', 'reboot']);
+        // It was read while it booted (starting), until it ran: it runs when the restart returns.
+        expect(fake.calls.slice(before).filter((c) => c.method === 'GET').length).toBeGreaterThan(1);
+        expect(fake.state.servers.get(s.id).state).toBe('running');
         expect((await p.waitUntilRunning(s.id, fast)).status).toBe('running');
+        await p.restartServer(s.id.split('/')[1], fast);
+        expect(actions(fake)).toEqual(['poweron', 'reboot', 'reboot']);
+        expect(fake.state.servers.get(s.id).state).toBe('running');
         await expect(p.restartServer('00000000-0000-4000-8000-0000000000aa')).rejects.toBeInstanceOf(NotFoundError);
     });
 
@@ -913,7 +1082,7 @@ describe('Scaleway configuration', () => {
         compute: { kind: 'vm', gpu: true, cpu: true, userData: true, liveAvailability: true },
         power: { stoppedBilling: 'storage' },
         restart: {},
-        sshKeys: { appliedAtBoot: true },
+        sshKeys: { atCreate: 'account', appliedAtBoot: true },
         images: { scope: 'region' },
         volumes: { block: { mount: 'device', size: 'fixed', minGb: 1 }, shared: { mount: 'path', size: 'fixed', minGb: 25, maxGb: 50000 } },
         imageCopy: {},
@@ -1229,6 +1398,13 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         expect((await p.listEndpoints()).map((x) => x.id)).toEqual([e.id]);
     });
 
+    it('an image by the library\'s names is Docker Hub\'s, never the Marketplace label an Instance boots by that name', async () => {
+        const { fake, p } = make();
+        const e = await p.createEndpoint({ name: 'ubuntu', container: { image: MACHINE_TYPES.UBUNTU_24, command: ['sleep', 'infinity'] }, ...fast });
+        expect(containerCalls(fake).pop()?.[2]).toMatchObject({ image: 'ubuntu:24.04' });
+        expect(e.image).toBe('ubuntu:24.04');
+    });
+
     it('defaults: the smallest size, the region of the first zone; a region by name, by zone, or by the library\'s enum', async () => {
         const { fake, p } = make({}, { zones: ['pl-waw-1', 'nl-ams-2'] });
         const body = () => fake.calls.filter((c) => c.method === 'POST' && /\/containers$/.test(c.path)).pop();
@@ -1263,6 +1439,7 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         const refused: Array<[Parameters<Scaleway['createEndpoint']>[0], RegExp | typeof NotSupportedError]> = [
             [{ name: 'x1', container: { ...WHOAMI, registryAuth: { username: 'u', password: 'p' } } }, NotSupportedError],
             [{ name: 'x1', container: WHOAMI, idleTimeoutSeconds: 60 }, NotSupportedError],
+            [{ name: 'x1', container: WHOAMI, minCudaVersion: '12.8' }, /^scaleway: createEndpoint option "minCudaVersion" \(a Serverless Container has no GPU\) is not supported$/],
             [{ name: 'X1', container: WHOAMI }, /2-34 lowercase letters/],
             [{ name: 'x', container: WHOAMI }, /2-34 lowercase letters/],
             [{ name: 'x1-', container: WHOAMI }, /2-34 lowercase letters/],

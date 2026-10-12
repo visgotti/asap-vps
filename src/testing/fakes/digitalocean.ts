@@ -62,6 +62,11 @@ const SIZES = [
  */
 export function fakeDigitalOcean(o: {
     token?: string, bootReads?: number, dropletLimit?: number, actionReads?: number, failShutdown?: boolean, keyLag?: number, releaseReads?: number,
+    /**
+     * A power action the droplet's state already answers (a power-on of one that is on, a power-off or shutdown of one
+     * that is off) is refused with a 422, as DigitalOcean's own Terraform provider and others handle it; not seen live.
+     */
+    strictPower?: boolean,
     /** The guest ignores a shutdown: its action completes (the command was issued), and the droplet stays on. */
     ignoreShutdown?: boolean,
     /** Reads before an imported custom image is available (or, for a URL with "corrupt" in it, deleted with an error). */
@@ -361,6 +366,9 @@ export function fakeDigitalOcean(o: {
             }
             const done = { power_off: 'off', shutdown: 'off', power_on: 'active', reboot: 'active' }[body.type as string];
             if (!done) return err(422, 'unprocessable_entity', `unsupported action ${body.type}`);
+            if (o.strictPower && body.type !== 'reboot' && d.status === done) {
+                return err(422, 'unprocessable_entity', `Droplet is already powered ${done === 'off' ? 'off' : 'on'}.`);
+            }
             const action = startAction(body.type, () => {
                 if (body.type === 'shutdown' && o.ignoreShutdown) return;
                 d.status = done;

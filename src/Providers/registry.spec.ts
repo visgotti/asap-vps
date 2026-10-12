@@ -7,7 +7,8 @@ import { supports } from '../capabilities';
 import { ComputeProvider } from '../Core/ComputeProvider';
 import { LambdaCloud } from './LambdaCloud/LambdaCloud';
 import { createProvider, isProviderId, PROVIDERS, providerInfo, providerParams, providersFromEnv, providersWith } from './registry';
-import type { Scaleway } from './Scaleway/Scaleway';
+import type { ProviderParamsOf } from './registry';
+import { Scaleway } from './Scaleway/Scaleway';
 
 describe('provider registry', () => {
     it('builds every registered provider by id, and each reports that id', () => {
@@ -32,6 +33,22 @@ describe('provider registry', () => {
         if (supports(any, 'power')) expect(any.capabilities.power.stoppedBilling).toBe('storage');
         expect(isProviderId('runpod')).toBe(true);
         expect(isProviderId('toString')).toBe(false);
+    });
+
+    it('takes each provider\'s own settings, typed by its id: Scaleway\'s Project, RunPod\'s cloud, Vast\'s floors; another provider\'s are not its', () => {
+        const scaleway = createProvider('scaleway', { apiKey: 'k', projectId: '11111111-1111-4111-8111-111111111111', zones: ['fr-par-2'] });
+        expect([scaleway.api.projectId, scaleway.api.zones]).toEqual(['11111111-1111-4111-8111-111111111111', ['fr-par-2']]);
+        expect(createProvider('runpod', { apiKey: 'k', cloud: 'COMMUNITY' }).cloud).toBe('COMMUNITY');
+        expect(createProvider('vast', { apiKey: 'k', verifiedOnly: false, minReliability: 0.5 })).toMatchObject({ verifiedOnly: false, minReliability: 0.5 });
+        expect(createProvider('lambda', { apiKey: 'k' }).apiKey).toBe('k');
+        // @ts-expect-error Lambda has no Project: that is Scaleway's setting.
+        createProvider('lambda', { apiKey: 'k', projectId: 'p' });
+        // @ts-expect-error RunPod's clouds are SECURE and COMMUNITY.
+        createProvider('runpod', { apiKey: 'k', cloud: 'PUBLIC' });
+        const settings: ProviderParamsOf<'scaleway'> = { apiKey: 'k', accessKey: 'SCW123' };
+        expect(createProvider('scaleway', settings)).toBeInstanceOf(Scaleway);
+        // A provider by a name only known at run time takes what every provider does.
+        expect(createProvider(String('scaleway'), { apiKey: 'k' }).apiKey).toBe('k');
     });
 
     it('finds the providers that have every capability asked for, from their descriptors', () => {

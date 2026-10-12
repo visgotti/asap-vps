@@ -48,7 +48,7 @@ await digitalOcean.stopServer(server.id);
 console.log((await digitalOcean.getServer(server.id))?.status);
 console.log("cost while stopped:", await digitalOcean.getServerCost(server.id)); // the run goes on
 
-await digitalOcean.startServer(server.id);
+await digitalOcean.startServer(server.id); // each returns once the droplet runs again
 await digitalOcean.restartServer(server.id);
 await digitalOcean.deleteServerAndWait(server.id);
 ```

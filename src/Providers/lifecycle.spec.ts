@@ -23,7 +23,7 @@ let current: FakeApi | undefined;
 
 function mockShell(o: SSHConnectOptions): NodeSSH {
     /** The server at the address, as of now: asked at each command, so a reboot shows. */
-    const machine = () => current?.machine?.(o.host);
+    const machine = () => current?.machine?.(o.host, o.port);
     const answer = (cmd: string): { stdout: string, code: number } => {
         if (cmd.includes('os-release')) return { stdout: 'NAME="Ubuntu"\nVERSION_ID="22.04"', code: 0 };
         if (cmd.includes('nvidia-smi')) return { stdout: 'GPU 0: NVIDIA RTX 4000 Ada Generation (UUID: GPU-0f1e2d3c)', code: 0 };
@@ -50,7 +50,7 @@ function mockShell(o: SSHConnectOptions): NodeSSH {
 /** A login, as sshd answers it: no server at the address refuses the connection; a key the server does not authorize is refused. */
 function connect(o: SSHConnectOptions): NodeSSH {
     if (current?.machine) {
-        const m = current.machine(o.host);
+        const m = current.machine(o.host, o.port);
         if (!m) throw new Error(`connect ECONNREFUSED ${o.host}:${o.port ?? 22}`);
         const key = o.privateKey ? sshKeyFingerprint(toOpenSSHPublicKey(createPublicKey(o.privateKey))) : undefined;
         if (!key || !m.keys.some((k) => sshKeyFingerprint(k) === key)) throw new Error('All configured authentication methods failed');

@@ -2,11 +2,15 @@
 // instance as a server, a filesystem as a volume, an account key as a key, its
 // status words and its billing. Pure functions of the raw records, typed by LambdaTypes.
 
-import { canonicalGpu, gpuName, sshKeyFingerprint } from '../../Core/utils';
+import { MACHINE_TYPES } from '../../constants';
+import type { EnumTranslations } from '../../Core/ComputeProvider';
+import { canonicalGpu, gpuName, placed, sshKeyFingerprint } from '../../Core/utils';
 import type { Billing, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerStatus, Volume } from '../../types';
 import type { LambdaFilesystem, LambdaInstance, LambdaInstanceStatus, LambdaInstanceTypes, LambdaSSHKeyData } from './types';
 
 export const LAMBDA_ID = 'lambda';
+/** Whom Lambda's images log in as: a sudoer, not root. */
+export const LAMBDA_SSH_USER = 'ubuntu';
 
 /**
  * The createServer options Lambda cannot honor: a container's (env, command,
@@ -14,6 +18,38 @@ export const LAMBDA_ID = 'lambda';
  * instance type). Left out of its CreateServerOptions, refused at run time.
  */
 export const LAMBDA_REFUSED = ['env', 'command', 'ports', 'registryAuth', 'volume', 'diskGb'] as const satisfies readonly RefusableOption[];
+
+/**
+ * The library's enums by Lambda's names, its image families (the newest image
+ * of each is booted): plain Ubuntu, and with `cuda` Lambda Stack, its image
+ * with the NVIDIA driver, CUDA and the frameworks. It has none of Ubuntu
+ * 20.04 (GET /api/v1/images, 2026-10-11).
+ */
+export const LAMBDA_ENUMS: EnumTranslations = Object.freeze({
+    machines: {
+        [MACHINE_TYPES.UBUNTU_24]: 'ubuntu-24-04',
+        [MACHINE_TYPES.UBUNTU_22]: 'ubuntu-22-04',
+    },
+    cudaMachines: {
+        [MACHINE_TYPES.UBUNTU_24]: 'lambda-stack-24-04',
+        [MACHINE_TYPES.UBUNTU_22]: 'lambda-stack-22-04',
+    },
+});
+
+/** Countries as Lambda's region descriptions name them ('Virginia, USA', 'India'), by their ISO code. */
+const COUNTRY_NAMES: Readonly<Record<string, string>> = Object.freeze({
+    USA: 'US', 'United States': 'US', Canada: 'CA', India: 'IN', Japan: 'JP', Germany: 'DE', France: 'FR', 'United Kingdom': 'GB', Israel: 'IL', Australia: 'AU',
+});
+
+/**
+ * The country a region is in: the one its description ends with ('Virginia,
+ * USA', 'India': seen 2026-10-12), else the United States for a `us-` code;
+ * undefined for a country this does not know by name.
+ */
+export function countryOf(region: { name?: string, description?: string } | null | undefined): string | undefined {
+    const named = COUNTRY_NAMES[(region?.description ?? '').split(',').pop()!.trim()];
+    return named ?? (region?.name?.startsWith('us-') ? 'US' : undefined);
+}
 
 /** Where a launch can mount a filesystem (spec: RequestedFilesystemMountEntry.mount_point). */
 export const LAMBDA_MOUNT_PATH = /^(\/home|\/lambda\/nfs|\/data)[/a-zA-Z0-9-]*$/;
@@ -45,6 +81,7 @@ export function toOffer(t: LambdaInstanceTypes[string]): Offer<LambdaInstanceTyp
         pricePerHour: it.price_cents_per_hour / 100,
         billing: LAMBDA_BILLING,
         regions: (t.regions_with_capacity_available ?? []).map((r) => r.name),
+        locations: (t.regions_with_capacity_available ?? []).map((r) => placed(r.name, countryOf(r))),
         vcpus: it.specs.vcpus,
         memoryGb: it.specs.memory_gib,
         diskGb: it.specs.storage_gib,
@@ -64,10 +101,11 @@ export function toServer(i: LambdaInstance): Server<LambdaInstance> {
         gpu: it ? (canonicalGpu(it.gpu_description) ?? canonicalGpu(it.name))?.name ?? it.gpu_description : undefined,
         gpuCount: it?.specs?.gpus,
         region: i.region?.name,
+        ...(countryOf(i.region) ? { country: countryOf(i.region) } : {}),
         ip: i.ip || undefined,
         privateIp: i.private_ip || undefined,
         // Lambda Stack's login is ubuntu, not root.
-        ...(i.ip ? { ssh: { host: i.ip, port: 22, username: 'ubuntu' } } : {}),
+        ...(i.ip ? { ssh: { host: i.ip, port: 22, username: LAMBDA_SSH_USER } } : {}),
         pricePerHour: it ? it.price_cents_per_hour / 100 : undefined,
         // Billed from its first passed health check (Lambda has no stop).
         billingStartedAt: i.first_healthy ? Date.parse(i.first_healthy) || undefined : undefined,

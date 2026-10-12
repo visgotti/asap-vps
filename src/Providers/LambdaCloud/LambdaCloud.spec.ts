@@ -5,9 +5,11 @@
 // each refused before anything is sent; and filesystems (its volumes): no size,
 // mounted at launch under /home, /lambda/nfs or /data, never deleted in use.
 
+import { MACHINE_TYPES } from '../../constants';
+import { authorizeKeysScript } from '../../Core/utils';
 import { AuthError, CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError, QuotaError } from '../../errors';
 import { fakeLambda } from '../../testing/fakes/lambda';
-import { json } from '../../testing/fakes/util';
+import { json, testPublicKey } from '../../testing/fakes/util';
 import { LambdaCloud } from './LambdaCloud';
 
 const noSleep = async () => {};
@@ -50,6 +52,62 @@ describe('LambdaCloud', () => {
         expect(fake.calls.filter((c) => c.path === '/api/v1/instance-operations/launch')).toHaveLength(0);
     });
 
+    it('an image by the library\'s names is the newest of Lambda\'s family for it: plain Ubuntu, or with cuda Lambda Stack; it has none of Ubuntu 20.04', async () => {
+        const { p, fake } = make();
+        const launch = { name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] };
+        const images: Array<[Parameters<LambdaCloud['createServer']>[0]['image'], string]> = [
+            [MACHINE_TYPES.UBUNTU_24, 'ubuntu-24-04'], [MACHINE_TYPES.UBUNTU_22, 'ubuntu-22-04'], [{ os: 'ubuntu24' }, 'ubuntu-24-04'],
+            [{ os: 'ubuntu24', cuda: '12.8' }, 'lambda-stack-24-04'], [{ os: MACHINE_TYPES.UBUNTU_22, cuda: '13.0' }, 'lambda-stack-22-04'],
+        ];
+        for (const [image] of images) await p.createServer({ ...launch, image });
+        const launches = () => fake.calls.filter((c) => c.path === '/api/v1/instance-operations/launch');
+        expect(launches().map((c) => c.body.image)).toEqual(images.map(([, family]) => ({ family })));
+        await expect(p.createServer({ ...launch, image: MACHINE_TYPES.UBUNTU_20 }))
+            .rejects.toMatchObject({ name: 'NotSupportedError', message: 'lambda: image "ubuntu20" (MACHINE_TYPES has no lambda image by that name) is not supported' });
+        await expect(p.createServer({ ...launch, image: { os: 'ubuntu20', cuda: '12.8' } }))
+            .rejects.toMatchObject({ name: 'NotSupportedError', message: 'lambda: image "ubuntu20" with cuda (lambda has no GPU image of that Ubuntu) is not supported' });
+        expect(launches()).toHaveLength(images.length);
+    });
+
+    it('a restart returns once the instance runs again: on its fourth read as active where Lambda shows no reboot, and through whatever it reads as while it reboots', async () => {
+        const waits: number[] = [];
+        const fake = fakeLambda();
+        const p = new LambdaCloud({ apiKey: 'lambda-test', fetchImpl: fake.fetchImpl, sleep: async (ms) => { waits.push(ms); } });
+        const launch = { name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] };
+        const { id } = await p.waitUntilRunning((await p.createServer(launch)).id, fast);
+        const since = (from: number) => fake.calls.slice(from).map((c) => `${c.method} ${c.path}`);
+        let from = fake.calls.length;
+        waits.length = 0;
+        await p.restartServer(id);
+        // Never seen otherwise than active, it is given three pauses to show its reboot, then taken to be back.
+        expect(since(from)).toEqual(['POST /api/v1/instance-operations/restart', ...Array(4).fill(`GET /api/v1/instances/${id}`)]);
+        expect(waits).toEqual([10_000, 10_000, 10_000]);
+        expect(fake.calls[from].body).toEqual({ instance_ids: [id] });
+        // Its health checks fail while it reboots (unhealthy reads as an error), and it boots again: neither ends the wait.
+        const slept: number[] = [];
+        const words = ['unhealthy', 'unhealthy', 'booting'];
+        const rebooting = new LambdaCloud({ apiKey: 'lambda-test', sleep: async (ms) => { slept.push(ms); }, fetchImpl: answering(fake, (method, path) => {
+            const status = method === 'GET' && path === `/api/v1/instances/${id}` ? words.shift() : undefined;
+            return status ? json(200, { data: { id, name: 'a', status, ssh_key_names: ['laptop'], region: { name: 'us-east-1', description: '' } } }) : undefined;
+        }) });
+        from = fake.calls.length;
+        await rebooting.restartServer(id, { intervalMs: 7, timeoutMs: 60_000 });
+        expect(words).toEqual([]);
+        expect(slept).toEqual([7, 7, 7]);
+        expect(since(from)).toEqual(['POST /api/v1/instance-operations/restart', `GET /api/v1/instances/${id}`]);
+        // Terminated meanwhile, it did not restart; one Lambda does not have is refused by the restart itself.
+        const ending = new LambdaCloud({ apiKey: 'lambda-test', sleep: noSleep, fetchImpl: answering(fake, (method, path) => (method === 'GET' && path === `/api/v1/instances/${id}`
+            ? json(200, { data: { id, name: 'a', status: 'terminating', ssh_key_names: ['laptop'], region: { name: 'us-east-1', description: '' } } }) : undefined)) });
+        await expect(ending.restartServer(id, fast)).rejects.toMatchObject({ name: 'ProviderError', message: `lambda: server ${id} is terminating (terminating): it did not restart` });
+        await expect(p.restartServer('0123456789abcdef0123456789abcdef', fast)).rejects.toMatchObject({ name: 'NotFoundError' });
+        // A wait that is no number of milliseconds is refused before Lambda is asked for anything.
+        const asked = fake.calls.length;
+        await expect(p.restartServer(id, { timeoutMs: NaN })).rejects.toThrow('asap-vps: bad timeoutMs NaN: use a number of milliseconds, 0 or more');
+        expect(fake.calls).toHaveLength(asked);
+        // With no time to wait it has not been seen to restart: the timeout says what it read.
+        await expect(rebooting.restartServer(id, { intervalMs: 0, timeoutMs: 0 })).rejects.toMatchObject({ code: 'timeout', message: `lambda: timed out after 0 s waiting for server ${id}: running (active)` });
+    });
+
     it('an image is an id when the whole of it is 32 hex digits or a UUID, and a family otherwise', async () => {
         const { p, fake } = make();
         const hex = '0123456789abcdef0123456789abcdef';
@@ -83,7 +141,7 @@ describe('LambdaCloud', () => {
         const s = await p.createServer({ name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] });
         const id = [...fake.state.instances.keys()].pop()!;
         expect(s).toEqual({
-            provider: 'lambda', id, name: 'a', status: 'pending', providerStatus: 'booting', offerId: 'gpu_1x_a10', region: 'us-east-1', billing: LambdaCloud.BILLING,
+            provider: 'lambda', id, name: 'a', status: 'pending', providerStatus: 'booting', offerId: 'gpu_1x_a10', region: 'us-east-1', country: 'US', billing: LambdaCloud.BILLING,
             raw: { id, name: 'a', status: 'booting', ssh_key_names: ['laptop'], region: { name: 'us-east-1', description: '' } },
         });
     });
@@ -188,16 +246,38 @@ describe('LambdaCloud launch limits', () => {
     };
     const launches = (fake: ReturnType<typeof fakeLambda>) => fake.calls.filter((c) => c.method === 'POST' && c.path === '/api/v1/instance-operations/launch');
 
-    it('takes exactly one SSH key, and refuses a second before asking Lambda', async () => {
+    it('every key named logs in: Lambda\'s launch takes one, the first, and cloud-init adds the others for the same login at the first boot', async () => {
         const { p, fake } = make();
         const [key] = await p.listSSHKeys();
-        const second = await p.addSSHKey('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtestsecondkeyonlyAAAAAAAAAAAAAAAAAAAAAAAAAAA two@test', 'second');
-        await expect(p.createServer({ name: 'two-keys', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: [key.id, second.id] }))
-            .rejects.toBeInstanceOf(NotSupportedError);
-        await expect(p.createServer({ name: 'two-keys', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: [key.id, second.id] }))
-            .rejects.toThrow('more than one SSH key at launch is not supported');
+        const [second, third] = [await p.addSSHKey(testPublicKey('two'), 'second'), await p.addSSHKey(testPublicKey('three'), 'third')];
+        const launch = { offer: 'gpu_1x_a10', region: 'us-east-1' };
+        const one = await p.createServer({ name: 'one-key', ...launch, sshKeyIds: [key.id] });
+        // One key: named at the launch, and no user data for it.
+        expect(launches(fake).pop()?.body).toMatchObject({ ssh_key_names: ['laptop'] });
+        expect(launches(fake).pop()?.body.user_data).toBeUndefined();
+        const three = await p.createServer({ name: 'three-keys', ...launch, sshKeyIds: [second.id, key.id, third.id] });
+        const body = launches(fake).pop()?.body;
+        expect(body.ssh_key_names).toEqual(['second']);
+        expect(body.user_data).toBe(`#!/bin/sh\n${authorizeKeysScript([key.publicKey, third.publicKey], 'ubuntu')}`);
+        // Each instance's sshd takes the keys it was launched with, and no other.
+        const taken = async (id: string) => fake.machine!((await p.waitUntilRunning(id, fast)).ip!)!.keys;
+        expect(await taken(one.id)).toEqual([key.publicKey]);
+        expect(await p.deleteServerAndWait(one.id, fast)).toBe(true);
+        expect(await taken(three.id)).toEqual([second.publicKey, key.publicKey, third.publicKey]);
+        // Beside user data of the caller's own, which still runs.
+        await p.createServer({ name: 'with-script', ...launch, sshKeyIds: [key.id, second.id], userData: '#!/bin/bash\necho mine\n' });
+        const doc = launches(fake).pop()?.body.user_data as string;
+        expect(doc).toMatch(/^Content-Type: multipart\/mixed/);
+        expect(doc.indexOf('echo mine')).toBeLessThan(doc.indexOf('asap_vps_keys \'ubuntu\''));
+    });
+
+    it('needs a key: its launch takes none without one, refused before Lambda is asked', async () => {
+        const { p, fake } = make();
+        for (const sshKeyIds of [undefined, []]) {
+            await expect(p.createServer({ name: 'no-key', offer: 'gpu_1x_a10', region: 'us-east-1', ...(sshKeyIds ? { sshKeyIds } : {}) }))
+                .rejects.toMatchObject({ name: 'ProviderError', message: 'lambda: Lambda requires an SSH key (sshKeyIds): its launch takes exactly one, by name' });
+        }
         expect(launches(fake)).toHaveLength(0);
-        await expect(p.createServer({ name: 'one-key', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: [key.id] })).resolves.toMatchObject({ name: 'one-key' });
     });
 
     it('refuses a name over 64 characters and a tag key Lambda rejects; accepts its own format', async () => {

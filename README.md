@@ -11,7 +11,7 @@ Rent servers on any cloud through one set of typed primitives: create a VPS or a
 npm install asap-vps    # Node 18 or newer
 ```
 
-[Providers](#providers) · [Quick start](#quick-start) · [Capabilities](#capabilities) · [Containers](#containers) · [Serverless](#serverless-endpoints) · [Servers](#servers) · [Cost](#cost) · [Setup](#setting-a-server-up) · [Images](#images) · [Volumes](#volumes) · [Errors](#errors) · [Platform notes](#platform-notes) · [Development](#development) · [Tests](#tests)
+[Providers](#providers) · [Quick start](#quick-start) · [Capabilities](#capabilities) · [Containers](#containers) · [Serverless](#serverless-endpoints) · [Servers](#servers) · [Cost](#cost) · [SSH](#logging-in-and-working-on-a-server) · [Setup](#setting-a-server-up) · [Images](#images) · [Volumes](#volumes) · [Errors](#errors) · [Platform notes](#platform-notes) · [Development](#development) · [Tests](#tests)
 
 ## Providers
 
@@ -28,7 +28,7 @@ npm install asap-vps    # Node 18 or newer
 A VPS on DigitalOcean, logged into over SSH:
 
 ```typescript
-import { DigitalOcean, MACHINE_TYPES, REGION_TYPES, SSHService } from "asap-vps";
+import { DigitalOcean, MACHINE_TYPES, REGION_TYPES, RemoteMachine, SSHService } from "asap-vps";
 
 const digitalOcean = new DigitalOcean(process.env.DIGITAL_OCEAN_API_KEY!);
 const { publicKey, privateKey } = await SSHService.createKeys();
@@ -43,37 +43,42 @@ const server = await digitalOcean.createServer({
 });
 const running = await digitalOcean.waitUntilRunning(server.id);
 
-// every provider says where its sshd is and whom to log in as (root, or ubuntu on Lambda)
-const ssh = await SSHService.connect({ ...running.ssh!, privateKey });
+// every provider's server says where its sshd is and whom to log in as: one login, whatever rented it
+const machine = await RemoteMachine.connect(running, { privateKey });
+console.log((await machine.run("uname -a")).stdout);
+await machine.close();
 
 await digitalOcean.deleteServerAndWait(server.id); // deletes, then checks until it is gone
 await digitalOcean.deleteSSHKey(key.id);
 ```
 
 - `SSHService.createKeys()` makes an RSA 2048 pair in memory (PEM, as `ssh-keygen -m PEM -t rsa -b 2048` does). Nothing is written to disk unless its third argument, `deleteAfter`, is false.
-- `SSHService.connect(ip, privateKey)`, the positional form, logs in as root on port 22.
+- What a `RemoteMachine` does once you are in is under [Logging in and working on a server](#logging-in-and-working-on-a-server).
+- `SSHService.connect(ip, privateKey)`, the positional form, still logs in as root on port 22 and returns the bare session (node-ssh's).
 
 A GPU server is the same call with a GPU offer:
 
 ```typescript
-import { RunPod } from "asap-vps";
+import { CUDA_TYPES, MACHINE_TYPES, RunPod } from "asap-vps";
 
 const runpod = new RunPod(process.env.RUNPOD_API_KEY!);
+const cuda = CUDA_TYPES.CUDA_12_8;
 
 // what can be rented right now, cheapest first, on hosts whose driver runs the image's CUDA
-const [offer] = await runpod.listOffers({ minVramGb: 24, maxPricePerHour: 1, minCudaVersion: "12.8" });
+const [offer] = await runpod.listOffers({ minVramGb: 24, maxPricePerHour: 1, minCudaVersion: cuda });
 
 // the offer brings its region, GPU count and (interruptible) bid: nothing to repeat
 const server = await runpod.createServer({
   name: "my-gpu",
   offer,
-  image: "nvidia/cuda:12.8.1-base-ubuntu24.04",
+  // the library's names, the same on every provider: here NVIDIA's CUDA 12.8 image of Ubuntu 24.04,
+  // on a host whose driver runs it (RunPod places the pod by it; Vast checks the machine before renting it)
+  image: { os: MACHINE_TYPES.UBUNTU_24, cuda },
   command: ["sleep", "infinity"],
-  minCudaVersion: "12.8", // RunPod places the pod by it; Vast checks the machine before renting it
 });
 await runpod.waitUntilRunning(server.id);
-await runpod.stopServer(server.id);
-await runpod.startServer(server.id);
+await runpod.stopServer(server.id);  // returns once it is stopped
+await runpod.startServer(server.id); // returns once it runs again
 await runpod.deleteServerAndWait(server.id);
 ```
 
@@ -113,18 +118,18 @@ await lambda.waitUntilRunning(server.id);
 **Vast.ai**: every offer is one machine, a volume lives on a machine, and an image is a snapshot pushed to your registry that boots on any machine:
 
 ```typescript
-import { VastAI } from "asap-vps";
+import { CUDA_TYPES, MACHINE_TYPES, VastAI } from "asap-vps";
 
 const vast = new VastAI({
   apiKey: process.env.VAST_API_KEY!,
   snapshots: { server: "ghcr.io", repository: "acme/snapshots", username: "bot", password: process.env.GHCR_TOKEN! },
 });
-const [offer] = await vast.listOffers({ minVramGb: 16, minCudaVersion: "12.2" });   // each offer is one machine
+const [offer] = await vast.listOffers({ minVramGb: 16, minCudaVersion: CUDA_TYPES.CUDA_12_8 }); // each offer is one machine
 const machine = offer.regions.find((r) => r.startsWith("machine:"))!;
 
 const volume = await vast.createVolume({ name: "weights_v1", region: machine, sizeGb: 50 }); // lives on that machine
 const server = await vast.createServer({
-  name: "trainer", offer, image: "nvidia/cuda:12.8.1-base-ubuntu24.04", command: ["sleep", "infinity"], mounts: [{ volume, path: "/models" }],
+  name: "trainer", offer, image: { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 }, command: ["sleep", "infinity"], mounts: [{ volume, path: "/models" }],
 });
 await vast.waitUntilRunning(server.id);
 const image = await vast.createImage(server.id, { name: "trained-v1" });            // ghcr.io/acme/snapshots:trained-v1
@@ -171,10 +176,11 @@ lambda.createVolume({ name: "models", region: "us-east-1", sizeGb: 50 }); // com
 ```typescript
 DigitalOcean.capabilities;
 // { compute: { kind: 'vm', gpu: true, cpu: true, userData: true, liveAvailability: true },
-//   power: { stoppedBilling: 'full' }, restart: {}, sshKeys: { appliedAtBoot: false },
+//   power: { stoppedBilling: 'full' }, restart: {}, sshKeys: { atCreate: 'chosen', appliedAtBoot: false },
 //   images: { scope: 'region' }, imageCopy: {},
 //   imageImport: { formats: ['raw', 'qcow2', 'vhdx', 'vdi', 'vmdk'], compressions: ['gzip', 'bzip2'], maxGb: 100 },
-//   volumes: { block: { mount: 'auto', size: 'fixed', minGb: 1, maxGb: 16384 } }, volumeAttach: {} }
+//   volumes: { block: { mount: 'auto', size: 'fixed', minGb: 1, maxGb: 16384 }, shared: { mount: 'path', size: 'fixed', minGb: 50, maxGb: 32768 } },
+//   volumeAttach: {} }
 ```
 
 Code that takes any provider asks first, and is typed by the answer:
@@ -251,9 +257,13 @@ await scaleway.listServers({ kind: "gpu" });
 | Option | What it does |
 |---|---|
 | `listOffers(query?)` | What can be rented now, cheapest first: GPUs and VRAM per GPU, price per hour, regions with stock. A query means the same on every provider. |
+| `countries` | Only offers with stock in those countries (`COUNTRY_TYPES`, or any ISO 3166-1 alpha-2 code). See [Countries](#countries). |
 | `minCudaVersion` | Only hosts whose driver runs that CUDA version (container providers, whose offers say `cudaVersion`). A VM runs its image's driver, so VM offers aren't filtered. |
 | `offer` | An offer from `listOffers`, or its id. `gpuCount` defaults to the offer's; only RunPod takes another. |
-| `region`, `image` | The provider's own names, or `REGION_TYPES` / `MACHINE_TYPES`. A member a provider has no name for is refused. `image` defaults to the provider's GPU image, or plain Ubuntu. |
+| `region` | The provider's own name, or a `REGION_TYPES` member. A member a provider has no name for is refused. |
+| `image` | The provider's own name, a `MACHINE_TYPES` member, or `{ os, cuda }`. See [Images by the library's names](#images-by-the-librarys-names). Default: the provider's GPU image, or plain Ubuntu. |
+| `sshKeyIds` | The account's keys that log in to the server. See [SSH keys](#ssh-keys). |
+| `ports` | A container's ports, each `<port>/<tcp\|udp\|http>`. See [Ports](#ports). |
 | `providerOptions` | Extra fields for the platform's own create request, typed per provider. |
 | `registryAuth` | The login for a private image: `{ username, password, server? }`. RunPod stores it once and reuses it. On a VM it goes inside `container`. |
 | `container`, `mounts` | See [Containers](#containers) and [Volumes](#volumes). |
@@ -261,6 +271,79 @@ await scaleway.listServers({ kind: "gpu" });
 - An option a provider cannot honor is refused (`NotSupportedError`) before anything is rented, never dropped.
 - The other calls: `getServer` (null when missing), `listServers({ kind })`, `deleteServer` (idempotent), `waitForServer`, `waitUntilRunning`, `deleteServerAndWait`, `getServerCost`.
 - Every record carries the platform's own as `raw`, typed per provider: `(await digitalOcean.getServer(id))?.raw` is a `DigitalOceanDropletData`.
+
+### Countries
+
+Every provider names its places its own way (`tor1`, `fr-par-2`, `us-east-1`, `EU-RO-1`, `Texas, US`). Countries are the same everywhere:
+
+- `listOffers({ countries: [COUNTRY_TYPES.US, COUNTRY_TYPES.CA] })` asks the same of all five providers.
+- Each offer returned has its `regions` narrowed to the ones in those countries, so it brings a region there to `createServer`.
+- Each offer carries `locations`: its regions with the country each is in. A server carries its `country`.
+- `COUNTRY_TYPES` lists the countries the providers have machines in. Any other ISO code is taken (Vast is a marketplace).
+- A value that is no ISO code is refused, not read as nowhere.
+
+### Images by the library's names
+
+`image` by the library's names is the same call on every provider:
+
+- A `MACHINE_TYPES` member is that Ubuntu.
+- `{ os, cuda }` (a `CUDA_TYPES` member) is that Ubuntu for a machine that runs CUDA software.
+- A provider's own name still passes as it is (a slug, an image id, a registry reference, an image from `listImages`): that is what an image of your own needs.
+- The same names work in `container.image` and in an endpoint's.
+
+| `image` | RunPod, Vast, and any `container` | DigitalOcean | Scaleway | Lambda |
+|---|---|---|---|---|
+| `MACHINE_TYPES.UBUNTU_24` | `ubuntu:24.04` | `ubuntu-24-04-x64` | `ubuntu_noble` (types without GPUs) | `ubuntu-24-04` |
+| `{ os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 }` | `nvidia/cuda:12.8.2-base-ubuntu24.04` | `gpu-h100x1-base` (`gpu-h100x8-base` on an x8 size) | `ubuntu_noble_gpu_os_13_nvidia` (GPU types) | `lambda-stack-24-04` |
+
+- **A container** gets NVIDIA's `base` image of that CUDA version's newest patch.
+  - `minCudaVersion` defaults to the version, so it lands only on a host whose driver runs it (a pod, a Vast instance, a RunPod endpoint's GPU workers).
+  - Given no command it runs `sleep infinity`, so it stays up as a VM does. The images' own command, a shell, exits at once.
+- **A VM** gets the provider's GPU image of that Ubuntu: the one with the NVIDIA driver.
+  - What else it carries is the provider's: DigitalOcean's has the CUDA toolkit, Lambda Stack has CUDA and the frameworks, Scaleway's GPU OS has Docker with NVIDIA's runtime.
+  - The CUDA version asked for picks nothing there and is not checked: each provider's image has the driver it has.
+- **What no image exists for** is refused with `NotSupportedError` before anything is sent:
+  - A CUDA version NVIDIA does not publish for that Ubuntu (CUDA 13 on 20.04, CUDA 12.4 on 24.04).
+  - An Ubuntu the provider has no image of. DigitalOcean's NVIDIA image is 24.04 only, and it has none for an AMD size; Scaleway and Lambda have 22.04 and 24.04.
+  - On Scaleway, the pair it cannot boot: its plain Ubuntu boots only types without GPUs, its GPU OS only GPU types.
+- A spec with a typo in it is a `ProviderError` that lists the members.
+
+### SSH keys
+
+`sshKeyIds` names the account's keys that log in to the server, by id (or name, fingerprint or public key). It means the same on every provider:
+
+- Each key named logs in, at the endpoint the running server reports (`server.ssh`: host, port and user).
+- A key the account does not hold is refused before anything is rented.
+- How the keys get in is the provider's business: see [Logging in and working on a server](#logging-in-and-working-on-a-server).
+- The one thing that differs is said in `capabilities.sshKeys.atCreate`:
+  - `'chosen'`: exactly the keys named (DigitalOcean, Lambda, RunPod, Vast).
+  - `'account'`: every key of the Project logs in besides, whatever is named (Scaleway).
+
+### Ports
+
+A container's `ports` are read the same way on every provider:
+
+- Each is `<port>/<tcp|udp|http>`. A bare port is tcp, and either case is taken.
+- The port is 1 to 65535. Anything else is refused before anything is rented.
+- `http` is RunPod's proxied port, and plain TCP elsewhere. RunPod takes no `udp`.
+
+### Stop, start and restart
+
+`stopServer(id, o?)`, `startServer(id, o?)` and `restartServer(id, o?)` wait, the same on every provider that has them.
+
+- `o` is `{ timeoutMs?, intervalMs? }`. Without it, each provider waits by its own default (10 to 15 minutes).
+- A value that is no number of milliseconds from 0 up is refused before the platform is asked for anything.
+- A wait that runs out throws a `ProviderError` with code `timeout`, saying what the server still was and how long the wait was.
+- A server the provider does not have is a `NotFoundError`.
+
+| Call | Returns once | Notes |
+|---|---|---|
+| `stopServer` | the server is stopped | At once when it already is. |
+| `startServer` | the server runs | One that runs already is left as it is. A VM's public address is still `waitUntilRunning`'s to wait for. No stock to come back to is a `CapacityError`, and it stays stopped. |
+| `restartServer` | the server was seen not to run, and runs again | A stopped server is refused (start it). One that errors, stops or is deleted instead of coming back is thrown at once. |
+
+- Where the status never shows the reboot (a Lambda instance reads as active throughout), a restart returns after the server has read as running four times in a row: thirty seconds at the default pace.
+- A status can lag a reboot by longer. When it matters that the machine really booted again, ask the machine (its boot id over SSH, a mark in its log).
 
 ## Cost
 
@@ -289,9 +372,95 @@ const job = estimateCost(offer.pricePerHour, 0, 90_000, offer.billing); // bille
 
 Estimates cover the server's rate only. Disks, bandwidth and addresses bill on top, and the invoice is the truth.
 
+## Logging in and working on a server
+
+Every provider's servers are logged in to the same way, a VM or a container:
+
+1. Create the server with `sshKeyIds`.
+2. Wait until it runs.
+3. Hand it to `RemoteMachine.connect` with the private key. Where its sshd is, on which port, and whom to log in as come from the server itself.
+
+```typescript
+import { CUDA_TYPES, MACHINE_TYPES, RemoteMachine, RunPod, SSHService } from "asap-vps";
+
+const runpod = new RunPod(process.env.RUNPOD_API_KEY!);
+const { publicKey, privateKey } = await SSHService.createKeys();
+const key = await runpod.addSSHKey(publicKey, "laptop");
+const [offer] = await runpod.listOffers({ gpus: ["RTX 4090"] });
+const server = await runpod.createServer({
+  name: "worker-1", offer, image: { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 }, sshKeyIds: [key.id],
+});
+
+const machine = await RemoteMachine.connect(await runpod.waitUntilRunning(server.id), { privateKey });
+console.log((await machine.run("nvidia-smi -L")).stdout);    // as the login; an exit other than 0 throws RemoteCommandError
+await machine.sudo("apt-get update");                         // as root: as it is for a root login, through sudo for any other
+await machine.writeFile("/etc/app.env", "PORT=8080\n", { mode: "600" });
+
+// not only root: a user of its own, its keys, and sudo if you say so
+const deployKeys = await SSHService.createKeys();
+await machine.addUser("deploy", { publicKeys: [deployKeys.publicKey], sudo: true });
+const deploy = await machine.as("deploy", { privateKey: deployKeys.privateKey });
+console.log((await deploy.run("whoami")).stdout);             // deploy
+await deploy.close();
+await machine.close();
+```
+
+The same lines work with a `DigitalOcean`, `Scaleway`, `LambdaCloud` or `VastAI` in place of the `RunPod`.
+
+| Method | What it does |
+|---|---|
+| `RemoteMachine.connect(server, { privateKey, username?, decryptionKey?, retry? })` | A session to a running server, or to an `{ host, port, username }` given as it is. It logs in as the server's own login unless `username` names another. A server with no `ssh` endpoint (not running yet, or made with no key) says so. |
+| `run(command, { cwd?, env?, stdin?, check? })` | The command as the login: `{ stdout, stderr, code }`. An exit other than 0 throws `RemoteCommandError` unless `check` is false. |
+| `sudo(command, o?)` | The command as root: as it is where the login is root, through passwordless `sudo` where it is not. |
+| `readFile(path, { sudo? })`, `writeFile(path, text, { mode?, owner?, sudo? })` | A text file, as it is. The text goes over the session's input, never into a command line. |
+| `upload(local, remote)`, `download(remote, local)` | A file over SFTP, as the login. |
+| `addUser(name, { publicKeys?, sudo?, shell? })` | Makes a user, or brings an existing one to what is asked: a home, no password, the keys that log in as it, and with `sudo: true` passwordless root (`sudo: false` takes it back). The same on Debian, Alpine and RHEL family images; done again, it changes nothing. |
+| `authorizeKeys(publicKeys, user?)` | Adds keys to the ones that log in as `user` (default: the login itself), each once. |
+| `as(name, { privateKey })` | A second session to the same machine as another user. |
+| `root` | The session with everything done as root (node-ssh's `NodeSSH`): what a `SetupPipeline`'s steps run on. `ssh` is the bare session. |
+| `close()` | Ends the session. |
+
+How the keys get in differs by platform; what you call does not:
+
+| Provider | Login (`server.ssh.username`) | Where (`server.ssh`) | How `sshKeyIds` gets its keys in |
+|---|---|---|---|
+| DigitalOcean | `root` | the droplet's address, port 22 | DigitalOcean, at the create |
+| Scaleway | `root` | the Instance's address, port 22 | Scaleway, at every boot: every key of the Project besides the ones named (`atCreate: 'account'`) |
+| Lambda | `ubuntu`, which has sudo | the instance's address, port 22 | Lambda takes the first; the others are added at the first boot (cloud-init). At least one must be named |
+| RunPod | `root` | the pod's public address and the port mapped to its 22 | an SSH server the library starts in the container, before its command |
+| Vast | `root` | the machine's address and the port mapped to the container's 22 | the same SSH server, started the same way |
+
+### Containers (RunPod, Vast)
+
+A container platform gives a container no SSH server, so `sshKeyIds` there starts one:
+
+- It is OpenSSH, taking exactly the keys named and no password.
+- A session has the container's own `PATH` and `LD_LIBRARY_PATH`, so `nvidia-smi` and `python` are found as the image's own processes find them.
+- It runs before the container's command, then hands over to it.
+
+Three things follow:
+
+- **The container needs a command to hand over to.**
+  - An image named by the library (`MACHINE_TYPES`, `{ os, cuda }`) is given one that keeps it up.
+  - With an image of your own, pass `command` as the whole command line (`["python", "serve.py"]`, not arguments to the image's entrypoint): the SSH server's start takes the entrypoint's place, then runs the command.
+  - Without one, the create is refused before anything is rented.
+- **The image must start as root**, and have either `sshd` or a package manager to install it with (apt-get, apk, dnf or yum; an install adds some seconds to the first boot).
+  - Where neither holds, the container does not start, and its log says why (`getServerLogs` on RunPod).
+- **To use an image's own SSH setup instead**, leave `sshKeyIds` out and use the platform's way:
+  - RunPod: `providerOptions: { startSsh: true }` with `env: { PUBLIC_KEY }` and `ports: ["22/tcp"]`, in an image built for it.
+  - Vast: `providerOptions: { runtype: "ssh" }`.
+
+### Other users
+
+A user made with `addUser` is an ordinary one:
+
+- Log in as it from anywhere: `RemoteMachine.connect(server, { privateKey, username: "deploy" })`.
+- To have it from a VM's first boot, without logging in at all, pass the same script as user data: `userData: "#!/bin/sh\n" + addUserScript("deploy", { publicKeys, sudo: true })`.
+- In a pipeline it is `new AddUserStep("deploy", { publicKeys, sudo: true })`.
+
 ## Setting a server up
 
-`ServerProvisioner` works on any provider whose servers are VMs (with `compute` and `sshKeys`):
+`ServerProvisioner` works on any provider with `compute` and `sshKeys`, a VM or a container. A VPS, a GPU VM and a GPU container go through it the same way:
 
 1. It makes a fresh key and rents the offer.
 2. It waits for the server.
@@ -444,7 +613,10 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
   - `createServer` sends key ids and MD5 fingerprints without looking them up.
   - `addSSHKey` remembers its own registrations for a minute. Another process may still register the same key twice in that window.
 - A droplet takes one action at a time, its create included. An action asked for meanwhile gets a 422 "pending event" and is asked again until the wait ends.
-- `stopServer` shuts the droplet down cleanly, and powers it off only if that fails.
+- `stopServer` shuts the droplet down cleanly, and powers it off only if that fails:
+  - The whole of it has thirteen minutes: the shutdown three of them, and never more than half the time you give it.
+  - A power-off DigitalOcean refuses because a slow shutdown finished meanwhile is no failure.
+- `startServer` and `restartServer` read the droplet first, and again once their action is done: one that is on is not powered on again, and one that is off is not rebooted.
 - 8-GPU sizes boot the 8-GPU image.
 - Volumes:
   - A droplet attaches volumes of its region that no droplet holds.
@@ -485,8 +657,15 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
 
 - MIG slices are GPU types of their own, named card and profile (`RTX PRO 6000 MIG 1g.24gb`), so asking for a card never rents a slice.
 - Pods take no UDP.
-- RunPod's own SSH setup would authorize every key on the account, so `sshKeyIds` sends exactly the keys named (as `PUBLIC_KEY`) and exposes `22/tcp` for sshd's direct endpoint.
+- SSH:
+  - RunPod's own SSH setup authorizes every key on the account, and works only in images built for it.
+  - So `sshKeyIds` starts the library's SSH server instead (as the pod's entrypoint, ahead of its command), with exactly the keys named, and exposes `22/tcp`.
+  - `server.ssh` is the pod's public address and the port mapped to it.
+  - The keys are sent as `PUBLIC_KEY` too, so `env.PUBLIC_KEY` can't be given with `sshKeyIds`.
 - A stopped pod can resume without its GPU: `startServer` then stops it again and throws `CapacityError`.
+- A pod rented by an offer goes to the offer's first data center with stock, as on every provider:
+  - Where that one can't place it (nothing free of what was asked, no host that runs the CUDA asked for), the offer's next is tried before the create fails.
+  - A `region`, or a network volume, pins it.
 - A pod mounts at most one network volume, or a disk of its own (`volume`), never both.
 - A registry login's username and password are write-only, with no update: a new password is stored as a new login.
 
@@ -501,6 +680,11 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
   - Each offer is one machine, whose `regions` are its location and its `machine:<id>`. A `region` asked for must be one of the offer's.
   - An interruptible offer's id carries its bid.
 - Ports are mapped to random public ports: read them from the server's `ports`.
+- SSH:
+  - `sshKeyIds` starts the library's SSH server in the container (as its entrypoint, ahead of its command and of a `userData` script) and maps its port 22.
+  - `server.ssh` is the machine's address and that port, or Vast's own SSH proxy where the instance reports no mapped port.
+  - `providerOptions.runtype` is Vast's own launch mode, and can't be given with `sshKeyIds`.
+- Vast takes no `tags`.
 - Price:
   - An offer's `pricePerHour` counts 8 GB of disk; an interruptible offer's is its minimum bid, with no disk.
   - The disk (`diskGb`) bills on top, at the machine's `raw.storage_cost` (USD per GB per month, billed hourly over 720 hours).
@@ -527,7 +711,7 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
 <details>
 <summary><b>Lambda Cloud</b></summary>
 
-- Exactly one SSH key at launch.
+- Exactly one SSH key at launch: the first of `sshKeyIds`. The library adds the others to `ubuntu` at the first boot, through cloud-init.
 - Names are at most 64 characters; tag keys are 2-55 characters (`a-z 0-9 - :`, starting with a letter).
 - Filesystems are mounted at launch only, never on a running instance, by any number of instances of their region. One in use can't be deleted.
 - Lambda reads filesystems only as a list, so `getVolume` looks one up in it.
@@ -539,11 +723,12 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
 ```
 src/types.ts                    the shared shapes: offers, servers, images, volumes, create options, SSH, PlatformTypes
 src/capabilities.ts             the capability interfaces, their traits, supports() / requireCapability()
-src/errors.ts, constants.ts     the typed errors; the enums (MACHINE_TYPES, REGION_TYPES, PLATFORM)
+src/errors.ts, constants.ts     the typed errors; the enums (MACHINE_TYPES, CUDA_TYPES, COUNTRY_TYPES, REGION_TYPES, PLATFORM)
 src/Core/BaseProvider.ts        what every provider shares: id, capabilities, the platform's API client
 src/Core/ComputeProvider.ts     the compute capability's shared logic: waits, verified deletes, cost, offers, enum names
-src/Core/ServerProvisioner.ts   SetupPipeline over SSH on any VM provider; SetupPipeline.ts, steps/, SSHService.ts
-src/Core/utils/                 pure helpers: http (ApiClient), offers, gpus, cost, ssh (key formats), async, crypto
+src/Core/RemoteMachine.ts       a machine behind SSH, whichever provider rented it: commands, files, users
+src/Core/ServerProvisioner.ts   SetupPipeline over SSH on any provider; SetupPipeline.ts, steps/, SSHService.ts
+src/Core/utils/                 pure helpers: http (ApiClient), offers, gpus, cost, ssh (key formats), sshd (a container's SSH server, users), async, crypto
 src/Providers/<Platform>/       one folder per platform:
     <Platform>.ts                 the provider class: its capabilities, implemented from the two below
     api.ts                        its API client: auth, what counts as success, its errors as typed errors (toError)
@@ -604,11 +789,14 @@ npm run docs:check     # type-check every block of every page; run each `run`; r
 |---|---|
 | `npm test` | Every spec, against fakes of the providers' APIs: no account, no key, nothing rented. |
 | `npm run test:coverage` | The same with coverage of the library. Fails below 90% of statements, branches, functions or lines, or below 100% on any Scaleway file. |
+| `npm run test:ssh` | Holds `RemoteMachine` to a real session: logins, commands, files, SFTP. It starts this machine's own `sshd` on 127.0.0.1 with a host key, a key list and a port of its own, then stops it. Costs nothing. |
 | `npm run api:spec` | Holds each provider's endpoint table to the live OpenAPI specs and reference pages ([scripts/api-spec-check.ts](scripts/api-spec-check.ts)). |
 | `npm run scaleway:spec` | Holds the Scaleway provider to Scaleway's OpenAPI specs: endpoints, enums, fields and reference pages (`-- --live` also reads the public catalog). |
 
 - CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs a type-check, the build and `test:coverage` on Node 18, 22 and 24 for every pull request. `master` takes only pull requests whose runs all passed.
 - CI runs on GitHub's runners, or on the self-hosted ones the repository variable `CI_RUNS_ON` names. A fork's pull request never runs on those.
+- The shell scripts the library sends to a machine (a container's SSH server, a user and its keys) are run for real in `npm test`, under `sh` and `dash`.
+  - They run against stand-ins for the tools that would change a system ([sshd.spec.ts](src/Core/utils/sshd.spec.ts)).
 - Each provider's API client refuses a request its endpoint table (`endpoints.ts`) doesn't describe, before sending it, so every test that drives a provider holds it to the table.
 - A call that departs from the spec is sent as the platform's own CLI sends it, or as seen live, and its entry says which.
 
