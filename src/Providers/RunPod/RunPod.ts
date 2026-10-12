@@ -11,7 +11,7 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider } from '../../Core/ComputeProvider';
-import { asksForGpu, cudaVersion, filterOffers, findSSHKey, isKind, parseSSHPublicKey, pickSSHKeys, registryAuthName, registryOf, waitOf } from '../../Core/utils';
+import { asksForGpu, cudaVersion, filterOffers, findSSHKey, isKind, parsePort, parseSSHPublicKey, pickSSHKeys, registryAuthName, registryOf, waitOf } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, TransportError } from '../../errors';
 import type {
     CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, InitializedSSHKeyData, LogOptions, Offer, OfferQuery, RegistryAuth,
@@ -222,9 +222,20 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
      * among them) its endpoint, there is nowhere to reach it yet.
      */
     protected override comingUp(server: Server<RunPodPod>): boolean {
-        const asked = server.raw.ports ?? [];
-        const published = new Set((server.ports ?? []).filter((x) => x.publicPort != null).map((x) => `${x.privatePort}/${x.protocol}`));
-        return asked.some((x) => !published.has(x)) || (asked.includes('22/tcp') && !server.ssh);
+        // What it was made to expose, read as the library reads a port ('8888/HTTP' and '8888/http' are one, a bare '22' is
+        // tcp): RunPod's spec makes it any string. One that is no port names nothing to wait for.
+        const asked = (server.raw.ports ?? []).flatMap((x) => {
+            try {
+                return [parsePort(x)];
+            } catch {
+                return [];
+            }
+        });
+        // A tcp port is published once it has its public one. An http port is reached through RunPod's proxy by its own
+        // number, so it is published once RunPod lists it: the spec lets its `public` be null.
+        const published = (a: { port: number, protocol: string }) => (server.ports ?? []).some((p) => p.privatePort === a.port
+            && p.protocol === a.protocol && (a.protocol === 'http' || p.publicPort != null));
+        return asked.some((a) => !published(a)) || (asked.some((a) => a.port === 22 && a.protocol === 'tcp') && !server.ssh);
     }
 
     /**

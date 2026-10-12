@@ -124,7 +124,8 @@ export function toServer(p: RunPodPod): Server<RunPodPod> {
         privatePort: x.private,
         ...(x.public != null ? { publicPort: x.public } : {}),
         ...(x.ip ? { ip: x.ip } : {}),
-        protocol: x.type ?? 'tcp',
+        // As the library writes a protocol, whatever case RunPod lists it in (its spec: any string).
+        protocol: String(x.type ?? 'tcp').toLowerCase(),
     }));
     return {
         provider: RUNPOD_ID,
