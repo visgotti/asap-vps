@@ -114,7 +114,23 @@ export function instanceStatus(i: VastInstance, relaunchedAt = 0, now = Date.now
 function sshOf(i: VastInstance, ip: string | undefined, ports: Array<{ privatePort: number, publicPort: number, protocol: string }>): SSHEndpoint | undefined {
     const direct = ports.find((p) => p.privatePort === 22 && p.protocol === 'tcp');
     if (direct && ip) return { host: ip, port: direct.publicPort, username: 'root' };
+    // The proxy leads to the SSH server Vast runs in its own ssh modes. An instance launched in `args` has none of Vast's
+    // (seen live 2026-10-12: no ssh_host, no ssh_port): were one ever named for it, nothing of its own would be behind it.
+    if (i.image_runtype === 'args') return undefined;
     return i.ssh_host && i.ssh_port ? { host: i.ssh_host, port: Number(i.ssh_port), username: 'root' } : undefined;
+}
+
+/**
+ * The ports an instance was launched to expose, each the container's own:
+ * its env's docker flags (`-p <host>:<container>[/udp]`), which is how a
+ * rental asks for them. A flag of another shape names none.
+ */
+export function askedPorts(i: VastInstance): Array<{ privatePort: number, protocol: string }> {
+    const env: Array<[string, unknown]> = Array.isArray(i.extra_env) ? i.extra_env : Object.entries(i.extra_env ?? {});
+    return env.flatMap(([flag]) => {
+        const m = /^-p\s+(?:\d+:)?(\d+)(?:\/(tcp|udp))?$/.exec(String(flag).trim());
+        return m ? [{ privatePort: Number(m[1]), protocol: m[2] ?? 'tcp' }] : [];
+    });
 }
 
 export function toServer(i: VastInstance, relaunchedAt?: number): Server<VastInstance> {

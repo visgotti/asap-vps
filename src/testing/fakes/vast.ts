@@ -103,10 +103,12 @@ export function fakeVast(o: { token?: string, bootReads?: number, stopReads?: nu
         const i = state.instances.get(id);
         if (l && i) l.text += containerRun(i);
     };
+    /** Its port mappings, which Vast reports once its container runs (seen live 2026-10-12: none while it loads, all of them with `running`). */
+    const mapped = (i: any) => (i.actual_status === 'running' ? i.ports : {});
     /** An instance as the single read has it: no volume_info (the list's alone). */
     const view = (i: any) => {
         const { reads, relaunching, stopLeft, volume_info: _, ...rest } = i;
-        return rest;
+        return { ...rest, ports: mapped(i) };
     };
     /** A read of one instance (alone, or the list filtered to it): time passes for it, its container loads, then runs. */
     const readOne = (i: any) => {
@@ -123,7 +125,7 @@ export function fakeVast(o: { token?: string, bootReads?: number, stopReads?: nu
     /** An instance as the list has it. */
     const listView = (i: any) => {
         const { reads, relaunching, stopLeft, ...rest } = i;
-        return rest;
+        return { ...rest, ports: mapped(i) };
     };
     const volumeView = (v: any) => {
         const { leaving, ...rest } = v;
@@ -167,7 +169,9 @@ export function fakeVast(o: { token?: string, bootReads?: number, stopReads?: nu
                 // An offer is found by ask_contract_id: a filter on `id` matches no offer at all (observed 2026-10-02).
                 if (field === 'id') offers = [];
                 for (const [op, v] of Object.entries(cond as Record<string, unknown>)) {
-                    offers = offers.filter((a: any) => OPS[op]?.(a[field], v) ?? true);
+                    // A location is searched by the country code it ends with: `geolocation in ['JP']` finds 'Japan, JP' (seen live 2026-10-12).
+                    const of = (a: any) => (field === 'geolocation' ? /(?:^|, )([A-Z]{2})$/.exec(String(a.geolocation ?? ''))?.[1] : a[field]);
+                    offers = offers.filter((a: any) => OPS[op]?.(of(a), v) ?? true);
                 }
             }
             offers.sort((a, b) => a.dph_total - b.dph_total);
@@ -223,7 +227,10 @@ export function fakeVast(o: { token?: string, bootReads?: number, stopReads?: nu
                 geolocation: ask.geolocation, dph_total: body.price !== undefined ? Number(body.price) : ask.dph_total, is_bid: body.price !== undefined,
                 machine_id: ask.machine_id, start_date: Date.now() / 1000, ports,
                 ...(volume ? { volume_info: [{ id: volume.id, label: volume.label, created_from: 5000 + volume.machine_id, avail_space: volume.disk_space, total_space: volume.disk_space, type: 'machine' }] } : {}),
-                public_ipaddr: `198.51.100.${id % 250}\n`, ssh_host: 'ssh5.vast.ai', ssh_port: 20000 + (id % 1000), reads: 0 });
+                // Its launch mode, and Vast's SSH proxy in the modes Vast runs an SSH server in: an `args` instance has none (seen live 2026-10-12).
+                image_runtype: body.runtype ?? 'args',
+                ...(/ssh|jupyter/.test(String(body.runtype)) ? { ssh_host: 'ssh5.vast.ai', ssh_port: 20000 + (id % 1000) } : { ssh_host: null, ssh_port: null }),
+                public_ipaddr: `198.51.100.${id % 250}\n`, reads: 0 });
             state.logs.set(String(id), { text: containerRun(state.instances.get(String(id))), fetchesBeforeReady: 1 });
             if (volume) Object.assign(volume, { instances: [...volume.instances, id], status: 'in-use' });
             return json(200, { success: true, new_contract: id });
