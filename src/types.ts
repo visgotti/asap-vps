@@ -258,7 +258,8 @@ export type OfferQuery = {
      * Only offers with stock in one of these countries (ISO 3166-1 alpha-2:
      * COUNTRY_TYPES, or any other code), their `regions` narrowed to the ones
      * there: the same on every provider, whatever it calls its places. An
-     * offer in stock nowhere is in no country.
+     * offer in stock nowhere is in no country. The list is the places allowed:
+     * an empty one allows none (no offer), and only leaving it out allows any.
      */
     countries?: Array<COUNTRY_TYPES | `${COUNTRY_TYPES}` | (string & {})>,
     /** Also return offers with no stock right now (default false). */

@@ -9,6 +9,9 @@ import { isRetriable, ProviderError } from '../errors';
 import { ApiClient, Deadline, pollUntil, Sleep, waitOf } from './utils';
 
 export abstract class BaseProvider<TApi extends ApiClient = ApiClient> implements Capable {
+    /** How far apart a poll's reads are unless its options say. */
+    static readonly POLL_INTERVAL_MS = 10_000;
+
     /** The provider's id: what its records and errors report. */
     abstract readonly id: string;
     /** What it can do and how (src/capabilities.ts): each key a capability whose interface the class implements. */
@@ -44,7 +47,7 @@ export abstract class BaseProvider<TApi extends ApiClient = ApiClient> implement
     protected async poll<T>(read: () => Promise<T>, done: (v: T) => boolean,
         o: Deadline & { what: string, describe?: (v: T) => string }): Promise<T> {
         // Fifteen minutes, read every ten seconds, unless `o` says; of a longer wait under one deadline, the timeout reports the whole.
-        const { timeoutMs, intervalMs, budgetMs = timeoutMs } = waitOf(o, { timeoutMs: 15 * 60_000, intervalMs: 10_000 });
+        const { timeoutMs, intervalMs, budgetMs = timeoutMs } = waitOf(o, { timeoutMs: 15 * 60_000, intervalMs: BaseProvider.POLL_INTERVAL_MS });
         return pollUntil(read, done, {
             timeoutMs,
             intervalMs,

@@ -2,7 +2,8 @@
 // key: a VPS, a GPU VM and a container set up the same way, against each
 // provider's fake.
 
-import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { spawnSync } from 'child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { NodeSSH } from 'node-ssh';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -37,6 +38,9 @@ function mockShell(): NodeSSH {
         dispose: jest.fn(),
     } as unknown as NodeSSH;
 }
+
+/** How a command becomes root's on a login that is not root: through passwordless sudo, by bash where the machine has it, else sh (rootCommand). */
+const AS_ROOT = `sudo -n sh -c 'exec "$(command -v bash || command -v sh)" -c "$1"' asap-vps`;
 
 describe('ServerProvisioner', () => {
     let shell: NodeSSH;
@@ -95,8 +99,8 @@ describe('ServerProvisioner', () => {
         await new ServerProvisioner(p).provision({ serverOptions: { name: 'gpu-setup', offer: 'gpu_1x_a10', region: 'us-east-1' }, ...quick },
             (pipeline) => void pipeline.addStep(new RunCommandStep(["echo 'hi' > /etc/motd"], 'motd')));
         expect(SSHService.connect).toHaveBeenCalledWith(expect.objectContaining({ username: 'ubuntu', port: 22 }));
-        expect(shell.execCommand).toHaveBeenCalledWith(`sudo -n bash -c 'echo '\\''hi'\\'' > /etc/motd'`);
-        expect(shell.execCommand).toHaveBeenCalledWith(`sudo -n bash -c 'cat /etc/os-release'`);
+        expect(shell.execCommand).toHaveBeenCalledWith(`${AS_ROOT} 'echo '\\''hi'\\'' > /etc/motd'`);
+        expect(shell.execCommand).toHaveBeenCalledWith(`${AS_ROOT} 'cat /etc/os-release'`);
     });
 
     it('a failed step deletes the server (verified) and says which step', async () => {
@@ -376,9 +380,33 @@ describe('asRoot: the steps\' connection on a login that is not root', () => {
         await root.execCommand('systemctl restart app');
         await root.execCommand('ls', { cwd: '/root/app dir', stdin: 'x' });
         expect(commands).toEqual([
-            [`sudo -n bash -c 'systemctl restart app'`],
-            [`sudo -n bash -c 'cd ${q('/root/app dir')} && ls'`, { stdin: 'x' }],
+            [`${AS_ROOT} 'systemctl restart app'`],
+            // The directory on a line of its own that ends the command if it is not there, then the command.
+            [`${AS_ROOT} 'cd -- ${q('/root/app dir')} || exit\nls'`, { stdin: 'x' }],
         ]);
+    });
+
+    it('a cwd that is not there ends the command, all of it: `a; b` does not run its second half in root\'s home', async () => {
+        // The command as asRoot sends it, run for real by a shell behind a stand-in sudo, in a directory that stands for root's home.
+        const home = mkdtempSync(join(tmpdir(), 'asap-vps-as-root-home-'));
+        try {
+            writeFileSync(join(home, 'sudo'), '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n');
+            chmodSync(join(home, 'sudo'), 0o755);
+            const ssh = { execCommand: async (command: string) => {
+                const r = spawnSync('/bin/sh', ['-c', command], { cwd: home, encoding: 'utf8', env: { PATH: `${home}:/bin:/usr/bin`, HOME: home } });
+                return { stdout: r.stdout.trim(), stderr: r.stderr.trim(), code: r.status, signal: r.signal };
+            } } as unknown as NodeSSH;
+            const root = asRoot(ssh, 'ubuntu');
+            const missing = await root.execCommand('echo first; touch ran-in-home', { cwd: join(home, 'no-such-dir') });
+            expect([missing.stdout, missing.code === 0, existsSync(join(home, 'ran-in-home'))]).toEqual(['', false, false]);
+            expect(missing.stderr).toMatch(/no-such-dir/);
+            // With the directory there, the whole command runs in it.
+            mkdirSync(join(home, 'app'));
+            const there = await root.execCommand('echo first; touch ran-in-app', { cwd: join(home, 'app') });
+            expect([there.stdout, there.code, existsSync(join(home, 'app', 'ran-in-app'))]).toEqual(['first', 0, true]);
+        } finally {
+            rmSync(home, { recursive: true, force: true });
+        }
     });
 
     it('exec and mkdir go through sudo too: a directory is made as root, never over SFTP as the login', async () => {
@@ -388,10 +416,10 @@ describe('asRoot: the steps\' connection on a login that is not root', () => {
         await root.mkdir('/etc/app/conf.d');
         await root.mkdir('/etc/app/other', 'sftp');
         expect(sent()).toEqual([
-            `sudo -n bash -c 'systemctl restart ${q('my app')}'`,
+            `${AS_ROOT} 'systemctl restart ${q('my app')}'`,
             // node-ssh quotes an argument with a dot in it.
-            `sudo -n bash -c 'mkdir -p ${q('/etc/app/conf.d')}'`,
-            `sudo -n bash -c 'mkdir -p /etc/app/other'`,
+            `${AS_ROOT} 'mkdir -p ${q('/etc/app/conf.d')}'`,
+            `${AS_ROOT} 'mkdir -p /etc/app/other'`,
         ]);
         expect(written).toEqual([]);
     });
@@ -400,7 +428,7 @@ describe('asRoot: the steps\' connection on a login that is not root', () => {
         const { ssh, sent, written } = client();
         await asRoot(ssh, 'ubuntu').putFile(join(local, 'app.conf'), '/etc/app/app.conf');
         expect(written).toEqual([expect.stringMatching(STAGED)]);
-        expect(sent()).toEqual([`sudo -n bash -c 'mkdir -p -- ${q('/etc/app')} && mv -f -- ${q(written[0])} ${q('/etc/app/app.conf')} && chown -- root:root ${q('/etc/app/app.conf')}'`]);
+        expect(sent()).toEqual([`${AS_ROOT} 'mkdir -p -- ${q('/etc/app')} && mv -f -- ${q(written[0])} ${q('/etc/app/app.conf')} && chown -- root:root ${q('/etc/app/app.conf')}'`]);
     });
 
     it('putFiles and putDirectory place every file and directory as root: nothing is written outside the login\'s home over SFTP', async () => {
@@ -413,13 +441,13 @@ describe('asRoot: the steps\' connection on a login that is not root', () => {
         const ran = sent().join('\n');
         expect(ran).toContain(`mkdir -p ${q('/opt/app/conf.d')}`);
         for (const placed of ['/etc/a.conf', '/etc/b.conf', '/opt/app/app.conf', '/opt/app/conf.d/b.conf']) expect(ran).toContain(`chown -- root:root ${q(placed)}`);
-        for (const c of sent()) expect(c).toMatch(/^sudo -n bash -c '/);
+        for (const c of sent()) expect(c.startsWith(`${AS_ROOT} '`)).toBe(true);
     });
 
     it('a file that cannot be moved into place is an error, and is not left in the login\'s home', async () => {
         const { ssh, sent, written } = client({ refuse: /mv -f/ });
         await expect(asRoot(ssh, 'ubuntu').putFile(join(local, 'app.conf'), '/etc/app/app.conf')).rejects.toThrow('putFile /etc/app/app.conf: mv: cannot move');
-        expect(sent().pop()).toBe(`sudo -n bash -c 'rm -f -- ${q(written[0])}'`);
+        expect(sent().pop()).toBe(`${AS_ROOT} 'rm -f -- ${q(written[0])}'`);
     });
 
     it('a move that fails without a word is an error that gives its exit code', async () => {

@@ -982,7 +982,8 @@ export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implem
 
     /** Waits until the server asked to `start` or `restart` is running (a restart: running again, as restartWatch tells it): one that is gone, or locked, did not. */
     private async waitUntilUp(s: ScalewayServer, id: string, asked: 'start' | 'restart', o: WaitOptions): Promise<void> {
-        const back = asked === 'restart' ? restartWatch(Scaleway.RESTART_SETTLE_READS) : (running: boolean) => running;
+        // The pace this is read at is waitFor's: the reboot is given the same time to show as on every provider.
+        const back = asked === 'restart' ? restartWatch(Scaleway.settleReads(waitOf(o, { intervalMs: 5000 }).intervalMs)) : (running: boolean) => running;
         const up = await this.waitFor(s, `to ${asked}`, (x) => x.state === 'locked' || back(x.state === 'running'), o);
         if (!up) throw new NotFoundError(this.id, `server ${id} disappeared while it was ${asked}ing`);
         if (up.state === 'locked') throw new ProviderError(this.id, `server ${id} is locked (${up.state_detail || 'no detail'}): it did not ${asked}`);

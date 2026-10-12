@@ -98,6 +98,13 @@ export type VastInstance = {
     machine_id?: number | null,
     ssh_host?: string | null,
     ssh_port?: number | null,
+    /**
+     * The mode it was launched in ('args', 'ssh', 'jupyter', and Vast's own
+     * variants of the last two). Vast gives its SSH proxy (`ssh_host`,
+     * `ssh_port`) to an instance in an ssh or jupyter mode; one in 'args' has
+     * none (seen live 2026-10-12: both null).
+     */
+    image_runtype?: string | null,
     /** Each open container port and the RANDOM public port it maps to: {"8080/tcp": [{HostIp, HostPort}]}. */
     ports?: Record<string, Array<{ HostIp?: string, HostPort?: string }> | null> | null,
     /** Its env as Vast keeps it: [name, value] pairs, a mounted volume among them as a docker flag, ["-v <volume name>:<path>", "1"] (observed 2026-10-06). */

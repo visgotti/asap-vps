@@ -415,6 +415,24 @@ describe('ComputeProvider', () => {
             expect(slept).toEqual([10_000, 10_000, 10_000]);
         });
 
+        it('the reboot is given thirty seconds to show at whatever pace the server is read: read every second that is thirty-one reads, not four (three seconds, before a reboot has begun)', async () => {
+            expect(ComputeProvider.RESTART_SETTLE_MS).toBe(30_000);
+            // The reads in a row as running that span thirty seconds, and four at least.
+            expect([10_000, 5000, 1000, 250, 7000, 30_000, 60_000, 0].map((intervalMs) => ComputeProvider.settleReads(intervalMs))).toEqual([4, 7, 31, 121, 6, 4, 4, 4]);
+            for (const [intervalMs, reads] of [[1000, 31], [5000, 7], [250, 121], [20_000, 4]] as const) {
+                const slept: number[] = [];
+                const steady = new ScriptedProvider([{ status: 'running' }], async (ms) => { slept.push(ms); });
+                await steady.restarted({ intervalMs });
+                expect([intervalMs, steady.reads, slept.length, slept.every((ms) => ms === intervalMs)]).toEqual([intervalMs, reads, reads - 1, true]);
+                // Thirty seconds or more went by before it was taken to be back, never less.
+                expect(slept.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(30_000);
+            }
+            // A reboot the status does show ends the wait as soon as the server is back, at any pace.
+            const shown = new ScriptedProvider([{ status: 'running' }, { status: 'pending' }, { status: 'running' }]);
+            await shown.restarted({ intervalMs: 1000 });
+            expect(shown.reads).toBe(3);
+        });
+
         it('a restart whose server is gone, errors, stops or is deleted instead did not restart, and says so at once; a status the platform shows of a reboot is waited through', async () => {
             await expect(new ScriptedProvider([{ status: 'pending' }, null]).restarted(fast))
                 .rejects.toMatchObject({ name: 'NotFoundError', message: 'scripted: server s1 disappeared while it was restarting' });

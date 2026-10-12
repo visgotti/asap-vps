@@ -609,6 +609,25 @@ describe('Scaleway stop, start, restart', () => {
         expect(reads() - before).toBe(5);
     });
 
+    it('a restart Scaleway shows nothing of is given the same thirty seconds as on every provider: seven reads at its own pace of 5 s (it was four, fifteen seconds), and as many as span them at another', async () => {
+        const clock = waitingClock();
+        try {
+            for (const [o, pauses] of [[undefined, Array(6).fill(5000)], [{ intervalMs: 1000 }, Array(30).fill(1000)], [{ intervalMs: 15_000 }, Array(3).fill(15_000)]] as const) {
+                const fake = fakeScaleway();
+                const slept: number[] = [];
+                const p = new Scaleway({ apiKey: 'scw-test', projectId: FAKE_SCALEWAY_PROJECT, fetchImpl: fake.fetchImpl, sleep: async (ms) => { slept.push(ms); await clock.sleep(ms); } });
+                const s = await running(p);
+                // Accepted, and the state never leaves running.
+                fake.intercept((r) => r.body?.action === 'reboot', { times: 1, after: () => Object.assign(fake.state.servers.get(s.id), { state: 'running' }) });
+                slept.length = 0;
+                await p.restartServer(s.id, o);
+                expect(slept).toEqual(pauses);
+            }
+        } finally {
+            clock.restore();
+        }
+    });
+
     it('a server that locks, or is deleted, while it starts or restarts did not', async () => {
         for (const [call, action, did, doing] of [['startServer', 'poweron', 'start', 'starting'], ['restartServer', 'reboot', 'restart', 'restarting']] as const) {
             for (const detail of ['locked for abuse', '']) {

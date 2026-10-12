@@ -125,6 +125,10 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
         if (this.imageSpec(o.image)?.cuda !== undefined && DigitalOcean.AMD_SIZE.test(size)) {
             throw new NotSupportedError(this.id, `image with cuda on ${size} (an AMD GPU: its image, the default, has ROCm)`);
         }
+        // Nor does a size without GPUs: the NVIDIA images are for the GPU sizes (the same refusal as Scaleway's).
+        if (this.imageSpec(o.image)?.cuda !== undefined && (offer ? offer.gpuCount === 0 : !size.startsWith('gpu-'))) {
+            throw new NotSupportedError(this.id, `image with cuda on ${size} (it has no GPU: DigitalOcean's NVIDIA images boot its GPU sizes only)`);
+        }
         const image = this.imageName(o.image, DigitalOcean.cudaImages(size)) ?? DigitalOcean.defaultImage(size, offer);
         const attached = await this.attachable(o, region);
         const volumes = attached.blocks.map((v) => v.id);
@@ -203,10 +207,11 @@ export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOcea
     /**
      * DigitalOcean's images with the NVIDIA driver and CUDA for a size, by the
      * Ubuntu they are: the 8-GPU image for an x8 size, the single-GPU one for
-     * any other, both Ubuntu 24.04; none for an AMD size, whose image has ROCm.
+     * any other, both Ubuntu 24.04; none for an AMD size, whose image has
+     * ROCm, and none for a size without GPUs, which boots no GPU image.
      */
     static cudaImages(sizeSlug: string): Readonly<Partial<Record<MACHINE_TYPES, string>>> {
-        if (DigitalOcean.AMD_SIZE.test(sizeSlug)) return {};
+        if (DigitalOcean.AMD_SIZE.test(sizeSlug) || !sizeSlug.startsWith('gpu-')) return {};
         return { [MACHINE_TYPES.UBUNTU_24]: DigitalOcean.X8_SIZE.test(sizeSlug) ? DigitalOcean.NVIDIA_8GPU_IMAGE : DigitalOcean.NVIDIA_IMAGE };
     }
 

@@ -244,6 +244,38 @@ describe('Vast.ai API facts', () => {
         expect(searches(fake).slice(before).map((c) => c.body.dph_total)).toEqual([undefined, { gte: 0.05 }, { gt: 0.05 }]);
     });
 
+    it('a question by country is put to Vast itself, as a model is: offers there that the cheapest pages do not reach are found (filtered out of those pages afterwards, they were missed)', async () => {
+        const fake = fakeVast();
+        // One page of the cheapest is all this reads: Vast's search gives a part of the market, never the whole of it.
+        const p = new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep, offerPages: 1 });
+        const ask = (id: number, dph_total: number, geolocation: string) => ({ id, gpu_name: 'RTX 3060', num_gpus: 1, gpu_ram: 12288, dph_total, min_bid: 0.03,
+            geolocation, rentable: true, verified: true, reliability: 0.99, cuda_max_good: 12.8, machine_id: 1000 + id }) as any;
+        // More than a page of machines in Ohio, every one cheaper than the two in Japan and the one in Brazil.
+        for (let i = 0; i < 70; i++) fake.state.asks.push(ask(3000 + i, 0.05 + i / 10_000, 'Ohio, US'));
+        fake.state.asks.push(ask(3900, 0.9, 'Tokyo, JP'), ask(3901, 0.8, 'Osaka, JP'), ask(3902, 0.7, 'Sao Paulo, BR'));
+        const before = searches(fake).length;
+        // The page of the cheapest holds none of them.
+        expect((await p.listOffers()).some((o) => ['3900', '3901', '3902'].includes(o.id))).toBe(false);
+        const japan = await p.listOffers({ countries: ['jp'] });
+        expect(japan.map((o) => [o.id, o.pricePerHour, o.regions])).toEqual([['3901', 0.8, ['Osaka, JP', 'machine:4901']], ['3900', 0.9, ['Tokyo, JP', 'machine:4900']]]);
+        expect((await p.listOffers({ countries: ['BR', 'jp', 'BR'] })).map((o) => o.id)).toEqual(['3902', '3901', '3900']);
+        // What the search was asked: nothing of countries where none was named, the codes as ISO writes them (each once) where some were.
+        expect(searches(fake).slice(before).map((c) => c.body.geolocation)).toEqual([undefined, { in: ['JP'] }, { in: ['BR', 'JP'] }]);
+        // An interruptible search is asked the same.
+        const bids = searches(fake).length;
+        await p.listOffers({ countries: ['JP'], includeInterruptible: true });
+        expect(searches(fake).slice(bids).map((c) => [c.body.type, c.body.geolocation])).toEqual([['ondemand', { in: ['JP'] }], ['bid', { in: ['JP'] }]]);
+    });
+
+    it('an empty list of countries is no offer and no search; a code that is none is refused before Vast is asked anything', async () => {
+        const { p, fake } = make();
+        const before = fake.calls.length;
+        expect(await p.listOffers({ countries: [] })).toEqual([]);
+        await expect(p.listOffers({ countries: ['Japan'] })).rejects.toMatchObject({ name: 'ProviderError', message: 'asap-vps: bad country "Japan": use an ISO 3166-1 alpha-2 code, e.g. US' });
+        await expect(p.listOffers({ countries: [] as string[], kind: 'gpu', gpus: ['RTX 4090'] })).resolves.toEqual([]);
+        expect(fake.calls).toHaveLength(before);
+    });
+
     it('answers that leave out their list read as nothing: no instances, offers or volumes', async () => {
         const fake = fakeVast();
         // Each answer as the fake gives it, less its list.
@@ -609,6 +641,63 @@ describe('Vast userData: a script run before the command, each time the containe
         const script = 'echo "asap-vps-boot=ok" > /tmp/booted';
         await p.createServer({ name: 'both', offer: second, image: MACHINE_TYPES.UBUNTU_24, userData: script, command: ['sleep', '60'], sshKeyIds: [a.id] });
         expect(rentals(fake).pop().args).toEqual(['-c', `${sshdBootScript([a.publicKey])}${script}\nexec "$@"`, 'asap-vps', 'sleep', '60']);
+    });
+
+    it('an instance that runs is returned by waitUntilRunning once each port it was launched to expose is mapped, its port 22 among them: a read that says running before then is not one to log in from', async () => {
+        const fake = fakeVast();
+        // Vast as the fake has it, but for the first reads that say running: those come without the port mappings, as a platform
+        // that maps a container's ports a moment after it reads as running gives them (the live rentals of 2026-10-12 did not; this is not theirs to promise).
+        let withoutPorts = 3;
+        const reads: string[] = [];
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: (async (url: string, init?: RequestInit) => {
+            const answer = await fake.fetchImpl(url, init);
+            if ((init?.method ?? 'GET') !== 'GET' || !/\/instances\//.test(new URL(url).pathname)) return answer;
+            const body = await answer.json();
+            for (const i of ([] as any[]).concat(body.instances ?? [])) {
+                if (i?.actual_status !== 'running') continue;
+                if (withoutPorts > 0) i.ports = {};
+                reads.push(Object.keys(i.ports ?? {}).length ? 'mapped' : 'running, no ports');
+            }
+            if (reads.length) withoutPorts--;
+            return json(200, body);
+        }) as typeof fetch });
+        const [offer] = await p.listOffers();
+        const key = await p.addSSHKey(testPublicKey('k'), 'k');
+        const s = await p.createServer({ name: 'ssh', offer, image: 'ghcr.io/acme/app:1', command: ['serve'], ports: ['8000/tcp', '53/udp'], sshKeyIds: [key.id] });
+        const running = await p.waitUntilRunning(s.id, fast);
+        // Not returned at the reads that said running with nothing mapped: at the first that names where it is reached.
+        expect(reads.slice(0, 3)).toEqual(['running, no ports', 'running, no ports', 'running, no ports']);
+        expect(reads[reads.length - 1]).toBe('mapped');
+        expect(running.ports!.map((x) => `${x.privatePort}/${x.protocol}`).sort()).toEqual(['22/tcp', '53/udp', '8000/tcp']);
+        expect(running.ssh).toEqual({ host: running.ip, port: running.ports!.find((x) => x.privatePort === 22)!.publicPort, username: 'root' });
+        // One that asked for no port is returned as soon as it runs, mapped or not.
+        withoutPorts = 3;
+        const plain = await p.createServer({ name: 'plain', offer: (await p.listOffers())[0], image: 'ghcr.io/acme/app:1', command: ['serve'] });
+        const before = reads.length;
+        expect((await p.waitUntilRunning(plain.id, fast)).status).toBe('running');
+        expect(reads.slice(before)).toEqual(['running, no ports']);
+    });
+
+    it('one whose ports are never mapped is not returned as if it could be reached: the wait runs out, and says what it was waiting for', async () => {
+        const fake = fakeVast();
+        const clock = waitingClock();
+        const p = new VastAI({ apiKey: 'vast-test', sleep: clock.sleep, fetchImpl: (async (url: string, init?: RequestInit) => {
+            const answer = await fake.fetchImpl(url, init);
+            if ((init?.method ?? 'GET') !== 'GET' || !/\/instances\//.test(new URL(url).pathname)) return answer;
+            const body = await answer.json();
+            for (const i of ([] as any[]).concat(body.instances ?? [])) if (i) i.ports = null;
+            return json(200, body);
+        }) as typeof fetch });
+        const key = await p.addSSHKey(testPublicKey('k'), 'k');
+        const s = await p.createServer({ name: 'ssh', offer: (await p.listOffers())[0], image: MACHINE_TYPES.UBUNTU_24, sshKeyIds: [key.id] });
+        try {
+            await expect(p.waitUntilRunning(s.id, { timeoutMs: 60_000, intervalMs: 10_000 })).rejects.toMatchObject({
+                name: 'ProviderError', code: 'timeout',
+                message: expect.stringMatching(/^vast: timed out after 60 s waiting for server \d+: running \(running\/running\), which has not said where it is reached yet \(its SSH endpoint, its ports\)$/),
+            });
+        } finally {
+            clock.restore();
+        }
     });
 
     it('an image named by the library\'s enums is logged in to as it is, kept up; one of the caller\'s own with no command is refused before anything is read or rented, and Vast\'s own ssh launch mode is another thing', async () => {

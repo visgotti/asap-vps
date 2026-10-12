@@ -494,6 +494,55 @@ describe('RunPod API facts', () => {
             expect([s.status, s.ports, s.ssh, readsOf(never.fake) - before]).toEqual(['running', [], undefined, 1]);
         });
 
+        it('what a pod was made to expose is read as the library reads a port, and an http port is published once RunPod lists it: a pod that is up is never waited on for a spelling, or for a public port an http port need not have', async () => {
+            // RunPod's spec makes a pod's `ports` any strings ("formatted as port/protocol") and lets a runtime port's `public` be null.
+            // Each of these is a pod that is up and reachable; before this, every one was waited on until the wait ran out.
+            const cases: Array<[string, string[], (ports: Array<{ private: number, type: string, public: number | null }>) => unknown[], string[]]> = [
+                ['spelled in capitals, and a bare port (tcp)', ['8888/HTTP', '8080'], (ports) => ports, ['8080/tcp', '8888/http']],
+                ['blank space around them', [' 8888/http ', '8080/tcp\n'], (ports) => ports, ['8080/tcp', '8888/http']],
+                ['an http port listed with no public port: it is reached through the proxy, by its own number', ['8888/http', '8080/tcp'], (ports) => ports.map((x) => (x.type === 'http' ? { ...x, public: null } : x)), ['8080/tcp', '8888/http']],
+                ['the type RunPod lists in capitals: a server\'s ports say it as the library writes a protocol', ['8888/http', '8080/tcp'], (ports) => ports.map((x) => ({ ...x, type: x.type.toUpperCase() })), ['8080/tcp', '8888/http']],
+                ['a string that is no port names nothing to wait for', ['8888/http', '8080/tcp', 'not-a-port', '70000/tcp', '53/sctp'], (ports) => ports, ['8080/tcp', '8888/http']],
+            ];
+            for (const [what, asked, listed, expected] of cases) {
+                const { p, fake } = slow(1, (inner) => async (url, init) => {
+                    const r = await inner(url, init);
+                    if ((init?.method ?? 'GET') !== 'GET' || !/\/v2\/pods\/[^/?]+$/.test(String(url))) return r;
+                    const pod = await r.json();
+                    pod.ports = asked;
+                    if (pod.runtime?.ports?.length) pod.runtime.ports = listed(pod.runtime.ports);
+                    return answer(r.status, pod);
+                });
+                const made = await p.createServer({ name: 'web', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8888/http', '8080/tcp'] });
+                expect([what, (await p.waitForServer(made.id, (s) => s?.status === 'running', fast))?.ports]).toEqual([what, []]);
+                const before = readsOf(fake);
+                const s = await p.waitUntilRunning(made.id, fast);
+                // At the first read that lists its ports: not one later, and not at the read before, which listed none.
+                expect([what, shown(s), readsOf(fake) - before]).toEqual([what, expected, 1]);
+            }
+        });
+
+        it('a tcp port with no public port is still nowhere to reach, however it is spelled: waited for, as its SSH endpoint is where 22 is among them', async () => {
+            let read = 0;
+            const { p, fake } = slow(1, (inner) => async (url, init) => {
+                const r = await inner(url, init);
+                if ((init?.method ?? 'GET') !== 'GET' || !/\/v2\/pods\/[^/?]+$/.test(String(url))) return r;
+                const pod = await r.json();
+                pod.ports = ['8080/TCP', '22'];
+                if (!pod.runtime?.ports?.length) return answer(r.status, pod);
+                read++;
+                if (read === 1) pod.runtime.ports = pod.runtime.ports.map((x: { private: number }) => (x.private === 8080 ? { ...x, public: null } : x));
+                if (read <= 2) pod.ssh.direct = null;
+                return answer(r.status, pod);
+            });
+            const key = await p.addSSHKey(testPublicKey('laptop'), 'laptop');
+            const pod = await p.createServer({ name: 'ssh', offer: 'NVIDIA RTX A5000', image: 'img', command: ['sleep', 'infinity'], ports: ['8080/tcp'], sshKeyIds: [key.id] });
+            await p.waitForServer(pod.id, (s) => s?.status === 'running', fast);
+            const before = readsOf(fake);
+            const s = await p.waitUntilRunning(pod.id, fast);
+            expect([shown(s), s.ssh !== undefined, readsOf(fake) - before]).toEqual([['22/tcp', '8080/tcp'], true, 3]);
+        });
+
         it('its SSH port published but its endpoint not named yet: still waited for; a record that names no ports at all is one to return', async () => {
             // RunPod's answers once it lists the pod's ports: first with no public port for them yet (null, as its reference allows),
             // then with the ports published and the endpoint still left out, then whole.

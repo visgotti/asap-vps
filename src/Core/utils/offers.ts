@@ -42,7 +42,8 @@ export function countryCodes(countries: readonly string[]): Set<string> {
 export function filterOffers<O extends Offer<any>>(offers: O[], q: OfferQuery = {}): O[] {
     const minCuda = q.minCudaVersion !== undefined ? cudaVersion(q.minCudaVersion) : undefined;
     const gpuOnly = asksForGpu(q);
-    const countries = q.countries?.length ? countryCodes(q.countries) : undefined;
+    // A list of countries is the places allowed: an empty one allows none (left out, any place is).
+    const countries = q.countries !== undefined ? countryCodes(q.countries) : undefined;
     // In the countries asked for: only its places there are left to it (one whose country is not known is in none).
     const there = (o: O): O => {
         const locations = (o.locations ?? []).filter((l) => l.country !== undefined && countries!.has(l.country));

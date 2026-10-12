@@ -50,10 +50,13 @@ jobs:
     permissions:
       contents: write
       pages: write
-    env:
-      GITHUB_TOKEN: ${{ github.token }}
     steps:
+      # This job's token can write to the repository, so it is handed to the two steps that publish and to nothing else:
+      # not left in the checkout's git config, and not in the environment of `npm ci` and the build, where any
+      # dependency's install or build script could read it.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -67,6 +70,8 @@ jobs:
       - name: Publish site/dist as the gh-pages branch (one commit, replaced by every deploy, so the repository does not grow)
         id: publish
         working-directory: site/dist
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           git init -q -b gh-pages
           git config user.name "github-actions[bot]"
@@ -76,6 +81,8 @@ jobs:
           git push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Ask Pages to build that commit, and wait until it is live
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}/pages/builds"
           auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json")

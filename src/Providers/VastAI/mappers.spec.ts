@@ -3,7 +3,7 @@
 // default), never NaN or a crash.
 
 import { testPublicKey } from '../../testing/fakes/util';
-import { countryOf, instanceStatus, machineOf, toImage, toOffer, toServer, toSSHKey, toVolume } from './mappers';
+import { askedPorts, countryOf, instanceStatus, machineOf, toImage, toOffer, toServer, toSSHKey, toVolume } from './mappers';
 import type { VastInstance, VastOffer, VastSnapshotRepository, VastVolume } from './types';
 
 describe('Vast places', () => {
@@ -39,6 +39,34 @@ describe('Vast offers', () => {
 describe('Vast instances', () => {
     it('a stopped contract asked to run is starting', () => {
         expect(instanceStatus({ id: 1, cur_state: 'stopped', intended_status: 'running', actual_status: 'exited' } as VastInstance)).toBe('pending');
+    });
+
+    it('where it is logged in: the public port its own port 22 is mapped to; Vast\'s proxy only for an instance launched in one of Vast\'s own ssh modes, never for one launched in `args`', () => {
+        const base = { id: 9, actual_status: 'running', cur_state: 'running', intended_status: 'running', public_ipaddr: '198.51.100.7' };
+        const mapped = { '22/tcp': [{ HostIp: '0.0.0.0', HostPort: '41022' }, { HostIp: '::', HostPort: '41022' }] };
+        const proxy = { ssh_host: 'ssh5.vast.ai', ssh_port: 20123 };
+        // As both live `args` rentals of 2026-10-12 read: their own port 22 mapped, and no proxy named.
+        expect(toServer({ ...base, image_runtype: 'args', ports: mapped, ssh_host: null, ssh_port: null } as unknown as VastInstance).ssh).toEqual({ host: '198.51.100.7', port: 41022, username: 'root' });
+        // An `args` instance whose port 22 is not mapped (yet, or at all) has no endpoint: were a proxy ever named for it, nothing of its own is behind it.
+        for (const ports of [{}, null, undefined, { '8000/tcp': [{ HostIp: '0.0.0.0', HostPort: '41000' }] }]) {
+            expect(toServer({ ...base, image_runtype: 'args', ports, ...proxy } as unknown as VastInstance).ssh).toBeUndefined();
+        }
+        // Launched in Vast's ssh mode (or its jupyter one, which runs the same server): the proxy is where it is reached.
+        for (const image_runtype of ['ssh', 'ssh_direc ssh_proxy', 'jupyter_direc ssh_direc ssh_proxy']) {
+            expect(toServer({ ...base, image_runtype, ports: {}, ...proxy } as unknown as VastInstance).ssh).toEqual({ host: 'ssh5.vast.ai', port: 20123, username: 'root' });
+        }
+        // A record that does not say how it was launched reads as it always did; a mapped port 22 comes first whatever the mode.
+        expect(toServer({ ...base, ports: {}, ...proxy } as unknown as VastInstance).ssh).toEqual({ host: 'ssh5.vast.ai', port: 20123, username: 'root' });
+        expect(toServer({ ...base, image_runtype: 'ssh', ports: mapped, ...proxy } as unknown as VastInstance).ssh).toEqual({ host: '198.51.100.7', port: 41022, username: 'root' });
+        expect(toServer({ ...base, image_runtype: 'ssh', ports: {} } as unknown as VastInstance).ssh).toBeUndefined();
+    });
+
+    it('the ports an instance was launched to expose are its env\'s docker flags, each the container\'s own port: pairs or an object, tcp unless udp; anything else names none', () => {
+        const flags = ['-p 22:22', '-p 8000:8000/tcp', '-p 5353:53/udp', '-p  9000:9000 ', '-p 7000', 'MODEL', '-v weights:/models', '-p eighty:80', '-p 80:80/sctp', '-e A=b'];
+        const asked = [{ privatePort: 22, protocol: 'tcp' }, { privatePort: 8000, protocol: 'tcp' }, { privatePort: 53, protocol: 'udp' }, { privatePort: 9000, protocol: 'tcp' }, { privatePort: 7000, protocol: 'tcp' }];
+        expect(askedPorts({ id: 1, extra_env: flags.map((f) => [f, '1']) } as VastInstance)).toEqual(asked);
+        expect(askedPorts({ id: 1, extra_env: Object.fromEntries(flags.map((f) => [f, '1'])) } as VastInstance)).toEqual(asked);
+        for (const extra_env of [undefined, null, [], {}]) expect(askedPorts({ id: 1, extra_env } as VastInstance)).toEqual([]);
     });
 
     it('an instance that says next to nothing: no name, no GPU, no place, no price, no dates; its status words as Vast gave them', () => {

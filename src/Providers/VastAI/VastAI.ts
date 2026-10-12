@@ -16,8 +16,8 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider, ResolvedMount } from '../../Core/ComputeProvider';
 import {
-    compareCudaVersions, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey, pickSSHKeys, RegistryClient, registryOf,
-    timeLeft, waitOf,
+    compareCudaVersions, countryCodes, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey,
+    pickSSHKeys, RegistryClient, registryOf, timeLeft, waitOf,
 } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
 import type {
@@ -26,8 +26,8 @@ import type {
 } from '../../types';
 import { VastApi } from './api';
 import {
-    hostCuda, IMAGE_TAG, machineOf, machineRegion, RELAUNCH_GRACE_MS, serverSideModels, SNAPSHOT_TAG, toImage, toOffer, toServer, toSSHKey, toVolume, VAST_BILLING, VAST_ID,
-    VAST_MOUNT_PATH, VAST_REFUSED, VOLUME_NAME,
+    askedPorts, hostCuda, IMAGE_TAG, machineOf, machineRegion, RELAUNCH_GRACE_MS, serverSideModels, SNAPSHOT_TAG, toImage, toOffer, toServer, toSSHKey, toVolume, VAST_BILLING,
+    VAST_ID, VAST_MOUNT_PATH, VAST_REFUSED, VOLUME_NAME,
 } from './mappers';
 import type {
     VastAIParams, VastImage, VastInstance, VastOffer, VastSnapshotRepository, VastSSHKeyData, VastTypes, VastVolume, VastVolumeInfo, VastVolumeOffer,
@@ -84,6 +84,8 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
     public async listOffers(query: OfferQuery = {}): Promise<Offer<VastOffer>[]> {
         // Every ask is a GPU machine: a question about machines without them has no answer here.
         if (query.kind === 'cpu' || query.gpuCount === 0) return [];
+        // No country allowed is no offer: there is nothing to search for (a code that is none is refused all the same).
+        if (query.countries !== undefined && countryCodes(query.countries).size === 0) return [];
         const offers = (await this.search('ondemand', query)).map((a) => toOffer(a, false));
         if (query.includeInterruptible) offers.push(...(await this.search('bid', query)).map((a) => toOffer(a, true)));
         return filterOffers(offers, query);
@@ -161,6 +163,19 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         // Not listed yet: what the rental said, as the instance it is.
         const rented: VastInstance = { id: body.new_contract, label: o.name, actual_status: 'created' };
         return (await this.getServer(id).catch(() => null)) ?? { ...toServer(rented), offerId: resolved.id };
+    }
+
+    /**
+     * Vast maps a container's ports when the container starts, and both live
+     * rentals of 2026-10-12 read as running with their mappings in the same
+     * read. That is two reads, not Vast's word for it: so an instance that
+     * runs is still coming up until each port it was launched to expose
+     * (askedPorts) has its public one, and the server waitUntilRunning returns
+     * is one that says where it is reached, whichever way Vast reports it.
+     */
+    protected override comingUp(server: Server<VastInstance>): boolean {
+        const mapped = new Set((server.ports ?? []).map((p) => `${p.privatePort}/${p.protocol}`));
+        return askedPorts(server.raw).some((p) => !mapped.has(`${p.privatePort}/${p.protocol}`));
     }
 
     /**
@@ -481,6 +496,10 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         let above = false;
         const minCuda = query.minCudaVersion !== undefined ? Number(cudaVersion(query.minCudaVersion)) : this.minCudaVersion;
         const models = serverSideModels(query);
+        // The countries are Vast's to search by, as the models are: its search returns a part of the market only (seen live
+        // 2026-10-12: read to its end it gave 243 offers of the whole world, 3 of them in Japan, where a search of Japan
+        // alone gave 25), so offers of a country filtered out of that part afterwards would mostly be missed.
+        const countries = query.countries !== undefined ? [...countryCodes(query.countries)] : undefined;
         for (let page = 0; page < this.offerPages; page++) {
             const price = {
                 ...(floor !== undefined ? { [above ? 'gt' : 'gte']: floor } : {}),
@@ -498,6 +517,8 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
                 ...models,
                 // MB, and Vast reports USABLE memory (an L4 lists ~22.5 GB): a margin, the exact check is filterOffers.
                 ...(query.minVramGb ? { gpu_ram: { gte: Math.floor(query.minVramGb * 1024 * 0.9) } } : {}),
+                // By the country code a machine's location ends with ('Texas, US'): `in` takes the codes (seen live 2026-10-12).
+                ...(countries ? { geolocation: { in: countries } } : {}),
                 ...(Object.keys(price).length ? { dph_total: price } : {}),
                 type,
                 order: [['dph_total', 'asc']],

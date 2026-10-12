@@ -408,8 +408,27 @@ describe('DigitalOcean API facts', () => {
         expect(creates().map((c) => c.body.image)).toEqual(['gpu-h100x1-base', 'gpu-h100x8-base', 'ubuntu-24-04-x64', 'gpu-h100x1-base', 'gpu-amd-base', 'ubuntu-24-04-x64']);
         expect(DigitalOcean.cudaImages('gpu-4000adax1-20gb')).toEqual({ ubuntu24: 'gpu-h100x1-base' });
         expect(DigitalOcean.cudaImages('gpu-h100x8-640gb')).toEqual({ ubuntu24: 'gpu-h100x8-base' });
-        expect(DigitalOcean.cudaImages('s-8vcpu-16gb')).toEqual({ ubuntu24: 'gpu-h100x1-base' });
         expect(DigitalOcean.cudaImages('gpu-mi300x8-1536gb')).toEqual({});
+    });
+
+    it('`{ os, cuda }` on a size without GPUs is refused before anything is created: the NVIDIA images boot the GPU sizes only (a droplet with no GPU was sent one before)', async () => {
+        const { p, fake } = make();
+        const image = { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 };
+        const creates = () => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/droplets');
+        const refusal = (size: string) => ({ name: 'NotSupportedError', message: `digitalocean: image with cuda on ${size} (it has no GPU: DigitalOcean's NVIDIA images boot its GPU sizes only) is not supported` });
+        // By the size's slug, and by an offer of it (whose GPU count says so, whatever it is called).
+        await expect(p.createServer({ name: 'cpu', offer: 's-8vcpu-16gb', region: 'nyc1', image })).rejects.toMatchObject(refusal('s-8vcpu-16gb'));
+        const [cpu] = await p.listOffers({ kind: 'cpu' });
+        expect(cpu.gpuCount).toBe(0);
+        await expect(p.createServer({ name: 'cpu', offer: cpu, image })).rejects.toMatchObject(refusal(cpu.id));
+        expect(creates()).toEqual([]);
+        // The same Ubuntu without cuda is what such a size boots.
+        await p.createServer({ name: 'cpu', offer: 's-8vcpu-16gb', region: 'nyc1', image: { os: MACHINE_TYPES.UBUNTU_24 } });
+        await p.createServer({ name: 'cpu-2', offer: cpu, image: MACHINE_TYPES.UBUNTU_24 });
+        expect(creates().map((c) => c.body.image)).toEqual(['ubuntu-24-04-x64', 'ubuntu-24-04-x64']);
+        // The images by size say the same: none for a size with no GPU, as none for an AMD one.
+        expect(DigitalOcean.cudaImages('s-8vcpu-16gb')).toEqual({});
+        expect(DigitalOcean.cudaImages(cpu.id)).toEqual({});
     });
 
     it('a container named by the library\'s enums runs as Docker Hub\'s image for it, on the droplet\'s own OS image', async () => {

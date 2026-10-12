@@ -9,9 +9,9 @@
 import type { NodeSSH } from 'node-ssh';
 import { RemoteCommandError } from '../errors';
 import type { Server, SSHEndpoint, SSHRetryOptions } from '../types';
-import { asRoot } from './ServerProvisioner';
+import { asRoot, rootCommand } from './ServerProvisioner';
 import { SSHService } from './SSHService';
-import { addUserScript, authorizeKeysScript, checkUsername, RemoteUser, shellQuote } from './utils';
+import { addUserScript, authorizeKeysScript, checkLoginName, RemoteUser, shellQuote } from './utils';
 
 /** What a login needs besides where to: the private key of a key the machine takes. */
 export type RemoteLogin = {
@@ -20,7 +20,13 @@ export type RemoteLogin = {
     username?: string,
     /** Decrypts `privateKey` when it is stored encrypted (SSHService.initKeys with an encryptionKey). */
     decryptionKey?: string,
-    /** How often to try, and how long apart (default 10 tries, 5 s apart): a machine that has just come up may not take logins yet. */
+    /**
+     * How often to try, and how long apart: a machine that has just come up
+     * may not take logins yet. Default for a server (RemoteMachine.FIRST_LOGIN):
+     * 36 tries, 5 s apart, three minutes in all, since a container may still be
+     * installing its SSH server when it reads as running. For an endpoint given
+     * as it is, SSHService's own (10 tries, 5 s apart).
+     */
     retry?: SSHRetryOptions,
 };
 
@@ -46,7 +52,12 @@ export type RunResult = {
 
 /** How a file is written (RemoteMachine.writeFile). */
 export type WriteFileOptions = {
-    /** Its mode, as chmod takes it ('600', 'u=rw,go='). */
+    /**
+     * Its mode, as chmod takes it ('600', 'u=rw,go='). With one, the file is
+     * closed to everyone but its writer before the text goes in and gets its
+     * mode after, so the text is never in a file others can read: a mode that
+     * adds to what is there ('g+r') adds to that.
+     */
     mode?: string,
     /** Its owner, as chown takes it ('deploy', 'deploy:www-data'): needs root. */
     owner?: string,
@@ -55,6 +66,15 @@ export type WriteFileOptions = {
 };
 
 export class RemoteMachine {
+    /**
+     * How long a server's first login is tried for unless `retry` says: three
+     * minutes. A VM's sshd comes up after its address does, and a container
+     * that keys log in to starts its SSH server itself, installing OpenSSH
+     * first where its image has none (seen live 2026-10-12: Vast instances
+     * took their first login 14 s and 25 s after they read as running).
+     */
+    static readonly FIRST_LOGIN: Readonly<SSHRetryOptions> = Object.freeze({ maxRetries: 36, retryTimeout: 5000 });
+
     /** Where the session is, and whom it is logged in as. */
     readonly endpoint: Readonly<SSHEndpoint>;
 
@@ -70,7 +90,8 @@ export class RemoteMachine {
      * Logs in to a server of any provider (its `ssh` endpoint: it must run,
      * and have been created with a key this is the private half of), or to an
      * endpoint given as it is. As the endpoint's own login unless
-     * `login.username` names another (a user made with addUser).
+     * `login.username` names another (a user made with addUser, or any login
+     * the machine has).
      */
     static async connect(target: Server<any> | SSHEndpoint, login: RemoteLogin): Promise<RemoteMachine> {
         const server = 'host' in target ? undefined : target;
@@ -78,11 +99,13 @@ export class RemoteMachine {
         if (!endpoint) {
             throw new Error(`${server!.provider}: server ${server!.id} reports no ssh endpoint: wait until it runs (waitUntilRunning), and create it with sshKeyIds`);
         }
-        const username = login.username === undefined ? endpoint.username : checkUsername(login.username);
+        const username = login.username === undefined ? endpoint.username : checkLoginName(login.username);
         const to: SSHEndpoint = { host: endpoint.host, port: endpoint.port, username };
+        // A server may have come up this moment: its first login is given the time its SSH server takes to (FIRST_LOGIN).
+        const retry = login.retry ?? (server ? RemoteMachine.FIRST_LOGIN : undefined);
         const ssh = await SSHService.connect({
             ...to, privateKey: login.privateKey,
-            ...(login.decryptionKey !== undefined ? { decryptionKey: login.decryptionKey } : {}), ...(login.retry ? { retry: login.retry } : {}),
+            ...(login.decryptionKey !== undefined ? { decryptionKey: login.decryptionKey } : {}), ...(retry ? { retry: { ...retry } } : {}),
         });
         return new RemoteMachine(ssh, to);
     }
@@ -122,26 +145,36 @@ export class RemoteMachine {
      */
     async sudo(command: string, o: RunOptions = {}): Promise<RunResult> {
         const script = RemoteMachine.scripted(command, o);
-        return this.exec(command, this.endpoint.username === 'root' ? script : `sudo -n sh -c ${shellQuote(script)}`, o);
+        return this.exec(command, this.endpoint.username === 'root' ? script : rootCommand(script), o);
     }
 
     /** A text file's contents, read as the login (or as root with `sudo`). One that cannot be read throws. */
     async readFile(path: string, o: { sudo?: boolean } = {}): Promise<string> {
         const read = `cat -- ${shellQuote(path)}`;
         // As it is, to its last line break: nothing of the file is trimmed.
-        const r = await this.ssh.execCommand(o.sudo && this.endpoint.username !== 'root' ? `sudo -n sh -c ${shellQuote(read)}` : read, { noTrim: true });
+        const r = await this.ssh.execCommand(o.sudo && this.endpoint.username !== 'root' ? rootCommand(read) : read, { noTrim: true });
         return this.checked(read, r, true).stdout;
     }
 
     /**
      * Writes a text file, replacing what is there (its directory must exist),
      * with a mode and an owner where given. The text goes over the session's
-     * input, never into a command line: any text is written as it is.
+     * input, never into a command line: any text is written as it is. With a
+     * mode, the text is at no time in a file open to others: the file is made
+     * (or, one that is there, narrowed to) its writer's alone first, written,
+     * and given its owner and its mode last; where either of those fails, it
+     * stays closed.
      */
     async writeFile(path: string, content: string, o: WriteFileOptions = {}): Promise<void> {
         const file = shellQuote(path);
         // `--` before the mode and the owner: where every chmod and chown takes it (BSD's and busybox's as GNU's).
-        const write = [`cat > ${file}`, ...(o.mode !== undefined ? [`chmod -- ${shellQuote(o.mode)} ${file}`] : []), ...(o.owner !== undefined ? [`chown -- ${shellQuote(o.owner)} ${file}`] : [])].join(' && ');
+        const write = [
+            // A new file is made 600 (the umask), one that is there is brought to it: before the text, not after.
+            ...(o.mode !== undefined ? ['umask 077', `: >> ${file}`, `chmod -- 600 ${file}`] : []),
+            `cat > ${file}`,
+            ...(o.owner !== undefined ? [`chown -- ${shellQuote(o.owner)} ${file}`] : []),
+            ...(o.mode !== undefined ? [`chmod -- ${shellQuote(o.mode)} ${file}`] : []),
+        ].join(' && ');
         const asRootToo = o.sudo ?? o.owner !== undefined;
         await (asRootToo ? this.sudo(write, { stdin: content }) : this.run(write, { stdin: content }));
     }
@@ -186,13 +219,19 @@ export class RemoteMachine {
         await this.ssh.dispose();
     }
 
-    /** `command` with its directory and environment, as one shell script. */
+    /**
+     * `command` with its directory and environment, as one shell script: each
+     * on a line of its own that ends the script if it fails, and the command
+     * after them. Not `cd <dir> && <command>`: of a command that is several
+     * (`a; b`, or lines), that skips only the first where the directory is not
+     * there, and the rest runs in the login's home.
+     */
     private static scripted(command: string, o: RunOptions): string {
         const env = Object.entries(o.env ?? {}).map(([k, v]) => {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`bad environment variable name ${JSON.stringify(k)}`);
             return `export ${k}=${shellQuote(String(v))}`;
         });
-        return [...(o.cwd !== undefined ? [`cd ${shellQuote(o.cwd)}`] : []), ...env, command].join(' && ');
+        return [...[...(o.cwd !== undefined ? [`cd -- ${shellQuote(o.cwd)}`] : []), ...env].map((line) => `${line} || exit`), command].join('\n');
     }
 
     private async exec(command: string, script: string, o: RunOptions): Promise<RunResult> {

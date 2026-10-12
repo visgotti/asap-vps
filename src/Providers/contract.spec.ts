@@ -283,7 +283,8 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
         const connect = jest.spyOn(SSHService, 'connect').mockResolvedValue({ execCommand: async () => ({ stdout: 'ok', stderr: '', code: 0, signal: null }), dispose: async () => undefined } as never);
         try {
             const machine = await RemoteMachine.connect(s, { privateKey: 'PRIVATE' });
-            expect(connect).toHaveBeenCalledWith({ ...s.ssh, privateKey: 'PRIVATE' });
+            // A server's first login is given three minutes of tries (RemoteMachine.FIRST_LOGIN): its SSH server may still be coming up.
+            expect(connect).toHaveBeenCalledWith({ ...s.ssh, privateKey: 'PRIVATE', retry: { maxRetries: 36, retryTimeout: 5000 } });
             expect([machine.endpoint, machine.username, (await machine.run('true')).stdout]).toEqual([s.ssh, s.ssh!.username, 'ok']);
         } finally {
             connect.mockRestore();

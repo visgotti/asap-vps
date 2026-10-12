@@ -42,14 +42,24 @@ describe('filterOffers by country: the same on every provider, whatever it calls
         expect(filterOffers(offers).map((o) => o.id)).toEqual(['unknown', 'fr', 'both', 'us']);
     });
 
-    it('a code is read in either case; none asked for is no filter; a place whose country is not known, and an offer in stock nowhere, are in no country', () => {
+    it('a code is read in either case; left out, any country is allowed; a place whose country is not known, and an offer in stock nowhere, are in no country', () => {
         expect(filterOffers(offers, { countries: ['us'] }).map((o) => o.id)).toEqual(['both', 'us']);
-        expect(filterOffers(offers, { countries: [] }).map((o) => o.id)).toEqual(['unknown', 'fr', 'both', 'us']);
+        expect(filterOffers(offers, {}).map((o) => o.id)).toEqual(['unknown', 'fr', 'both', 'us']);
+        expect(filterOffers(offers, { countries: undefined }).map((o) => o.id)).toEqual(['unknown', 'fr', 'both', 'us']);
         expect(filterOffers(offers, { countries: ['US'], includeUnavailable: true }).map((o) => o.id)).toEqual(['both', 'us']);
         // An offer made without locations (another library's, an older one) is in no country either.
         const bare: Offer = { provider: 'p', id: 'bare', gpu: 'L4', vendor: 'nvidia', gpuCount: 1, vramGb: 24, pricePerHour: 1, regions: ['nyc1'], raw: {} };
         expect(filterOffers([bare], { countries: ['US'] })).toEqual([]);
         expect(filterOffers([bare])).toEqual([bare]);
+    });
+
+    it('an empty list of countries allows none: no offer, never every country (a list of places allowed that came out empty must not rent anywhere)', () => {
+        expect(filterOffers(offers, { countries: [] })).toEqual([]);
+        expect(filterOffers(offers, { countries: [], includeUnavailable: true })).toEqual([]);
+        // The same list built by a caller: the countries it may use, of which none is left.
+        const allowed = ['US', 'FR'].filter((c) => c === 'DE');
+        expect(filterOffers(offers, { countries: allowed })).toEqual([]);
+        expect([...countryCodes([])]).toEqual([]);
     });
 
     it('a country that is no ISO 3166-1 alpha-2 code is refused, not read as nowhere', () => {

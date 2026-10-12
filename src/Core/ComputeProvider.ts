@@ -56,11 +56,23 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
     /** The platform's names for the library's enums (CreateServerOptions.region and .image). */
     protected readonly enums: EnumTranslations = {};
     /**
-     * How many reads in a row as running a restart takes for done, of a server
-     * never seen otherwise (restartWatch): at the default pace, 30 seconds for
-     * a platform's status to show the reboot it was asked for.
+     * How long a platform's status is given to show the reboot it was asked
+     * for: a server never seen other than running that long is taken to be
+     * back (restartWatch).
      */
+    static readonly RESTART_SETTLE_MS = 30_000;
+    /** The fewest reads in a row as running that take a restart for done, however far apart they are. */
     static readonly RESTART_SETTLE_READS = 4;
+
+    /**
+     * The reads in a row as running, `intervalMs` apart, that a restart takes
+     * for done: as many as span RESTART_SETTLE_MS, and RESTART_SETTLE_READS at
+     * least. A time, not a count: read every second, a count of four would be
+     * three seconds, less than a reboot takes to begin.
+     */
+    static settleReads(intervalMs: number): number {
+        return Math.max(ComputeProvider.RESTART_SETTLE_READS, intervalMs > 0 ? Math.ceil(ComputeProvider.RESTART_SETTLE_MS / intervalMs) + 1 : 0);
+    }
 
     public abstract listOffers(query?: OfferQuery): Promise<Offer<T['offer']>[]>;
     public abstract createServer(options: CreateServerOptions<T>): Promise<Server<T['server']>>;
@@ -128,14 +140,14 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
     /**
      * What a restart waits on: until the server is running again, having been
      * seen not to be, or, where its status never shows the reboot, having read
-     * as running RESTART_SETTLE_READS times (restartWatch). One that is gone
+     * as running for RESTART_SETTLE_MS (settleReads, restartWatch). One that is gone
      * (NotFoundError), errors, stops or is deleted instead did not restart,
      * and is thrown at once, but for a status in `passing`: one the platform
      * shows of a server that is rebooting (a Lambda instance reads as
      * unhealthy, a RunPod pod as stopped), which is waited through.
      */
     protected async waitUntilRestarted(id: string, o: WaitOptions = {}, passing: readonly ServerStatus[] = []): Promise<Server<T['server']>> {
-        const back = restartWatch(ComputeProvider.RESTART_SETTLE_READS);
+        const back = restartWatch(ComputeProvider.settleReads(waitOf(o, { intervalMs: BaseProvider.POLL_INTERVAL_MS }).intervalMs));
         const failed = (['error', 'stopped', 'terminating', 'terminated'] as const).filter((x) => !passing.includes(x));
         const s = await this.waitForServer(id, (x) => !x || (failed as readonly ServerStatus[]).includes(x.status) || back(x.status === 'running'), o);
         if (!s) throw new NotFoundError(this.id, `server ${id} disappeared while it was restarting`);
