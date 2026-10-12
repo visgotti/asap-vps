@@ -12,7 +12,7 @@
 // `data`; every failure is {error: {code, message}}. A test puts an instance in
 // `unhealthy` or `preempted` through `state.instances`.
 
-import { fakeBootId, FakeApi, json, readRequest, userDataFiles } from './util';
+import { fakeBootId, FakeApi, json, readRequest, scriptKeys, userDataFiles } from './util';
 
 const TYPES = {
     gpu_1x_a10: { instance_type: { name: 'gpu_1x_a10', description: '1x A10 (24 GB PCIe)', gpu_description: 'A10 (24 GB PCIe)', price_cents_per_hour: 75,
@@ -134,6 +134,8 @@ export function fakeLambda(o: { token?: string, bootReads?: number, instanceQuot
                 // Its first boot: cloud-init runs its user data.
                 i.boots = 1;
                 i.files = userDataFiles(i.user_data);
+                // And adds the keys it names for the login (authorizeKeysScript), after the one the launch named.
+                i.authKeys = [...new Set([...(i.authKeys ?? []), ...(scriptKeys(i.user_data, 'ubuntu') ?? [])])];
             }
             else if (i.status === 'terminating') {
                 if (++i.terminatingReads > state.terminateReads) terminated(i);

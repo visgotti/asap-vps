@@ -7,6 +7,10 @@ import { InstallSSLCertificateStep } from './InstallSSLCertificateStep';
 import { CreateDirectoryStep } from './CreateDirectoryStep';
 import { RunCommandStep } from './RunCommandStep';
 import { AddAuthorizedKeyStep } from './AddAuthorizedKeyStep';
+import { AddUserStep } from './AddUserStep';
+import { testPublicKey } from '../../testing/fakes/util';
+import { asRoot } from '../ServerProvisioner';
+import { addUserScript, authorizeKeysScript } from '../utils';
 import { InstallNodeStep } from './InstallNodeStep';
 
 type ExecResult = { stdout: string; stderr: string; code: number };
@@ -266,47 +270,74 @@ describe('RunCommandStep', () => {
     });
 });
 
+/** A session that answers `answer` to everything, and keeps each command with what it was given on its input. */
+function recordingSSH(answer: Partial<ExecResult> | Error = {}) {
+    const sent: Array<{ command: string, stdin?: string }> = [];
+    const ssh = {
+        execCommand: jest.fn(async (command: string, options?: { stdin?: string }) => {
+            sent.push({ command, ...(options?.stdin !== undefined ? { stdin: options.stdin } : {}) });
+            if (answer instanceof Error) throw answer;
+            return { stdout: '', stderr: '', code: 0, ...answer };
+        }),
+    } as unknown as NodeSSH;
+    return { ssh, sent };
+}
+
 describe('AddAuthorizedKeyStep', () => {
-    it('should add public key when not already present', async () => {
-        const ssh = createMockSSH((cmd) => {
-            if (cmd.includes('grep -F')) return { code: 1, stdout: '' };
-            return {};
-        });
+    const KEY = testPublicKey('deploy@laptop');
 
-        const step = new AddAuthorizedKeyStep('ssh-rsa AAAA...');
-        const result = await step.execute(ssh, debianContext);
-
-        expect(result.success).toBe(true);
-        const cmds = (ssh.execCommand as jest.Mock).mock.calls.map((c: any[]) => c[0]);
-        expect(cmds.some((c: string) => c.includes('authorized_keys'))).toBe(true);
-        expect(cmds).toContain('mkdir -p /root/.ssh');
-        expect(cmds).toContain('chmod 700 /root/.ssh');
+    it('authorizes the key for root, or for the user named, with the one script every way of adding a key runs', async () => {
+        for (const [step, user] of [[new AddAuthorizedKeyStep(KEY), 'root'], [new AddAuthorizedKeyStep(`  ${KEY}\n`, 'deploy'), 'deploy']] as const) {
+            const { ssh, sent } = recordingSSH();
+            expect(await step.execute(ssh, debianContext)).toEqual({ step: 'add-authorized-key', success: true, message: `Public key authorized for ${user}` });
+            expect(sent).toEqual([{ command: 'sh -s', stdin: authorizeKeysScript([KEY], user) }]);
+        }
     });
 
-    it('should skip adding when key already exists', async () => {
-        const ssh = createMockSSH((cmd) => {
-            if (cmd.includes('grep -F')) return { code: 0, stdout: 'ssh-rsa AAAA...' };
-            return {};
+    it('fails with what the machine said when it cannot (no such user), and with the reason when the key or the user name is not one: nothing is sent then', async () => {
+        const refused = recordingSSH({ code: 1, stderr: 'asap-vps: no user deploy on this machine' });
+        expect(await new AddAuthorizedKeyStep(KEY, 'deploy').execute(refused.ssh, debianContext)).toEqual({
+            step: 'add-authorized-key', success: false, message: 'Could not authorize the public key for deploy', output: 'asap-vps: no user deploy on this machine',
         });
+        const { ssh, sent } = recordingSSH();
+        expect(await new AddAuthorizedKeyStep('ssh-rsa AAAA..."; rm -rf /').execute(ssh, debianContext)).toEqual({
+            step: 'add-authorized-key', success: false, message: 'bad public key "ssh-rsa AAAA...\\"; rm -rf /": not an OpenSSH public key line (ssh-ed25519 AAAA... comment)',
+        });
+        expect((await new AddAuthorizedKeyStep(KEY, 'de ploy').execute(ssh, debianContext)).message).toMatch(/^bad user name "de ploy"/);
+        expect(sent).toEqual([]);
+        const dropped = recordingSSH(new Error('Not connected to server'));
+        expect(await new AddAuthorizedKeyStep(KEY).execute(dropped.ssh, debianContext)).toEqual({ step: 'add-authorized-key', success: false, message: 'Not connected to server' });
+    });
+});
 
-        const step = new AddAuthorizedKeyStep('ssh-rsa AAAA...');
-        const result = await step.execute(ssh, debianContext);
+describe('AddUserStep', () => {
+    const KEY = testPublicKey('deploy@laptop');
 
-        expect(result.success).toBe(true);
-        expect(result.message).toContain('already exists');
+    it('makes the user with what RemoteMachine.addUser makes it with: its keys, sudo and shell, as one script on the input of a shell', async () => {
+        const { ssh, sent } = recordingSSH();
+        const options = { publicKeys: [KEY], sudo: true, shell: '/bin/bash' };
+        expect(await new AddUserStep('deploy', options).execute(ssh, debianContext)).toEqual({ step: 'add-user', success: true, message: 'User deploy is ready' });
+        expect(await new AddUserStep('svc').execute(ssh, rhelContext)).toEqual({ step: 'add-user', success: true, message: 'User svc is ready' });
+        expect(sent).toEqual([{ command: 'sh -s', stdin: addUserScript('deploy', options) }, { command: 'sh -s', stdin: addUserScript('svc') }]);
     });
 
-    it('should use correct home directory for non-root users', async () => {
-        const ssh = createMockSSH((cmd) => {
-            if (cmd.includes('grep -F')) return { code: 1, stdout: '' };
-            return {};
+    it('fails with what the machine said when it cannot make the user, and with the reason when the name or a key is not one: nothing is sent then', async () => {
+        const refused = recordingSSH({ code: 1, stderr: 'asap-vps: this machine has neither useradd nor adduser' });
+        expect(await new AddUserStep('deploy').execute(refused.ssh, debianContext)).toEqual({
+            step: 'add-user', success: false, message: 'Could not make the user deploy', output: 'asap-vps: this machine has neither useradd nor adduser',
         });
+        const { ssh, sent } = recordingSSH();
+        expect((await new AddUserStep('Root;id').execute(ssh, debianContext)).message).toMatch(/^bad user name "Root;id"/);
+        expect((await new AddUserStep('deploy', { publicKeys: ['nope'] }).execute(ssh, debianContext)).message).toMatch(/^bad public key "nope"/);
+        expect(sent).toEqual([]);
+        const dropped = recordingSSH(new Error('Not connected to server'));
+        expect(await new AddUserStep('deploy').execute(dropped.ssh, debianContext)).toEqual({ step: 'add-user', success: false, message: 'Not connected to server' });
+    });
 
-        const step = new AddAuthorizedKeyStep('ssh-rsa AAAA...', 'deploy');
-        await step.execute(ssh, debianContext);
-
-        const cmds = (ssh.execCommand as jest.Mock).mock.calls.map((c: any[]) => c[0]);
-        expect(cmds).toContain('mkdir -p /home/deploy/.ssh');
+    it('in a pipeline run as a login that is not root, the script goes to a shell root runs: through sudo, its input with it', async () => {
+        const { ssh, sent } = recordingSSH();
+        expect((await new AddUserStep('deploy', { sudo: true }).execute(asRoot(ssh, 'ubuntu'), debianContext)).success).toBe(true);
+        expect(sent).toEqual([{ command: `sudo -n bash -c 'sh -s'`, stdin: addUserScript('deploy', { sudo: true }) }]);
     });
 });
 

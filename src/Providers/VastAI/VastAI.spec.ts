@@ -5,9 +5,10 @@
 // containers that crash or go silent never reach running, and each offer is one
 // machine, whose driver's CUDA version is read before it is rented.
 
-import { RegistryClient } from '../../Core/utils';
-import { CapacityError, isRetriable, NotSupportedError, ProviderError } from '../../errors';
-import { json, testPublicKey } from '../../testing/fakes/util';
+import { CUDA_TYPES, MACHINE_TYPES } from '../../constants';
+import { RegistryClient, sshdBootScript } from '../../Core/utils';
+import { CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError } from '../../errors';
+import { json, testPublicKey, waitingClock } from '../../testing/fakes/util';
 import { FAKE_SNAPSHOTS, fakeVast } from '../../testing/fakes/vast';
 import { VastAI } from './VastAI';
 
@@ -311,33 +312,217 @@ describe('minCudaVersion on Vast: every offer is one machine, read before it is 
         expect([e.constructor.name, e.message]).toEqual(['CapacityError', 'vast: offer 101: its host\'s driver runs CUDA (unknown), below 12.0']);
         expect(rents(fake)).toHaveLength(0);
     });
+
+    it('an image by the library\'s names is Docker Hub\'s: an Ubuntu is rented unread; with cuda, only a machine whose driver runs that version', async () => {
+        const { p, fake } = make();
+        await p.createServer({ name: 'plain', offer: '106', image: MACHINE_TYPES.UBUNTU_24, command: ['nvidia-smi', '-L'] });
+        expect(rents(fake).pop()?.body).toMatchObject({ image: 'ubuntu:24.04', args: ['nvidia-smi', '-L'] });
+        // Nothing to check the machine for: it is not read.
+        expect(fake.calls.filter((c) => c.path === '/api/v0/bundles/' && c.body?.limit === 1)).toHaveLength(0);
+        const image = { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 };
+        await expect(p.createServer({ name: 't4', offer: '104', image })).rejects.toMatchObject({ name: 'CapacityError', message: expect.stringMatching(/runs CUDA 12\.2, below 12\.8$/) });
+        expect(rents(fake)).toHaveLength(1);
+        // Given no command it is kept up: the command of NVIDIA's image, as of a bare Ubuntu, exits at once.
+        await p.createServer({ name: 'a5000', offer: '102', container: { image } });
+        expect(rents(fake).pop()?.body).toMatchObject({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', args: ['sleep', 'infinity'] });
+        // minCudaVersion, where given, is the floor: this machine runs 12.2.
+        await p.createServer({ name: 'low', offer: '104', image: { os: 'ubuntu22', cuda: '12.8' }, minCudaVersion: '12.2' });
+        expect(rents(fake).pop()?.body.image).toBe('nvidia/cuda:12.8.2-base-ubuntu22.04');
+        await expect(p.createServer({ name: 'x', offer: '101', image: { os: 'ubuntu20', cuda: '13.0' } })).rejects.toMatchObject({
+            name: 'NotSupportedError', message: 'vast: image "ubuntu20" with cuda "13.0" (NVIDIA publishes no CUDA 13.0 image of Ubuntu 20.04: it has 22.04, 24.04) is not supported',
+        });
+        expect(rents(fake)).toHaveLength(3);
+        // An image of the caller's own runs its own command: none is added.
+        await p.createServer({ name: 'own', offer: '101', image: 'ubuntu:24.04' });
+        expect(rents(fake).pop()?.body.args).toBeUndefined();
+    });
 });
 
 describe('Vast stop and start, as the live API answers them (observed 2026-10-02)', () => {
-    const make = () => {
-        const fake = fakeVast();
-        return { fake, p: new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
+    const make = (o: Parameters<typeof fakeVast>[0] = {}, onSleep: (ms: number) => void = () => undefined) => {
+        const fake = fakeVast(o);
+        const slept: number[] = [];
+        return { fake, slept, p: new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: async (ms) => { slept.push(ms); onSleep(ms); } }) };
     };
     const running = async (p: VastAI) => {
         const [offer] = await p.listOffers();
         const s = await p.createServer({ name: 'cycle', offer, image: 'img', command: ['sleep', 'infinity'] });
         return p.waitUntilRunning(s.id, fast);
     };
+    /** What `p` reads of its servers from here on: each status, and how Vast worded it. */
+    const reading = (p: VastAI) => {
+        const seen: string[] = [];
+        const read = p.getServer.bind(p);
+        jest.spyOn(p, 'getServer').mockImplementation(async (id) => {
+            const s = await read(id);
+            seen.push(s ? `${s.status} (${s.providerStatus})` : 'gone');
+            return s;
+        });
+        return seen;
+    };
+    afterEach(() => jest.restoreAllMocks());
 
-    it('a started container reads as starting while Vast still reports it as it was left (exited), then running', async () => {
+    it('a stop returns once the container has exited: the instance reads as stopping until then, every 5 s unless told', async () => {
+        for (const [o, interval] of [[undefined, 5000], [{ intervalMs: 7, timeoutMs: 60_000 }, 7]] as const) {
+            const { p, fake, slept } = make();
+            const s = await running(p);
+            const seen = reading(p);
+            slept.length = 0;
+            await p.stopServer(s.id, o);
+            // What was asked is on record at once; the container runs on for a read, then exits.
+            expect(seen).toEqual(['stopping (running/running)', 'stopped (exited/stopped)']);
+            expect(slept).toEqual([interval]);
+            const inst = fake.state.instances.get(s.id);
+            expect([inst.actual_status, inst.cur_state, inst.intended_status]).toEqual(['exited', 'stopped', 'stopped']);
+            // Stopped already: asked again, read once, done.
+            seen.length = 0;
+            await p.stopServer(s.id, o);
+            expect(seen).toEqual(['stopped (exited/stopped)']);
+            jest.restoreAllMocks();
+        }
+    });
+
+    it('a container that does not stop is reported as what it still is, after 10 minutes or the time given; an instance deleted meanwhile is gone', async () => {
+        // A clock the waits advance: the minutes pass at once.
+        const clock = waitingClock();
+        try {
+            for (const [o, seconds, pauses] of [[undefined, 600, 120], [{ timeoutMs: 30_000 }, 30, 6], [{ timeoutMs: 30_000, intervalMs: 10_000 }, 30, 3]] as const) {
+                const { p, slept } = make({ stopReads: 1_000_000 }, (ms) => void clock.sleep(ms));
+                const s = await running(p);
+                slept.length = 0;
+                await expect(p.stopServer(s.id, o)).rejects.toMatchObject({ name: 'ProviderError', code: 'timeout', message: `vast: timed out after ${seconds} s waiting for server ${s.id}: stopping (running/running)` });
+                expect(slept).toHaveLength(pauses);
+            }
+        } finally {
+            clock.restore();
+        }
+        const { p, fake } = make({ stopReads: 1_000_000 });
+        const s = await running(p);
+        const stop = p.stopServer(s.id, fast);
+        fake.state.instances.delete(s.id);
+        await expect(stop).rejects.toMatchObject({ name: 'NotFoundError', message: `vast: server ${s.id} disappeared while it was stopping` });
+    });
+
+    it('a start returns once the container runs: it reads as starting while Vast still reports it as it was left (exited), then as it loads', async () => {
         const { p, fake } = make();
         const s = await running(p);
         await p.stopServer(s.id);
-        expect((await p.waitForServer(s.id, (x) => x?.status === 'stopped', fast))?.status).toBe('stopped');
-        await p.startServer(s.id);
+        const seen = reading(p);
+        await p.startServer(s.id, fast);
+        // Read first (stopped: it is started), then as it starts.
+        expect(seen).toEqual(['stopped (exited/stopped)', 'pending (exited/running)', 'pending (loading/running)', 'pending (loading/running)', 'running (running/running)']);
         const inst = fake.state.instances.get(s.id);
-        expect([inst.actual_status, inst.cur_state, inst.intended_status]).toEqual(['exited', 'running', 'running']);
-        expect((await p.getServer(s.id))?.status).toBe('pending');
-        expect((await p.waitUntilRunning(s.id, fast)).status).toBe('running');
-        // The same report read by an initializer that started nothing is a crash.
+        expect([inst.actual_status, inst.cur_state, inst.intended_status]).toEqual(['running', 'running', 'running']);
+        // Reported as it was left again (exited): to the provider that started it, still starting; to one that started nothing, a crash.
         Object.assign(inst, { actual_status: 'exited' });
+        expect((await p.getServer(s.id))?.status).toBe('pending');
         const other = new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: noSleep });
         expect((await other.getServer(s.id))?.status).toBe('error');
+    });
+
+    it('a start whose container never comes up is reported as what it still is when the wait runs out', async () => {
+        // A clock the waits advance: a wait longer than it was told ends at once too, and says how long it was.
+        const clock = waitingClock();
+        try {
+            const { p, slept } = make({ bootReads: 1_000_000 }, (ms) => void clock.sleep(ms));
+            const [offer] = await p.listOffers();
+            const s = await p.createServer({ name: 'cycle', offer, image: 'img', command: ['sleep', 'infinity'] });
+            await p.stopServer(s.id, fast);
+            slept.length = 0;
+            await expect(p.startServer(s.id, { intervalMs: 10_000, timeoutMs: 30_000 })).rejects.toMatchObject({ code: 'timeout', message: `vast: timed out after 30 s waiting for server ${s.id}: pending (loading/running)` });
+            expect(slept).toEqual([10_000, 10_000, 10_000]);
+        } finally {
+            clock.restore();
+        }
+    });
+
+    const states = (fake: ReturnType<typeof fakeVast>, id: string) => fake.calls.filter((c) => c.method === 'PUT' && c.path === `/api/v0/instances/${id}/`).map((c) => c.body.state);
+    const reboots = (fake: ReturnType<typeof fakeVast>, id: string) => fake.calls.filter((c) => c.method === 'PUT' && c.path === `/api/v0/instances/reboot/${id}/`).length;
+
+    it('a start of an instance that runs already is left as it is: read once, nothing asked of Vast, and no start of its own to make allowances for', async () => {
+        const { p, fake } = make();
+        const s = await running(p);
+        const seen = reading(p);
+        await p.startServer(s.id);
+        expect(seen).toEqual(['running (running/running)']);
+        expect(states(fake, s.id)).toEqual([]);
+        // It started nothing: a container that exits now has crashed, to it as to anyone.
+        Object.assign(fake.state.instances.get(s.id), { actual_status: 'exited' });
+        expect((await p.getServer(s.id))?.status).toBe('error');
+        await expect(p.startServer('424242')).rejects.toMatchObject({ name: 'NotFoundError', message: 'vast: no instance 424242' });
+    });
+
+    it('a restart returns once the container runs again: read first, then as it restarts; an instance deleted meanwhile is gone', async () => {
+        const { p, fake } = make();
+        const s = await running(p);
+        const seen = reading(p);
+        await p.restartServer(s.id, fast);
+        expect(seen).toEqual(['running (running/running)', 'pending (exited/running)', 'pending (loading/running)', 'pending (loading/running)', 'running (running/running)']);
+        expect(reboots(fake, s.id)).toBe(1);
+        jest.restoreAllMocks();
+        // Gone between the reboot and the next read.
+        const read = p.getServer.bind(p);
+        let reads = 0;
+        jest.spyOn(p, 'getServer').mockImplementation(async (id) => {
+            if (++reads === 2) fake.state.instances.delete(s.id);
+            return read(id);
+        });
+        await expect(p.restartServer(s.id, fast)).rejects.toMatchObject({ name: 'NotFoundError', message: `vast: server ${s.id} disappeared while it was restarting` });
+        expect(reboots(fake, s.id)).toBe(2);
+        await expect(p.restartServer(s.id, fast)).rejects.toMatchObject({ name: 'NotFoundError', message: `vast: no instance ${s.id}` });
+        expect(reboots(fake, s.id)).toBe(2);
+    });
+
+    it('a restart Vast still reports as it was left (running) is not over at the first read: it is, once the container was seen down and runs again', async () => {
+        const { p, fake } = make();
+        const s = await running(p);
+        const inst = fake.state.instances.get(s.id);
+        // The reboot is accepted, and the instance reads as before it for two more reads.
+        const read = p.getServer.bind(p);
+        let stale = 0;
+        const seen: string[] = [];
+        jest.spyOn(p, 'getServer').mockImplementation(async (id) => {
+            const before = { ...inst };
+            const lagging = reboots(fake, s.id) === 1 && stale++ < 2;
+            if (lagging) Object.assign(inst, { actual_status: 'running' });
+            const got = await read(id);
+            if (lagging) Object.assign(inst, { actual_status: before.actual_status, relaunching: before.relaunching, reads: before.reads });
+            seen.push(got ? got.status : 'gone');
+            return got;
+        });
+        await p.restartServer(s.id, fast);
+        expect(seen).toEqual(['running', 'running', 'running', 'pending', 'pending', 'pending', 'running']);
+    });
+
+    it('a restart whose host goes silent, or whose container exits for good, did not restart: said at once, not at the end of the wait', async () => {
+        for (const [gone, word] of [[{ actual_status: 'offline' }, 'offline/running'], [{ actual_status: 'unknown' }, 'unknown/running']] as const) {
+            const { p, fake } = make();
+            const s = await running(p);
+            const read = p.getServer.bind(p);
+            let reads = 0;
+            jest.spyOn(p, 'getServer').mockImplementation(async (id) => {
+                if (++reads === 2) Object.assign(fake.state.instances.get(s.id), gone, { relaunching: false });
+                return read(id);
+            });
+            await expect(p.restartServer(s.id, fast)).rejects.toMatchObject({ name: 'ProviderError', message: `vast: server ${s.id} is error (${word}): it did not restart` });
+            expect(reads).toBe(2);
+            jest.restoreAllMocks();
+        }
+    });
+
+    it('a restart of an instance that is stopped, or stopping, is refused before Vast is asked: its reboot is of a container that runs', async () => {
+        const { p, fake } = make({ stopReads: 5 });
+        const s = await running(p);
+        await p.api.call('PUT', `/api/v0/instances/${s.id}/`, { state: 'stopped' });
+        await expect(p.restartServer(s.id)).rejects.toMatchObject({
+            name: 'ProviderError', code: 'not_running', message: `vast: server ${s.id} is stopping: only a server that runs is restarted (start it)`,
+        });
+        await p.stopServer(s.id, fast);
+        await expect(p.restartServer(s.id)).rejects.toMatchObject({
+            name: 'ProviderError', code: 'not_running', message: `vast: server ${s.id} is stopped: only a server that runs is restarted (start it)`,
+        });
+        expect(reboots(fake, s.id)).toBe(0);
+        expect((await p.getServer(s.id))?.status).toBe('stopped');
     });
 
     it('a stopped instance bills no run, even before Vast\'s cur_state says so; a running one bills from the rental\'s start', async () => {
@@ -404,6 +589,52 @@ describe('Vast userData: a script run before the command, each time the containe
         return { fake, p: new VastAI({ apiKey: 'vast-test', fetchImpl: fake.fetchImpl, sleep: async () => {} }) };
     };
     const rentals = (fake: ReturnType<typeof fakeVast>) => fake.calls.filter((c) => c.method === 'PUT' && /^\/api\/v0\/asks\/\d+\/$/.test(c.path)).map((c) => c.body);
+
+    it('keys that log in start an SSH server before the command, in the same entrypoint: sshd first, then a script of the caller\'s, then the command; its port 22 is mapped for it', async () => {
+        const { fake, p } = make();
+        const [first, second] = await p.listOffers({ minCudaVersion: '12.8' });
+        const [a, b] = [await p.addSSHKey(testPublicKey('a'), 'a'), await p.addSSHKey(testPublicKey('b'), 'b')];
+        const s = await p.createServer({ name: 'ssh', offer: first, image: 'ghcr.io/acme/app:1', command: ['python', 'serve.py'], ports: ['8000/tcp'], sshKeyIds: [a.id, b.id] });
+        expect(rentals(fake).pop()).toMatchObject({
+            runtype: 'args', onstart: 'sh', args: ['-c', `${sshdBootScript([a.publicKey, b.publicKey])}exec "$@"`, 'asap-vps', 'python', 'serve.py'],
+            env: { '-p 8000:8000': '1', '-p 22:22': '1' },
+        });
+        // Its endpoint is the public port its port 22 is mapped to, on the machine's address: not Vast's proxy, which nothing listens behind.
+        const running = await p.waitUntilRunning(s.id, fast);
+        const mapped = running.ports!.find((x) => x.privatePort === 22)!;
+        expect(running.ssh).toEqual({ host: running.ip, port: mapped.publicPort, username: 'root' });
+        expect(running.ssh!.host).not.toBe('ssh5.vast.ai');
+        expect(fake.machine!(running.ssh!.host, running.ssh!.port)?.keys).toEqual([a.publicKey, b.publicKey]);
+        // With a script of the caller's own: after the SSH server, before the command.
+        const script = 'echo "asap-vps-boot=ok" > /tmp/booted';
+        await p.createServer({ name: 'both', offer: second, image: MACHINE_TYPES.UBUNTU_24, userData: script, command: ['sleep', '60'], sshKeyIds: [a.id] });
+        expect(rentals(fake).pop().args).toEqual(['-c', `${sshdBootScript([a.publicKey])}${script}\nexec "$@"`, 'asap-vps', 'sleep', '60']);
+    });
+
+    it('an image named by the library\'s enums is logged in to as it is, kept up; one of the caller\'s own with no command is refused before anything is read or rented, and Vast\'s own ssh launch mode is another thing', async () => {
+        const { fake, p } = make();
+        const [offer] = await p.listOffers();
+        const key = await p.addSSHKey(testPublicKey('k'), 'k');
+        await p.createServer({ name: 'ubuntu', offer, image: MACHINE_TYPES.UBUNTU_22, sshKeyIds: [key.id] });
+        expect(rentals(fake).pop()).toMatchObject({ image: 'ubuntu:22.04', onstart: 'sh', args: ['-c', `${sshdBootScript([key.publicKey])}exec "$@"`, 'asap-vps', 'sleep', 'infinity'] });
+        const asked = fake.calls.length;
+        await expect(p.createServer({ name: 'own', offer: '101', image: 'ghcr.io/acme/app:1', sshKeyIds: [key.id] })).rejects.toMatchObject({
+            name: 'NotSupportedError',
+            message: 'vast: createServer option "sshKeyIds" without "command" on an image of your own (the SSH server is started before the command, which replaces the image\'s own start: say what it runs) is not supported',
+        });
+        await expect(p.createServer({ name: 'mode', offer: '101', image: 'ghcr.io/acme/app:1', command: ['serve'], sshKeyIds: [key.id], providerOptions: { runtype: 'ssh' } }))
+            .rejects.toMatchObject({ name: 'ProviderError', message: 'vast: pass sshKeyIds or providerOptions.runtype, not both' });
+        expect(fake.calls).toHaveLength(asked);
+        // A key the account does not hold is refused, and nothing is rented.
+        const rented = rentals(fake).length;
+        await expect(p.createServer({ name: 'none', offer: '101', image: 'ghcr.io/acme/app:1', command: ['serve'], sshKeyIds: ['no-such-key'] })).rejects.toBeInstanceOf(NotFoundError);
+        expect(rentals(fake)).toHaveLength(rented);
+        // An instance rented without keys maps no port 22 and starts no SSH server: nothing answers for it.
+        const plain = await p.waitUntilRunning((await p.createServer({ name: 'plain', offer: '101', image: 'ghcr.io/acme/app:1', command: ['serve'] })).id, fast);
+        expect(rentals(fake).pop().env).toBeUndefined();
+        expect(plain.ports?.some((x) => x.privatePort === 22) ?? false).toBe(false);
+        expect(fake.machine!(plain.ip!, 22)).toBeUndefined();
+    });
 
     it('becomes the entrypoint `sh -c <script>; exec "$@"` over the command; without one, args are the command as before', async () => {
         const { fake, p } = make();

@@ -103,7 +103,7 @@ try {
 }
 ```
 
-`createProvider("lambda", key)` is typed by its id: it is a `LambdaCloud`, with no `stopServer`. `providersWith("images", "imageCopy")` answers from the capability descriptors, without building anything:
+`createProvider("lambda", key)` is typed by its id: it is a `LambdaCloud`, with no `stopServer`. Its settings are typed by the id too: `createProvider("scaleway", { apiKey, projectId })` takes Scaleway's Project, and Lambda's does not. `providersWith("images", "imageCopy")` answers from the capability descriptors, without building anything:
 
 ```ts run title="Which providers have what, from the descriptors"
 import { providersWith } from "asap-vps";

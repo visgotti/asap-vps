@@ -8,7 +8,8 @@
 // passed through. The caller's own user data still runs: both go to cloud-init
 // as one multipart document.
 
-import type { ContainerSpec } from '../../types';
+import type { ContainerSpec, PortProtocol, ResolvedContainer } from '../../types';
+import { containerImageOf, imageSpecOf } from './images';
 import { registryOf } from './registry';
 
 /** The container's name on the VM: `docker logs asap-vps`. */
@@ -21,31 +22,65 @@ export function shellQuote(s: string): string {
     return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-/** A port as Docker publishes it: '8000/tcp' -> '8000:8000/tcp' (udp kept; http, a container platform's word, is tcp). */
-function publish(port: string): string {
-    const m = /^(\d+)(?:\/(tcp|udp|http))?$/.exec(port.trim());
-    if (!m) throw new Error(`bad port "${port}": use <port>/<tcp|udp>`);
-    return `${m[1]}:${m[1]}/${m[2] === 'udp' ? 'udp' : 'tcp'}`;
+/**
+ * What a container named by the library's enums runs when it is given no
+ * command: it stays up, as a VM does (the command of Docker Hub's `ubuntu`
+ * and `nvidia/cuda`, a shell, exits at once with no terminal).
+ */
+export const CONTAINER_KEEP_ALIVE: readonly string[] = Object.freeze(['sleep', 'infinity']);
+
+/**
+ * A container as it runs: its image as a registry reference (one named by
+ * the library's enums is Docker Hub's image for it: containerImageOf), and,
+ * for such an image given no command, the command that keeps it up
+ * (CONTAINER_KEEP_ALIVE). One whose image is the caller's own is as it is.
+ */
+export function resolveContainer(c: ContainerSpec): ResolvedContainer {
+    const spec = imageSpecOf(c.image);
+    if (!spec) return c as ResolvedContainer;
+    return { ...c, image: containerImageOf(spec), ...(c.command?.length ? {} : { command: [...CONTAINER_KEEP_ALIVE] }) };
 }
 
 /**
- * The first-boot script that runs `c` on a VM (bash, as root), `gpu` passing
- * its NVIDIA GPUs through. Env values are written to a root-only file, one
- * per line (so a value cannot hold a line break); a registry login goes to
+ * A port as `ports` writes one, read: '8000/tcp', '53/udp', '8888/http', in
+ * either case; a bare '8000' is tcp. Throws for anything else, and for a
+ * port outside 1-65535, the same on every provider.
+ */
+export function parsePort(port: string): { port: number, protocol: PortProtocol } {
+    const m = /^(\d{1,5})(?:\/(tcp|udp|http))?$/i.exec(String(port).trim());
+    const n = m ? Number(m[1]) : 0;
+    if (!m || n < 1 || n > 65535) throw new Error(`bad port "${port}": use <port>/<tcp|udp|http>, the port from 1 to 65535`);
+    return { port: n, protocol: (m[2]?.toLowerCase() ?? 'tcp') as PortProtocol };
+}
+
+/** A port as Docker publishes it: '8000/tcp' -> '8000:8000/tcp' (udp kept; http, a container platform's word, is tcp). */
+function publish(port: string): string {
+    const p = parsePort(port);
+    return `${p.port}:${p.port}/${p.protocol === 'udp' ? 'udp' : 'tcp'}`;
+}
+
+/**
+ * The first-boot script that runs a container on a VM (bash, as root), `gpu`
+ * passing its NVIDIA GPUs through. An image named by the library's enums is
+ * the registry reference it stands for, kept up when it is given no command
+ * (resolveContainer). Env values are written to a root-only file, one per
+ * line (so a value cannot hold a line break); a registry login goes to
  * `docker login --password-stdin` and is then removed from the machine's
  * Docker config. The login also rides in the server's user data, which the
  * account and the server itself can read: give a token that can only pull.
  */
-export function containerBootScript(c: ContainerSpec, o: { gpu: boolean }): string {
+export function containerBootScript(container: ContainerSpec, o: { gpu: boolean }): string {
+    const c = resolveContainer(container);
     for (const [k, v] of Object.entries(c.env ?? {})) {
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`bad env name "${k}"`);
         if (/[\r\n]/.test(v)) throw new Error(`env ${k}: a value cannot hold a line break`);
     }
     const env = Object.entries(c.env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n');
-    const login = c.registryAuth ? { host: registryOf(c.registryAuth, c.image), ...c.registryAuth } : undefined;
+    const { image } = c;
+    const login = c.registryAuth ? { host: registryOf(c.registryAuth, image), ...c.registryAuth } : undefined;
     const run = ['docker', 'run', '-d', '--name', VM_CONTAINER_NAME, '--restart', 'unless-stopped', '--env-file', VM_CONTAINER_ENV_FILE,
         ...(c.ports ?? []).flatMap((p) => ['-p', publish(p)])].map(shellQuote).join(' ');
-    const tail = [c.image, ...(c.command ?? [])].map(shellQuote).join(' ');
+    const tail = [image, ...(c.command ?? [])].map(shellQuote).join(' ');
     return [
         '#!/bin/bash',
         '# asap-vps: the server\'s container (CreateServerOptions.container), run once at the first boot.',
@@ -78,9 +113,9 @@ export function containerBootScript(c: ContainerSpec, o: { gpu: boolean }): stri
         'ASAP_VPS_ENV',
         ...(login ? [
             `printf '%s' ${shellQuote(login.password)} | docker login -u ${shellQuote(login.username)} --password-stdin ${shellQuote(login.host)}`,
-            `docker pull ${shellQuote(c.image)}`,
+            `docker pull ${shellQuote(image)}`,
             `docker logout ${shellQuote(login.host)} || true`,
-        ] : [`docker pull ${shellQuote(c.image)}`]),
+        ] : [`docker pull ${shellQuote(image)}`]),
         `docker rm -f ${VM_CONTAINER_NAME} >/dev/null 2>&1 || true`,
         `${run} $GPUS ${tail}`,
         '',

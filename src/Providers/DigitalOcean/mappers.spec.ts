@@ -3,12 +3,27 @@
 // stated default), never NaN or a crash, and a status word it adds later
 // reads as 'unknown'.
 
-import { formattedAs, FS_TAG, nfsMounts, nfsMountScript, nfsTag, toImage, toNfsVolume, toOffer, toServer, toVolume, volumeMountScript } from './mappers';
+import { countryOf, DIGITALOCEAN_ENUMS, formattedAs, FS_TAG, nfsMounts, nfsMountScript, nfsTag, toImage, toNfsVolume, toOffer, toServer, toVolume, volumeMountScript } from './mappers';
 import type { DigitalOceanDropletData, DigitalOceanImageData, DigitalOceanNfsShare, DigitalOceanSizeData, DigitalOceanVolumeData } from './types';
 
 const size = (o: Partial<DigitalOceanSizeData> = {}) => ({ slug: 's-1vcpu-1gb', price_hourly: 0.00893, available: true, regions: ['nyc3'], vcpus: 1, memory: 1024, disk: 25, ...o }) as DigitalOceanSizeData;
 const droplet = (o: Partial<DigitalOceanDropletData> = {}) => ({ id: 7, name: 'd', status: 'active', created_at: '2026-10-01T00:00:00Z', ...o }) as DigitalOceanDropletData;
 const SHARE = '0b4c5b1e-6a0e-4c47-9c1a-0a1b2c3d4e5f';
+
+describe('DigitalOcean places', () => {
+    it('the country of each datacenter it has (GET /v2/regions, 2026-10-12), by the letters its slug begins with; none for one it does not know', () => {
+        const live = ['nyc1', 'sfo1', 'nyc2', 'ams2', 'sgp1', 'lon1', 'nyc3', 'ams3', 'fra1', 'tor1', 'sfo2', 'blr1', 'sfo3', 'syd1', 'atl1', 'ric1', 'mkc1', 'mem1'];
+        expect(live.map(countryOf)).toEqual(['US', 'US', 'US', 'NL', 'SG', 'GB', 'US', 'NL', 'DE', 'CA', 'US', 'IN', 'US', 'AU', 'US', 'US', 'US', 'US']);
+        expect(['xyz1', '', undefined, 'NYC1', '1nyc'].map(countryOf)).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    });
+
+    it('Amsterdam is ams3, the datacenter there that takes new resources, as San Francisco is sfo3', () => {
+        expect(DIGITALOCEAN_ENUMS.regions).toEqual({
+            toronto: 'tor1', nyc: 'nyc1', nyc1: 'nyc1', nyc2: 'nyc2', nyc3: 'nyc3',
+            san_francisco: 'sfo3', san_francisco_1: 'sfo1', san_francisco_2: 'sfo2', san_francisco_3: 'sfo3', amsterdam: 'ams3', amsterdam_3: 'ams3',
+        });
+    });
+});
 
 describe('DigitalOcean sizes as offers', () => {
     it('a size that is not available, or names no regions, is in stock nowhere', () => {

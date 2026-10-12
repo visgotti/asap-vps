@@ -11,11 +11,11 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider } from '../../Core/ComputeProvider';
-import { asksForGpu, cudaVersion, filterOffers, findSSHKey, isKind, parseSSHPublicKey, pickSSHKeys, registryAuthName, registryOf } from '../../Core/utils';
+import { asksForGpu, cudaVersion, filterOffers, findSSHKey, isKind, parseSSHPublicKey, pickSSHKeys, registryAuthName, registryOf, waitOf } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, TransportError } from '../../errors';
 import type {
     CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, InitializedSSHKeyData, LogOptions, Offer, OfferQuery, RegistryAuth,
-    Server, ServerListOptions, Volume,
+    Server, ServerListOptions, Volume, WaitOptions,
 } from '../../types';
 import { RunPodApi } from './api';
 import {
@@ -35,7 +35,7 @@ export const RUNPOD_CAPABILITIES = {
     power: { stoppedBilling: 'storage' },
     restart: {},
     logs: {},
-    sshKeys: { appliedAtBoot: false },
+    sshKeys: { atCreate: 'chosen', appliedAtBoot: false },
     // Network volumes: any number of pods in its data center mount one, each at the path it asks for.
     volumes: { shared: { mount: 'path', size: 'fixed', minGb: 10, maxGb: 4096 } },
     // Load-balancing endpoints: workers serve plain HTTP, no RunPod SDK in the image; on GPU pools or CPU flavors.
@@ -89,11 +89,21 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
      * overrides it: a pod takes any count up to the type's maximum), in the
      * offer's data center.
      *
-     * `sshKeyIds` authorizes exactly those account keys: they go in PUBLIC_KEY,
-     * which RunPod's SSH setup reads (left to itself it would put every key on the
-     * account there; the image must honor PUBLIC_KEY, as RunPod's own images do).
-     * It also exposes 22/tcp: without it the pod has only RunPod's proxy, a shell
-     * with no scp, sftp or port forwarding.
+     * `sshKeyIds` are the account keys that log in to the pod, as root, and no
+     * other: RunPod gives a container no SSH server, so the pod's start runs one
+     * first (sshStart: OpenSSH, installed where the image has none) and then its
+     * command, which must therefore be known: `command`, or an image named by
+     * the library's enums (kept up). An image of your own with no command is
+     * refused: one that starts sshd itself from PUBLIC_KEY, as RunPod's own
+     * images do, takes `env: { PUBLIC_KEY }`, `ports: ['22/tcp']` and
+     * `providerOptions: { startSsh: true }` instead.
+     * It also exposes 22/tcp: without it the pod has only RunPod's proxy, a
+     * shell with no scp, sftp or port forwarding.
+     *
+     * An offer rents in its first data center with stock, as everywhere; where
+     * that one cannot place the pod (CapacityError: none free of what was asked,
+     * no host that runs the CUDA asked for), its next is tried, and the last
+     * one's refusal is the create's. A `region` pins it.
      *
      * `mounts` takes one network volume (a pod mounts at most one), at its
      * `path` (default /workspace): the pod is placed in the volume's data
@@ -110,33 +120,45 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
         if (cpu && o.volume) throw new NotSupportedError(this.id, 'createServer option "volume" on a CPU pod (it has no disk of its own: mount a network volume)');
         // The container: `container`, or the top-level image, env, command, ports and registryAuth.
         const c = this.containerOf(o);
-        const image = this.imageName(c?.image);
+        const image = c?.image;
         if (!c || !image) throw new ProviderError(this.id, 'a pod needs an image');
-        if (c.ports?.some((p) => /\/udp$/i.test(p))) throw new NotSupportedError(this.id, 'createServer option "ports" with udp');
+        const asPorts = this.portsOf(c.ports);
+        if (asPorts.some((p) => p.protocol === 'udp')) throw new NotSupportedError(this.id, 'createServer option "ports" with udp');
         const network = await this.networkMount(o);
-        // A pod that mounts a volume goes where the volume is.
-        const region = network?.dataCenter ?? offered;
+        // Where it goes: where its volume is; else where it was asked to; else the offer's data centers with stock, each in
+        // turn until one can place it (an offer's first, as everywhere: but its hosts differ in what they have free and in the
+        // CUDA they run, so the next is tried before the offer is given up on). An offer's id alone names none: RunPod picks.
+        const pinned = network?.dataCenter ?? (o.region !== undefined ? offered : undefined);
+        const dataCenters: Array<string | undefined> = pinned || o.providerOptions?.dataCenterIds || !offer?.regions.length ? [pinned] : offer.regions;
         if (c.registryAuth && o.providerOptions?.registry !== undefined) throw new ProviderError(this.id, 'pass registryAuth or providerOptions.registry, not both');
-        const ports = [...(c.ports ?? [])];
-        if (o.sshKeyIds?.length && !ports.some((p) => /^22\/tcp$/i.test(p))) ports.push('22/tcp');
-        const minCuda = o.minCudaVersion !== undefined ? cudaVersion(o.minCudaVersion) : undefined;
+        const ports = asPorts.map((p) => `${p.port}/${p.protocol}`);
+        if (o.sshKeyIds?.length && !ports.includes('22/tcp')) ports.push('22/tcp');
+        const asked = this.minCudaOf(o);
+        const minCuda = asked !== undefined ? cudaVersion(asked) : undefined;
         const env = { ...(c.env ?? {}) };
+        // The keys that log in: RunPod gives a container no SSH server, so its start runs one first (sshStart), then its command.
+        let start: string | undefined;
         if (o.sshKeyIds?.length) {
             if (env.PUBLIC_KEY !== undefined) throw new ProviderError(this.id, 'pass sshKeyIds or env.PUBLIC_KEY, not both');
-            env.PUBLIC_KEY = pickSSHKeys(await this.listSSHKeys(), o.sshKeyIds, this.id).map((k) => k.publicKey).join('\n');
+            this.sshCommand(c);
+            const keys = pickSSHKeys(await this.listSSHKeys(), o.sshKeyIds, this.id).map((k) => k.publicKey);
+            start = this.sshStart(c, keys);
+            // Named for RunPod too, which would otherwise hand the container every key of the account (startSsh).
+            env.PUBLIC_KEY = keys.join('\n');
         }
         // Stored last, once nothing of the request is left to refuse: a create that is refused leaves no login on the account.
         const registry = c.registryAuth ? await this.registryId(c.registryAuth, image) : undefined;
-        const pod = await this.api.call<RunPodPod>('POST', '/v2/pods', {
+        const body = (dataCenter: string | undefined) => ({
             name: o.name,
             image,
             ...(cpu ? { cpu: { id: cpu.flavor, vcpuCount: cpu.vcpuCount } }
                 : { gpu: { id: offerId, count: o.gpuCount ?? offer?.gpuCount ?? 1, ...(minCuda ? { minCudaVersion: minCuda } : {}) } }),
             // CPU pods are on the secure cloud only.
             cloud: cpu ? 'SECURE' : this.cloud,
-            ...(region ? { dataCenterIds: [region] } : {}),
+            ...(dataCenter ? { dataCenterIds: [dataCenter] } : {}),
             ...(Object.keys(env).length ? { env } : {}),
             ...(ports.length ? { ports } : {}),
+            ...(start ? { entrypoint: ['sh', '-c', start, 'asap-vps'] } : {}),
             ...(c.command?.length ? { cmd: c.command } : {}),
             // Always set (RunPod needs one: DEFAULT_DISK_GB), in whole GB (the API takes integers).
             disk: Math.ceil(o.diskGb || RunPod.DEFAULT_DISK_GB),
@@ -146,7 +168,16 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
             ...(o.sshKeyIds?.length ? { startSsh: true } : {}),
             ...o.providerOptions,
         });
-        return toServer(pod);
+        const rent = async (dataCenter: string | undefined) => toServer(await this.api.call<RunPodPod>('POST', '/v2/pods', body(dataCenter)));
+        // A data center with no room for it rents nothing: the next is asked, and the last one's answer is the create's.
+        for (const dataCenter of dataCenters.slice(0, -1)) {
+            try {
+                return await rent(dataCenter);
+            } catch (e) {
+                if (!(e instanceof CapacityError)) throw e;
+            }
+        }
+        return rent(dataCenters[dataCenters.length - 1]);
     }
 
     public async getServer(id: string): Promise<Server<RunPodPod> | null> {
@@ -174,18 +205,21 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
 
     // ── power, restart, logs ─────────────────────────────────────────────
 
-    /** Releases the GPU and keeps the pod's volume; a pod that is already stopped stays so. */
-    public async stopServer(id: string): Promise<void> {
-        await this.action(id, 'stop', ['EXITED']);
+    /** Releases the GPU and keeps the pod's volume, and waits until the pod is stopped (default: 10 minutes); a pod that is already stopped stays so. */
+    public async stopServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
+        const pod = await this.action(id, 'stop', ['EXITED']);
+        if (pod?.status !== 'EXITED') await this.waitUntilStopped(id, wait);
     }
 
     /**
-     * Boots the pod on its host again. A host that rented the GPU out meanwhile
-     * either refuses the start or resumes the pod with none (that pod is stopped
-     * again): either way this throws CapacityError, and the pod stays stopped
-     * (create a new pod elsewhere instead).
+     * Boots the pod on its host again, and waits until it is running. A host
+     * that rented the GPU out meanwhile either refuses the start or resumes the
+     * pod with none (that pod is stopped again): either way this throws
+     * CapacityError, and the pod stays stopped (create a new pod elsewhere instead).
      */
-    public async startServer(id: string): Promise<void> {
+    public async startServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
         const before = await this.api.getPod(id);
         if (!before) throw new NotFoundError(this.id, `pod ${id} not found`);
         const pod = await this.action(id, 'start', ['RUNNING', 'STARTING', 'PROVISIONING']);
@@ -193,10 +227,19 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
             await this.action(id, 'stop', ['EXITED']).catch(() => undefined);
             throw new CapacityError(this.id, `pod ${id} resumed without a GPU (its host has none free now): stopped it again`);
         }
+        if (pod?.status !== 'RUNNING') await this.waitUntilRunning(id, wait);
     }
 
-    public async restartServer(id: string): Promise<void> {
+    /**
+     * Runs the pod's container again, and waits until the pod runs again
+     * (waitUntilRestarted: RunPod's answer to the restart reads the pod as it
+     * was, so it says nothing of it; a pod RunPod stops on its way reads as
+     * stopped meanwhile). A pod that is stopped is refused by RunPod (409).
+     */
+    public async restartServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
         await this.action(id, 'restart');
+        await this.waitUntilRestarted(id, wait, ['stopped']);
     }
 
     /** The pod's recent container output: the log stream's backfill, read for `windowMs` (default 3 s). */
@@ -282,7 +325,7 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
      */
     public async createEndpoint(o: CreateEndpointOptions<RunPodTypes>): Promise<Endpoint<RunPodEndpoint>> {
         const c = o.container;
-        const image = this.imageName(c?.image);
+        const image = this.containerImageName(c?.image);
         if (!image) throw new ProviderError(this.id, 'an endpoint needs an image');
         const port = o.port ?? 80;
         if (!(Number.isInteger(port) && port > 0 && port < 65536)) throw new ProviderError(this.id, `bad port ${port}`);
@@ -296,7 +339,9 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
         }
         const idle = o.idleTimeoutSeconds;
         if (idle !== undefined && !(Number.isInteger(idle) && idle >= 1 && idle <= 3600)) throw new ProviderError(this.id, `idleTimeoutSeconds is 1-3600, not ${idle}`);
-        const compute = await this.endpointCompute(o.offer);
+        // Its workers go where the driver runs the CUDA asked for (minCudaVersion, else the image's own, as a pod's does).
+        const cuda = this.minCudaOf({ minCudaVersion: o.minCudaVersion, container: c });
+        const compute = await this.endpointCompute(o.offer, cuda !== undefined ? cudaVersion(cuda) : undefined);
         if (c.registryAuth && o.providerOptions?.registry !== undefined) throw new ProviderError(this.id, 'pass registryAuth or providerOptions.registry, not both');
         const region = o.region !== undefined ? this.regionName(o.region) : undefined;
         // Stored last, as for a pod: a create that is refused leaves no login on the account.
@@ -419,7 +464,7 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
     }
 
     /** What an endpoint's workers run on, as its create takes it: a GPU type pinned within its pool, or a CPU flavor; the cheapest in stock when no offer is named. */
-    private async endpointCompute(offer: Offer<RunPodGpuType | RunPodCpuOffer> | string | undefined): Promise<Pick<RunPodCreateEndpointBody, 'gpu' | 'cpu'>> {
+    private async endpointCompute(offer: Offer<RunPodGpuType | RunPodCpuOffer> | string | undefined, minCuda?: string): Promise<Pick<RunPodCreateEndpointBody, 'gpu' | 'cpu'>> {
         if (offer !== undefined && typeof offer !== 'string' && offer.provider !== this.id) throw new ProviderError(this.id, `offer ${offer.id} is ${offer.provider}'s, not ${this.id}'s`);
         let id = typeof offer === 'string' ? offer : offer?.id;
         if (id === undefined) {
@@ -437,7 +482,7 @@ export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements P
         if (!type) throw new NotFoundError(this.id, `no GPU type "${id}"`);
         if (!type.pool) throw new ProviderError(this.id, `GPU type "${id}" is in no serverless pool`);
         const others = gpus.filter((g) => g.pool === type.pool && g.id !== type.id).map((g) => g.id);
-        return { gpu: { pools: [type.pool], ...(others.length ? { excludedTypes: others } : {}), count: 1 } };
+        return { gpu: { pools: [type.pool], ...(others.length ? { excludedTypes: others } : {}), count: 1, ...(minCuda ? { minCudaVersion: minCuda } : {}) } };
     }
 
     /** The GPU types as offers: none for a question about machines without GPUs. */

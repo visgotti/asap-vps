@@ -1,5 +1,5 @@
 import { ProviderError } from '../../errors';
-import type { ComputeKind, Offer, OfferQuery } from '../../types';
+import type { ComputeKind, Location, Offer, OfferQuery } from '../../types';
 
 /** Whether an offer or server of this many GPUs is of `kind` (default 'any'). */
 export function isKind(gpuCount: number | undefined, kind: ComputeKind = 'any'): boolean {
@@ -13,14 +13,43 @@ export function asksForGpu(q: OfferQuery): boolean {
 }
 
 /**
+ * An offer's `regions` and `locations`, from the provider's names for its
+ * places and what says each one's country (ISO 3166-1 alpha-2; undefined
+ * where its name does not say): what every provider's offers are made with,
+ * so OfferQuery.countries reads them all alike.
+ */
+export function located(regions: readonly string[], countryOf: (region: string) => string | undefined): { regions: string[], locations: Location[] } {
+    return { regions: [...regions], locations: regions.map((region) => placed(region, countryOf(region))) };
+}
+
+/** A place and its country, where there is one to say. */
+export function placed(region: string, country: string | undefined): Location {
+    return country ? { region, country } : { region };
+}
+
+/** Country codes as ISO 3166-1 alpha-2 writes them ('us' -> 'US'). Throws on anything else, so a typo ('USA') is not read as "nowhere". */
+export function countryCodes(countries: readonly string[]): Set<string> {
+    return new Set(countries.map((c) => {
+        if (typeof c !== 'string' || !/^[A-Za-z]{2}$/.test(c)) throw new ProviderError('asap-vps', `bad country ${JSON.stringify(c)}: use an ISO 3166-1 alpha-2 code, e.g. US`);
+        return c.toUpperCase();
+    }));
+}
+
+/**
  * The one meaning of OfferQuery on every provider: providers push what they
  * can into their own search, then apply this. Cheapest first.
  */
 export function filterOffers<O extends Offer<any>>(offers: O[], q: OfferQuery = {}): O[] {
     const minCuda = q.minCudaVersion !== undefined ? cudaVersion(q.minCudaVersion) : undefined;
     const gpuOnly = asksForGpu(q);
-    return offers
-        .filter((o) => (q.includeUnavailable || o.regions.length > 0)
+    const countries = q.countries?.length ? countryCodes(q.countries) : undefined;
+    // In the countries asked for: only its places there are left to it (one whose country is not known is in none).
+    const there = (o: O): O => {
+        const locations = (o.locations ?? []).filter((l) => l.country !== undefined && countries!.has(l.country));
+        return { ...o, regions: locations.map((l) => l.region), locations };
+    };
+    return (countries ? offers.map(there) : offers)
+        .filter((o) => (countries ? o.regions.length > 0 : q.includeUnavailable || o.regions.length > 0)
             && (q.includeInterruptible || !o.interruptible)
             && (q.maxPricePerHour === undefined || o.pricePerHour <= q.maxPricePerHour)
             && isKind(o.gpuCount, q.kind)

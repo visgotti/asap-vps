@@ -18,7 +18,7 @@
 // (FAKE_SNAPSHOTS: a fake registry of the account's). Failures carry {success: false, error, msg}.
 
 import { fakeRegistry } from './registry';
-import { echoed, FakeApi, json, readRequest } from './util';
+import { echoed, fakeBootId, FakeApi, json, readRequest, scriptKeys, startsSshd } from './util';
 
 /** A registry of the account's with a repository snapshots are pushed to, and a login that can push to it. */
 export const FAKE_SNAPSHOTS = { server: 'registry.fake', repository: 'acme/snapshots', username: 'pusher', password: 'push-secret' };
@@ -52,7 +52,7 @@ const OPS: Record<string, (a: number, b: any) => boolean> = {
 /** Storage on each machine: what a volume is rented from. */
 const VOLUME_ASKS = ASKS.map((a) => ({ id: 5000 + a.machine_id, machine_id: a.machine_id, disk_space: 400, storage_cost: 0.2, geolocation: a.geolocation, reliability: a.reliability }));
 
-export function fakeVast(o: { token?: string, bootReads?: number, seededInstances?: number, volumeReleaseReads?: number, snapshotReads?: number } = {}) {
+export function fakeVast(o: { token?: string, bootReads?: number, stopReads?: number, seededInstances?: number, volumeReleaseReads?: number, snapshotReads?: number } = {}) {
     const token = o.token ?? 'vast-test';
     const calls: FakeApi['calls'] = [];
     const state = {
@@ -62,6 +62,8 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
         logs: new Map<string, { text: string, fetchesBeforeReady: number }>(),
         nextId: 9000,
         bootReads: o.bootReads ?? 2,
+        /** Reads a running container still runs for after it is asked to stop: the instance reads as stopping meanwhile. */
+        stopReads: o.stopReads ?? 2,
         failNextRentWith: 0,
         /** The next start finds its machine's GPU taken: Vast queues it (observed 2026-10-02). */
         queueNextStart: false,
@@ -103,20 +105,24 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
     };
     /** An instance as the single read has it: no volume_info (the list's alone). */
     const view = (i: any) => {
-        const { reads, relaunching, volume_info: _, ...rest } = i;
+        const { reads, relaunching, stopLeft, volume_info: _, ...rest } = i;
         return rest;
     };
     /** A read of one instance (alone, or the list filtered to it): time passes for it, its container loads, then runs. */
     const readOne = (i: any) => {
         i.reads++;
-        if (i.actual_status === null && i.reads >= 1) i.actual_status = 'loading';
+        // Asked to stop while it ran: its container runs on for a while, then exits, and the contract's state follows.
+        if (i.actual_status === 'running' && i.intended_status === 'stopped') {
+            if (--i.stopLeft <= 0) Object.assign(i, { actual_status: 'exited', cur_state: 'stopped' });
+        }
+        else if (i.actual_status === null && i.reads >= 1) i.actual_status = 'loading';
         // A started or rebooted container still reads as it was left (exited) for a while, then loads (observed 2026-10-02).
         else if (i.actual_status === 'exited' && i.relaunching && i.reads >= 2) Object.assign(i, { actual_status: 'loading', relaunching: false, reads: 0 });
         else if (i.actual_status === 'loading' && i.reads >= state.bootReads && i.intended_status === 'running') i.actual_status = 'running';
     };
     /** An instance as the list has it. */
     const listView = (i: any) => {
-        const { reads, relaunching, ...rest } = i;
+        const { reads, relaunching, stopLeft, ...rest } = i;
         return rest;
     };
     const volumeView = (v: any) => {
@@ -245,7 +251,11 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
                 return json(200, { instances: view(i) });
             }
             if (method === 'PUT') {
-                if (body?.state === 'stopped') Object.assign(i, { cur_state: 'stopped', intended_status: 'stopped', actual_status: 'exited' });
+                if (body?.state === 'stopped') {
+                    // What was asked is recorded at once; a container that runs takes a while to stop.
+                    if (i.actual_status === 'running' && state.stopReads > 0) Object.assign(i, { intended_status: 'stopped', stopLeft: state.stopReads });
+                    else Object.assign(i, { cur_state: 'stopped', intended_status: 'stopped', actual_status: 'exited' });
+                }
                 if (body?.state === 'running') {
                     // Its machine's GPU is someone else's now: the start is queued, a 200 that says it failed (observed 2026-10-02).
                     if (state.queueNextStart) {
@@ -370,6 +380,14 @@ export function fakeVast(o: { token?: string, bootReads?: number, seededInstance
         state,
         registry,
         liveServers: () => state.instances.size,
+        // An instance answers at the public port its port 22 is mapped to once its container runs, and only where its start runs an SSH server.
+        machine: (host: string, port?: number) => {
+            const i = [...state.instances.values()].find((x) => x.actual_status === 'running' && String(x.public_ipaddr).trim() === host
+                && (port === undefined || x.ports?.['22/tcp']?.some((m: { HostPort: string }) => Number(m.HostPort) === port)));
+            const start = i?.onstart === 'sh' && i.image_args?.[0] === '-c' ? i.image_args[1] : undefined;
+            if (!i || !i.ports?.['22/tcp'] || !startsSshd(start)) return undefined;
+            return { bootId: fakeBootId(i.id, i.boots ?? 1), files: {}, keys: scriptKeys(start, 'root') ?? [] };
+        },
     };
     return api;
 }

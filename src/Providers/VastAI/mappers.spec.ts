@@ -3,8 +3,24 @@
 // default), never NaN or a crash.
 
 import { testPublicKey } from '../../testing/fakes/util';
-import { instanceStatus, machineOf, toImage, toOffer, toServer, toSSHKey, toVolume } from './mappers';
+import { countryOf, instanceStatus, machineOf, toImage, toOffer, toServer, toSSHKey, toVolume } from './mappers';
 import type { VastInstance, VastOffer, VastSnapshotRepository, VastVolume } from './types';
+
+describe('Vast places', () => {
+    it('the country a machine is in is the code its location ends with, as Vast writes it (seen 2026-10-12); none where it gives none', () => {
+        expect(['Texas, US', 'United Kingdom, GB', 'South Korea, KR', 'Quebec, CA', 'Czechia, CZ', 'New Zealand, NZ', 'SE'].map(countryOf)).toEqual(['US', 'GB', 'KR', 'CA', 'CZ', 'NZ', 'SE']);
+        expect(['unknown', '', null, undefined, 'Texas, us', 'Texas,US', 'Texas, USA', 'US, Texas'].map(countryOf)).toEqual(Array(8).fill(undefined));
+    });
+
+    it('an offer is in its machine\'s country by both of its names: where it is, and the machine it is', () => {
+        const o = toOffer({ id: 1, gpu_name: 'RTX 4090', num_gpus: 1, gpu_ram: 24000, dph_total: 0.4, geolocation: 'Japan, JP', machine_id: 7 } as VastOffer, false);
+        expect([o.regions, o.locations]).toEqual([['Japan, JP', 'machine:7'], [{ region: 'Japan, JP', country: 'JP' }, { region: 'machine:7', country: 'JP' }]]);
+        const nowhere = toOffer({ id: 2, gpu_name: 'RTX 4090', num_gpus: 1, gpu_ram: 24000, dph_total: 0.4, machine_id: 8 } as VastOffer, false);
+        expect(nowhere.locations).toEqual([{ region: 'unknown' }, { region: 'machine:8' }]);
+        expect(toServer({ id: 5, actual_status: 'running', geolocation: 'Norway, NO' } as VastInstance).country).toBe('NO');
+        expect('country' in toServer({ id: 5, actual_status: 'running' } as VastInstance)).toBe(false);
+    });
+});
 
 describe('Vast offers', () => {
     it('an ask that says next to nothing: one GPU of no known model, its place unknown, no CUDA', () => {
@@ -44,6 +60,18 @@ describe('Vast instances', () => {
         // A binding that is null among the port's bindings is no binding.
         expect(toServer({ id: 9, ports: { '443/tcp': [null, { HostIp: '0.0.0.0', HostPort: '41000' }] } } as unknown as VastInstance).ports)
             .toEqual([{ privatePort: 443, publicPort: 41000, ip: undefined, protocol: 'tcp' }]);
+    });
+
+    it('where to log in: the machine\'s address and the port mapped to the container\'s 22; Vast\'s own proxy where none is mapped; nowhere where it gives neither', () => {
+        const mapped = { '22/tcp': [{ HostIp: '0.0.0.0', HostPort: '41022' }], '8080/tcp': [{ HostIp: '0.0.0.0', HostPort: '41080' }], '22/udp': [{ HostIp: '0.0.0.0', HostPort: '41999' }] };
+        const ssh = (i: object) => toServer({ id: 9, ...i } as unknown as VastInstance).ssh;
+        // The mapped port wins over the proxy, which carries no scp or port forwarding; port 22 itself, over tcp, and no other.
+        expect(ssh({ public_ipaddr: '198.51.100.7\n', ports: mapped, ssh_host: 'ssh5.vast.ai', ssh_port: 20009 })).toEqual({ host: '198.51.100.7', port: 41022, username: 'root' });
+        expect(ssh({ public_ipaddr: '198.51.100.7', ports: { '8080/tcp': mapped['8080/tcp'], '22/udp': mapped['22/udp'] }, ssh_host: 'ssh5.vast.ai', ssh_port: '20009' }))
+            .toEqual({ host: 'ssh5.vast.ai', port: 20009, username: 'root' });
+        // A mapped port with no address to reach it at is no endpoint: the proxy, where there is one.
+        expect(ssh({ ports: mapped, ssh_host: 'ssh5.vast.ai', ssh_port: 20009 })).toEqual({ host: 'ssh5.vast.ai', port: 20009, username: 'root' });
+        expect([ssh({ ports: mapped }), ssh({ ssh_host: 'ssh5.vast.ai' }), ssh({ ssh_port: 20009 }), ssh({}), 'ssh' in toServer({ id: 9 } as unknown as VastInstance)]).toEqual([undefined, undefined, undefined, undefined, false]);
     });
 });
 

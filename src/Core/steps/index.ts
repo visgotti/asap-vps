@@ -4,4 +4,5 @@ export { InstallSSLCertificateStep } from './InstallSSLCertificateStep';
 export { CreateDirectoryStep } from './CreateDirectoryStep';
 export { RunCommandStep } from './RunCommandStep';
 export { AddAuthorizedKeyStep } from './AddAuthorizedKeyStep';
+export { AddUserStep } from './AddUserStep';
 export { InstallNodeStep } from './InstallNodeStep';

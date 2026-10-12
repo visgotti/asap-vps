@@ -17,7 +17,8 @@ import type { Scaleway } from './Scaleway/Scaleway';
 import type { ScalewayBlockVolume, ScalewayFileSystem } from './Scaleway/types';
 import type { VastImage, VastVolume } from './VastAI/types';
 import type { VastAI } from './VastAI/VastAI';
-import type { CreateServerOptions, ServerImage, Volume } from '../types';
+import { CUDA_TYPES, MACHINE_TYPES } from '../constants';
+import type { CreateServerOptions, ImageSpec, ServerImage, Volume } from '../types';
 
 type ServerOptions<P extends { createServer(o: never): unknown }> = Parameters<P['createServer']>[0];
 type VolumeOptions<P extends { createVolume(o: never): unknown }> = Parameters<P['createVolume']>[0];
@@ -40,14 +41,37 @@ describe('types: each provider offers what its platform honors', () => {
 
         // @ts-expect-error a pod has no cloud-init
         accepts<ServerOptions<RunPod>>({ ...base, userData: '#cloud-config' });
-        // @ts-expect-error a Vast instance authorizes every account key: no choice of keys
-        accepts<ServerOptions<VastAI>>({ ...base, sshKeyIds: ['k'] });
+        // The keys that log in are named on every provider, a container platform's included.
+        accepts<ServerOptions<VastAI>>({ ...base, image: 'ghcr.io/acme/app:1', command: ['serve'], sshKeyIds: ['k'] });
+        accepts<ServerOptions<RunPod>>({ ...base, image: 'ghcr.io/acme/app:1', command: ['serve'], sshKeyIds: ['k'] });
+        // @ts-expect-error a Vast instance has no tags
+        accepts<ServerOptions<VastAI>>({ ...base, tags: ['t'] });
         // @ts-expect-error a droplet runs no container: no registry login
         accepts<ServerOptions<DigitalOcean>>({ ...base, registryAuth: { username: 'u', password: 'p' } });
         // @ts-expect-error Lambda's instance type fixes its disk
         accepts<ServerOptions<LambdaCloud>>({ ...base, diskGb: 100 });
         // @ts-expect-error a Scaleway Instance takes no container environment
         accepts<ServerOptions<Scaleway>>({ ...base, env: { A: 'b' } });
+    });
+
+    it('image: the library\'s names on every platform, as enum members or as their values; a version the enums do not have is not one', () => {
+        const spec = { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 };
+        accepts<ServerOptions<RunPod>>({ ...base, image: spec });
+        accepts<ServerOptions<VastAI>>({ ...base, image: MACHINE_TYPES.UBUNTU_24 });
+        accepts<ServerOptions<DigitalOcean>>({ ...base, image: { os: 'ubuntu24', cuda: '12.8' } });
+        accepts<ServerOptions<Scaleway>>({ ...base, image: { os: 'ubuntu22' }, container: { image: spec } });
+        accepts<ServerOptions<LambdaCloud>>({ ...base, image: 'lambda-stack-24-04', container: { image: MACHINE_TYPES.UBUNTU_22 } });
+        accepts<CreateServerOptions>({ ...base, image: spec });
+        accepts<Parameters<RunPod['createEndpoint']>[0]>({ name: 'e', container: { image: spec } });
+
+        // @ts-expect-error there is no CUDA 12.7
+        accepts<ImageSpec>({ os: 'ubuntu24', cuda: '12.7' });
+        // @ts-expect-error not an Ubuntu the library names
+        accepts<ImageSpec>({ os: 'ubuntu26' });
+        // @ts-expect-error a spec names its Ubuntu
+        accepts<ImageSpec>({ cuda: '12.8' });
+        // @ts-expect-error cuda is a version, not a flag
+        accepts<ServerOptions<RunPod>>({ ...base, image: { os: 'ubuntu24', cuda: true } });
     });
 
     it('container: one shape on every platform, its login inside it; a VM runs it with Docker beside its own user data', () => {

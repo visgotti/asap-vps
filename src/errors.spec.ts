@@ -1,7 +1,7 @@
 // What asap-vps throws: each error named for its class, so a caller (or a log)
 // can tell them apart, and which of them are worth trying again.
 
-import { AuthError, CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError, QuotaError, quotedMessage, TransportError } from './errors';
+import { AuthError, CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError, QuotaError, quotedMessage, RemoteCommandError, TransportError } from './errors';
 
 describe('errors', () => {
     it('quotedMessage quotes an error of the same provider without its prefix, which the quoting error says once already; any other as it is', () => {
@@ -28,6 +28,25 @@ describe('errors', () => {
         expect([e.name, e.message, e.cause, e.retriable]).toEqual(['TransportError', 'GET https://api.example.com/x: fetch failed', cause, true]);
         const bare = new TransportError('POST https://api.example.com/x: fetch failed', undefined, false);
         expect(['cause' in bare, bare.retriable]).toEqual([false, false]);
+    });
+
+    it('a RemoteCommandError says who ran what where and how it ended, and ends on the command\'s own last three lines: of what it wrote as errors, else of what it wrote', () => {
+        const failed = new RemoteCommandError('root@203.0.113.7', 'apt-get install -y nginx', { code: 100, stdout: 'Reading package lists...\n', stderr: 'W: one\nE: two\nE: three\nE: four\n' });
+        expect([failed.name, failed.message, failed instanceof Error, failed instanceof ProviderError]).toEqual([
+            'RemoteCommandError', 'root@203.0.113.7: `apt-get install -y nginx` exited 100: E: two\nE: three\nE: four', true, false]);
+        expect([failed.login, failed.command, failed.code, failed.stdout, failed.stderr, 'signal' in failed]).toEqual([
+            'root@203.0.113.7', 'apt-get install -y nginx', 100, 'Reading package lists...\n', 'W: one\nE: two\nE: three\nE: four\n', false]);
+        // Nothing on stderr: the end of what it wrote; nothing at all: how it ended alone.
+        expect(new RemoteCommandError('ubuntu@h', 'test -f x', { code: 1, stdout: 'a\nb\nc\nd\ne', stderr: '  \n' }).message).toBe('ubuntu@h: `test -f x` exited 1: c\nd\ne');
+        expect(new RemoteCommandError('ubuntu@h', 'false', { code: 1, stdout: '', stderr: '' }).message).toBe('ubuntu@h: `false` exited 1');
+        expect(new RemoteCommandError('ubuntu@h', 'exit 0', { code: 0, stdout: '', stderr: '' }).message).toBe('ubuntu@h: `exit 0` exited 0');
+        // Ended by a signal: no status, and the signal where the session named it.
+        const killed = new RemoteCommandError('root@h', 'train', { code: null, signal: 'SIGKILL', stdout: '', stderr: 'Killed' });
+        expect([killed.message, killed.code, killed.signal]).toEqual(['root@h: `train` was ended by SIGKILL: Killed', null, 'SIGKILL']);
+        for (const signal of [null, undefined, '']) {
+            const unnamed = new RemoteCommandError('root@h', 'train', { code: null, signal, stdout: '', stderr: '' });
+            expect([unnamed.message, 'signal' in unnamed]).toEqual(['root@h: `train` was ended by a signal', false]);
+        }
     });
 
     it('isRetriable: only a ProviderError or TransportError that says so, nothing else whatever it carries', () => {

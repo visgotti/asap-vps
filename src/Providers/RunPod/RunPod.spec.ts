@@ -8,10 +8,11 @@
 // holds any OpenSSH key type, and minCudaVersion scopes the catalog's stock and
 // places the pod.
 
-import { REGION_TYPES } from '../../constants';
+import { CUDA_TYPES, MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import { AuthError, CapacityError, NotFoundError, NotSupportedError, ProviderError } from '../../errors';
+import { sshdBootScript } from '../../Core/utils';
 import { fakeRunPod } from '../../testing/fakes/runpod';
-import { followingRedirects, testPublicKey } from '../../testing/fakes/util';
+import { followingRedirects, testPublicKey, waitingClock } from '../../testing/fakes/util';
 import { runPodGpuName, sseLogLines } from './mappers';
 import { RunPod } from './RunPod';
 
@@ -361,17 +362,18 @@ describe('RunPod API facts', () => {
     it('SSH keys expose 22/tcp once, so the pod has sshd\'s direct endpoint and its host\'s address', async () => {
         const { p, fake } = make();
         const key = await p.addSSHKey(testPublicKey('ci'), 'ci');
-        const s = await p.createServer({ name: 'ssh', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8888/http'], sshKeyIds: [key.id] });
+        const run = { offer: 'NVIDIA RTX A5000', image: 'img', command: ['serve'], sshKeyIds: [key.id] };
+        const s = await p.createServer({ name: 'ssh', ...run, ports: ['8888/http'] });
         expect(created(fake)[0].body).toMatchObject({ ports: ['8888/http', '22/tcp'], startSsh: true });
         const running = await p.waitUntilRunning(s.id, fast);
         expect(running.ip).toBe('194.68.245.10');
         expect(running.ports?.find((x) => x.privatePort === 22)).toMatchObject({ protocol: 'tcp', publicPort: 40022 });
         expect(running.ssh).toEqual({ host: '194.68.245.10', port: 40022, username: 'root' });
-        await p.createServer({ name: 'ssh2', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['22/tcp'], sshKeyIds: [key.id] });
+        await p.createServer({ name: 'ssh2', ...run, ports: ['22/tcp'] });
         expect(created(fake)[1].body.ports).toEqual(['22/tcp']);
         // Added to no ports at all, and to a port that only ends in 22; not to 22/tcp among others.
         const ports = async (asked?: string[]) => {
-            await p.createServer({ name: 'ssh3', offer: 'NVIDIA RTX A5000', image: 'img', ...(asked ? { ports: asked } : {}), sshKeyIds: [key.id] });
+            await p.createServer({ name: 'ssh3', ...run, ...(asked ? { ports: asked } : {}) });
             return last(created(fake))?.body.ports;
         };
         expect(await ports()).toEqual(['22/tcp']);
@@ -379,21 +381,53 @@ describe('RunPod API facts', () => {
         expect(await ports(['22/tcp', '8888/http'])).toEqual(['22/tcp', '8888/http']);
     });
 
-    it('sshKeyIds authorize exactly those keys (RunPod would put every account key there), and an unknown id is refused', async () => {
+    it('sshKeyIds are the keys that log in, and no other (RunPod would hand the pod every account key), and an unknown id is refused', async () => {
         const { p, fake } = make();
         fake.state.keys = [testPublicKey('colleague')];
         const mine = await p.addSSHKey(testPublicKey('ci'), 'ci');
-        await p.createServer({ name: 'k', offer: 'NVIDIA RTX A5000', image: 'img', sshKeyIds: [mine.id] });
+        const run = { offer: 'NVIDIA RTX A5000', image: 'img', command: ['serve'] };
+        await p.createServer({ name: 'k', ...run, sshKeyIds: [mine.id] });
         expect(created(fake)[0].body.env).toEqual({ PUBLIC_KEY: mine.publicKey });
-        await expect(p.createServer({ name: 'k2', offer: 'NVIDIA RTX A5000', image: 'img', sshKeyIds: ['SHA256:not-on-the-account'] }))
-            .rejects.toBeInstanceOf(NotFoundError);
-        await expect(p.createServer({ name: 'k3', offer: 'NVIDIA RTX A5000', image: 'img', sshKeyIds: [mine.id], env: { PUBLIC_KEY: 'x' } }))
-            .rejects.toThrow(/not both/);
+        await expect(p.createServer({ name: 'k2', ...run, sshKeyIds: ['SHA256:not-on-the-account'] })).rejects.toBeInstanceOf(NotFoundError);
+        await expect(p.createServer({ name: 'k3', ...run, sshKeyIds: [mine.id], env: { PUBLIC_KEY: 'x' } })).rejects.toThrow(/not both/);
         expect(created(fake)).toHaveLength(1);
         // Several keys: one a line, as authorized_keys holds them.
         const other = await p.addSSHKey(testPublicKey('ci2'), 'ci2');
-        await p.createServer({ name: 'k4', offer: 'NVIDIA RTX A5000', image: 'img', sshKeyIds: [mine.id, other.id] });
+        await p.createServer({ name: 'k4', ...run, sshKeyIds: [mine.id, other.id] });
         expect(last(created(fake))?.body.env).toEqual({ PUBLIC_KEY: `${mine.publicKey}\n${other.publicKey}` });
+    });
+
+    it('a pod that keys log in to starts an SSH server before its command: RunPod gives a container none, so its entrypoint is the library\'s, and its command what that hands over to', async () => {
+        const { p, fake } = make();
+        const [a, b] = [await p.addSSHKey(testPublicKey('a'), 'a'), await p.addSSHKey(testPublicKey('b'), 'b')];
+        const s = await p.createServer({ name: 'ssh', offer: 'NVIDIA RTX A5000', image: 'ghcr.io/acme/app:1', command: ['python', 'serve.py'], sshKeyIds: [a.id, b.id] });
+        const body = last(created(fake))?.body;
+        expect(body.entrypoint).toEqual(['sh', '-c', `${sshdBootScript([a.publicKey, b.publicKey])}exec "$@"`, 'asap-vps']);
+        expect(body.cmd).toEqual(['python', 'serve.py']);
+        // Something answers at its endpoint once it runs, and takes those two keys alone.
+        const running = await p.waitUntilRunning(s.id, fast);
+        expect(fake.machine!(running.ssh!.host, running.ssh!.port)?.keys).toEqual([a.publicKey, b.publicKey]);
+        // A pod without keys keeps the image's own entrypoint, and nothing answers there.
+        const plain = await p.waitUntilRunning((await p.createServer({ name: 'plain', offer: 'NVIDIA RTX A5000', image: 'ghcr.io/acme/app:1', ports: ['22/tcp'] })).id, fast);
+        expect(last(created(fake))?.body.entrypoint).toBeUndefined();
+        expect(fake.machine!(plain.ssh!.host, plain.ssh!.port)).toBeUndefined();
+    });
+
+    it('an image named by the library\'s enums is logged in to as it is: kept up after its SSH server; an image of the caller\'s own with no command is refused before anything is read or rented', async () => {
+        const { p, fake } = make();
+        const key = await p.addSSHKey(testPublicKey('ci'), 'ci');
+        await p.createServer({ name: 'ubuntu', offer: 'NVIDIA RTX A5000', image: MACHINE_TYPES.UBUNTU_24, sshKeyIds: [key.id] });
+        expect(last(created(fake))?.body).toMatchObject({ image: 'ubuntu:24.04', entrypoint: ['sh', '-c', `${sshdBootScript([key.publicKey])}exec "$@"`, 'asap-vps'], cmd: ['sleep', 'infinity'] });
+        const asked = fake.calls.length;
+        await expect(p.createServer({ name: 'own', offer: 'NVIDIA RTX A5000', image: 'ghcr.io/acme/app:1', sshKeyIds: [key.id] })).rejects.toMatchObject({
+            name: 'NotSupportedError',
+            message: 'runpod: createServer option "sshKeyIds" without "command" on an image of your own (the SSH server is started before the command, which replaces the image\'s own start: say what it runs) is not supported',
+        });
+        expect(fake.calls).toHaveLength(asked);
+        // An image that starts sshd itself from PUBLIC_KEY (RunPod's own do) is given the key the way it reads it.
+        await p.createServer({ name: 'runpod-image', offer: 'NVIDIA RTX A5000', image: 'runpod/base:1', env: { PUBLIC_KEY: key.publicKey }, ports: ['22/tcp'] });
+        expect(last(created(fake))?.body).toMatchObject({ env: { PUBLIC_KEY: key.publicKey }, ports: ['22/tcp'] });
+        expect(last(created(fake))?.body.entrypoint).toBeUndefined();
     });
 
     it('an http port\'s address is RunPod\'s proxy network, never the server\'s ip', async () => {
@@ -639,6 +673,342 @@ describe('minCudaVersion on RunPod: the catalog scopes stock to hosts that run i
         const body = last(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/pods'))?.body;
         expect(body.gpu).toEqual({ id: 'NVIDIA RTX A5000', count: 1, minCudaVersion: '12.0' });
         expect(fake.state.pods.get(s.id)).toMatchObject({ dataCenterId: 'US-TX-3', cudaVersion: '12.8' });
+    });
+});
+
+describe('RunPod stop, start and restart return when it is done', () => {
+    /**
+     * A provider on the fake whose answers about `id` can lag: the next `lag`
+     * answers about it (an action's, a read's) say `status` instead of what
+     * the fake has; `slept`: its waits, each also given to `onSleep`.
+     */
+    const lagging = (onSleep: (ms: number) => void = () => undefined) => {
+        const fake = fakeRunPod();
+        const slept: number[] = [];
+        const late = { lag: 0, status: 'RUNNING' };
+        const fetchImpl = (async (url: string, init?: RequestInit) => {
+            const r = await fake.fetchImpl(url, init);
+            if (late.lag <= 0 || r.status !== 200 || !/^\/v2\/pods\/[^/]+(\/action)?$/.test(new URL(url).pathname)) return r;
+            late.lag--;
+            return answer(200, { ...(await r.json()), status: late.status });
+        }) as typeof fetch;
+        return { fake, slept, late, p: new RunPod({ apiKey: 'rp-test', fetchImpl, sleep: async (ms) => { slept.push(ms); onSleep(ms); } }) };
+    };
+    const up = async (p: RunPod) => (await p.waitUntilRunning((await p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: 'img' })).id, fast)).id;
+    const since = (fake: ReturnType<typeof fakeRunPod>, from: number) => fake.calls.slice(from).map((c) => `${c.method} ${c.path}`);
+
+    it('a stop RunPod answers with the pod stopped is done: nothing more is read', async () => {
+        const { p, fake, slept } = lagging();
+        const id = await up(p);
+        const [from, pauses] = [fake.calls.length, slept.length];
+        await p.stopServer(id);
+        expect(since(fake, from)).toEqual([`POST /v2/pods/${id}/action`]);
+        expect(slept).toHaveLength(pauses);
+        expect(fake.state.pods.get(id).status).toBe('EXITED');
+    });
+
+    it('a stop RunPod answers with the pod still running is waited for, every 5 s unless told, until it reads as stopped', async () => {
+        for (const [o, interval] of [[undefined, 5000], [{ intervalMs: 7, timeoutMs: 60_000 }, 7]] as const) {
+            const { p, fake, slept, late } = lagging();
+            const id = await up(p);
+            const [from, pauses] = [fake.calls.length, slept.length];
+            // The action's answer and the two reads after it still say RUNNING.
+            late.lag = 3;
+            await p.stopServer(id, o);
+            expect(since(fake, from)).toEqual([`POST /v2/pods/${id}/action`, `GET /v2/pods/${id}`, `GET /v2/pods/${id}`, `GET /v2/pods/${id}`]);
+            expect(slept.slice(pauses)).toEqual([interval, interval]);
+        }
+    });
+
+    it('a pod that does not stop is reported as what it still is, after 10 minutes or the time given; one deleted meanwhile is gone', async () => {
+        // A clock the waits advance: the minutes pass at once.
+        const clock = waitingClock();
+        try {
+            for (const [o, seconds, pauses] of [[undefined, 600, 120], [{ timeoutMs: 30_000 }, 30, 6], [{ timeoutMs: 30_000, intervalMs: 10_000 }, 30, 3]] as const) {
+                const { p, late, slept } = lagging((ms) => void clock.sleep(ms));
+                const id = await up(p);
+                late.lag = Infinity;
+                slept.length = 0;
+                await expect(p.stopServer(id, o)).rejects.toMatchObject({ name: 'ProviderError', code: 'timeout', message: `runpod: timed out after ${seconds} s waiting for server ${id}: running (RUNNING)` });
+                expect(slept).toHaveLength(pauses);
+            }
+        } finally {
+            clock.restore();
+        }
+        const { p, fake, late } = lagging();
+        const id = await up(p);
+        late.lag = 1;
+        const from = fake.calls.length;
+        const stop = p.stopServer(id, fast);
+        fake.state.pods.delete(id);
+        await expect(stop).rejects.toMatchObject({ name: 'NotFoundError', message: `runpod: server ${id} disappeared while it was stopping` });
+        expect(since(fake, from)).toEqual([`POST /v2/pods/${id}/action`, `GET /v2/pods/${id}`]);
+    });
+
+    it('a start returns once the pod runs: it is read until then, and not at all when RunPod answers that it runs', async () => {
+        const { p, fake } = lagging();
+        const id = await up(p);
+        await p.stopServer(id);
+        let from = fake.calls.length;
+        await p.startServer(id, fast);
+        // The pod before the start, the start (answered STARTING), then reads until it runs.
+        expect(since(fake, from)).toEqual([`GET /v2/pods/${id}`, `POST /v2/pods/${id}/action`, `GET /v2/pods/${id}`, `GET /v2/pods/${id}`]);
+        expect(fake.state.pods.get(id).status).toBe('RUNNING');
+        // Running already: RunPod's 409, the pod read to see it is where a start would put it, and nothing to wait for.
+        from = fake.calls.length;
+        await p.startServer(id);
+        expect(since(fake, from)).toEqual([`GET /v2/pods/${id}`, `POST /v2/pods/${id}/action`, `GET /v2/pods/${id}`]);
+    });
+
+    it('a start whose pod errors instead of running throws what it became', async () => {
+        const { p, late } = lagging();
+        const id = await up(p);
+        await p.stopServer(id);
+        // The start is accepted, and the pod reads as ERROR from then on.
+        Object.assign(late, { lag: Infinity, status: 'ERROR' });
+        await expect(p.startServer(id, fast)).rejects.toMatchObject({ name: 'ProviderError', message: `runpod: server ${id} is error (ERROR)` });
+    });
+
+    it('a restart is read until the pod runs again: RunPod\'s answer to it, the pod as it was, says nothing, and a pod never read otherwise is back on its fourth read', async () => {
+        const { p, fake, slept } = lagging();
+        const id = await up(p);
+        const [from, pauses] = [fake.calls.length, slept.length];
+        await p.restartServer(id);
+        expect(since(fake, from)).toEqual([`POST /v2/pods/${id}/action`, ...Array(4).fill(`GET /v2/pods/${id}`)]);
+        expect(slept.slice(pauses)).toEqual([10_000, 10_000, 10_000]);
+    });
+
+    it('a pod RunPod stops on its way to restarting is waited through, and is back the first time it runs; one that errors did not restart, said at once', async () => {
+        const { p, fake, late } = lagging();
+        const id = await up(p);
+        const from = fake.calls.length;
+        // The answer to the restart and the two reads after it say EXITED; then it runs.
+        Object.assign(late, { lag: 3, status: 'EXITED' });
+        await p.restartServer(id, fast);
+        expect(since(fake, from)).toEqual([`POST /v2/pods/${id}/action`, `GET /v2/pods/${id}`, `GET /v2/pods/${id}`, `GET /v2/pods/${id}`]);
+        Object.assign(late, { lag: Infinity, status: 'ERROR' });
+        const read = fake.calls.length;
+        await expect(p.restartServer(id, fast)).rejects.toMatchObject({ name: 'ProviderError', message: `runpod: server ${id} is error (ERROR): it did not restart` });
+        expect(since(fake, read)).toEqual([`POST /v2/pods/${id}/action`, `GET /v2/pods/${id}`]);
+        // One that stays stopped is the timeout, which says so.
+        Object.assign(late, { lag: Infinity, status: 'EXITED' });
+        await expect(p.restartServer(id, { intervalMs: 0, timeoutMs: 0 })).rejects.toMatchObject({ code: 'timeout', message: `runpod: timed out after 0 s waiting for server ${id}: stopped (EXITED)` });
+    });
+
+    it('a restart of a pod that is stopped is refused by RunPod, at once: nothing is waited for', async () => {
+        const { p, fake } = lagging();
+        const id = await up(p);
+        await p.stopServer(id);
+        const from = fake.calls.length;
+        await expect(p.restartServer(id)).rejects.toMatchObject({ name: 'ProviderError', status: 409, message: `runpod: POST /v2/pods/${id}/action -> 409 cannot restart a pod that is EXITED` });
+        expect(since(fake, from)).toEqual([`POST /v2/pods/${id}/action`]);
+        expect(fake.state.pods.get(id).status).toBe('EXITED');
+    });
+
+    it('a start of a pod deleted meanwhile is not found, as a stop\'s and a restart\'s is', async () => {
+        const { p, fake } = lagging();
+        const id = await up(p);
+        await p.stopServer(id);
+        // The start is answered (the pod starting), and the pod is gone when it is next read.
+        const read = p.getServer.bind(p);
+        jest.spyOn(p, 'getServer').mockImplementationOnce(async (x) => {
+            fake.state.pods.delete(id);
+            return read(x);
+        });
+        await expect(p.startServer(id, fast)).rejects.toMatchObject({ name: 'NotFoundError', message: `runpod: server ${id} disappeared before it was running` });
+    });
+});
+
+describe('RunPod rents an offer in its first data center that can place the pod', () => {
+    const make = () => {
+        const fake = fakeRunPod();
+        // The 4090 in two data centers of the secure cloud: Romania's hosts run CUDA 12.4, Texas's 12.8.
+        fake.state.gpus.find((g) => g.id === 'NVIDIA GeForce RTX 4090')!.dataCenters[1].SECURE = ['HIGH', 2];
+        return { fake, p: new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
+    };
+    const pods = (fake: ReturnType<typeof fakeRunPod>) => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/pods').map((c) => c.body);
+    const the4090 = async (p: RunPod) => (await p.listOffers({ kind: 'gpu' })).find((o) => o.id === 'NVIDIA GeForce RTX 4090')!;
+
+    it('its first data center with stock, as on every provider: asked alone, and nothing else when it has room', async () => {
+        const { p, fake } = make();
+        const offer = await the4090(p);
+        expect(offer.regions).toEqual(['EU-RO-1', 'US-TX-3']);
+        const plain = await p.createServer({ name: 'plain', offer, image: 'img' });
+        expect(pods(fake).map((b) => b.dataCenterIds)).toEqual([['EU-RO-1']]);
+        expect(fake.state.pods.get(plain.id)).toMatchObject({ dataCenterId: 'EU-RO-1' });
+        expect(plain.region).toBe(offer.regions[0]);
+    });
+
+    it('its next, where the first cannot place it: an image that needs CUDA 12.8 is rented where the hosts run it, not refused for want of it in the first', async () => {
+        const { p, fake } = make();
+        const offer = await the4090(p);
+        const rented = fake.state.pods.size;
+        const cuda = await p.createServer({ name: 'cuda', offer, image: { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 } });
+        // Asked of Romania first (refused: nothing rented), then of Texas.
+        expect(pods(fake).map((b) => [b.dataCenterIds, b.gpu])).toEqual([
+            [['EU-RO-1'], { id: 'NVIDIA GeForce RTX 4090', count: 1, minCudaVersion: '12.8' }], [['US-TX-3'], { id: 'NVIDIA GeForce RTX 4090', count: 1, minCudaVersion: '12.8' }],
+        ]);
+        expect(fake.state.pods.get(cuda.id)).toMatchObject({ dataCenterId: 'US-TX-3', cudaVersion: '12.8' });
+        expect(fake.state.pods.size).toBe(rented + 1);
+        const floor = await p.createServer({ name: 'floor', offer, image: 'img', minCudaVersion: '12.8' });
+        expect(fake.state.pods.get(floor.id)).toMatchObject({ dataCenterId: 'US-TX-3' });
+    });
+
+    it('where none of them can, the last one\'s refusal is the create\'s; a refusal that is not for want of room ends it at the first', async () => {
+        const { p, fake } = make();
+        const offer = await the4090(p);
+        const none = await p.createServer({ name: 'none', offer, image: 'img', minCudaVersion: '13.0' }).catch((e) => e);
+        expect(none).toBeInstanceOf(CapacityError);
+        expect(pods(fake).map((b) => b.dataCenterIds)).toEqual([['EU-RO-1'], ['US-TX-3']]);
+        // A request RunPod refuses as it is (422) is not asked again elsewhere.
+        const before = pods(fake).length;
+        const bad = await p.createServer({ name: 'bad', offer, image: 'img', providerOptions: { nope: true } }).catch((e) => e);
+        expect([bad.name, bad.status]).toEqual(['ProviderError', 422]);
+        expect(pods(fake)).toHaveLength(before + 1);
+    });
+
+    it('a region asked for pins it there, with the offer or with its id alone; an id alone and no region names no data center; the caller\'s own dataCenterIds stand', async () => {
+        const { p, fake } = make();
+        const offer = await the4090(p);
+        await p.createServer({ name: 'tx', offer, region: 'US-TX-3', image: 'img' });
+        expect(pods(fake).pop().dataCenterIds).toEqual(['US-TX-3']);
+        await p.createServer({ name: 'ro', offer: offer.id, region: 'EU-RO-1', image: 'img' });
+        expect(pods(fake).pop().dataCenterIds).toEqual(['EU-RO-1']);
+        // Pinned where the hosts are too old for it, there is no capacity for it: the caller's choice stands, and is asked once.
+        const asked = pods(fake).length;
+        await expect(p.createServer({ name: 'old', offer, region: 'EU-RO-1', image: 'img', minCudaVersion: '12.8' })).rejects.toBeInstanceOf(CapacityError);
+        expect(pods(fake)).toHaveLength(asked + 1);
+        await p.createServer({ name: 'any', offer: offer.id, image: 'img' });
+        expect(pods(fake).pop().dataCenterIds).toBeUndefined();
+        await p.createServer({ name: 'own', offer, image: 'img', providerOptions: { dataCenterIds: ['US-TX-3', 'EU-RO-1'] } });
+        expect(pods(fake).pop().dataCenterIds).toEqual(['US-TX-3', 'EU-RO-1']);
+        expect(pods(fake)).toHaveLength(asked + 3);
+        // Refused there, they are asked once: the same request is not sent again for each data center of the offer.
+        await expect(p.createServer({ name: 'own-old', offer, image: 'img', minCudaVersion: '12.8', providerOptions: { dataCenterIds: ['EU-RO-1'] } })).rejects.toBeInstanceOf(CapacityError);
+        expect(pods(fake).slice(asked + 3).map((b) => b.dataCenterIds)).toEqual([['EU-RO-1']]);
+    });
+
+    it('a pod that mounts a network volume goes where the volume is, whatever the offer brings', async () => {
+        const { p, fake } = make();
+        const offer = await the4090(p);
+        const volume = await p.createVolume({ name: 'models', region: 'US-TX-3', sizeGb: 10 });
+        await p.createServer({ name: 'v', offer, image: 'img', mounts: [{ volume }] });
+        expect(pods(fake).map((b) => b.dataCenterIds)).toEqual([['US-TX-3']]);
+    });
+});
+
+describe('RunPod reads ports as every provider does', () => {
+    const make = () => {
+        const fake = fakeRunPod();
+        return { fake, p: new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
+    };
+    const pods = (fake: ReturnType<typeof fakeRunPod>) => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/pods').map((c) => c.body);
+
+    it('each goes to RunPod as <port>/<protocol>: a bare port is tcp, either case is read, and what is no port is refused before anything is sent', async () => {
+        const { p, fake } = make();
+        await p.createServer({ name: 'a', offer: 'NVIDIA RTX A5000', image: 'img', ports: ['8888/HTTP', '8000', ' 22/tcp '] });
+        expect(pods(fake).pop().ports).toEqual(['8888/http', '8000/tcp', '22/tcp']);
+        for (const [ports, error] of [
+            [['80:8080'], { name: 'ProviderError', message: 'runpod: bad port "80:8080": use <port>/<tcp|udp|http>, the port from 1 to 65535' }],
+            [['70000/tcp'], { name: 'ProviderError', message: 'runpod: bad port "70000/tcp": use <port>/<tcp|udp|http>, the port from 1 to 65535' }],
+            [['53/UDP'], { name: 'NotSupportedError', message: 'runpod: createServer option "ports" with udp is not supported' }],
+        ] as const) {
+            await expect(p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: 'img', ports: [...ports] })).rejects.toMatchObject(error);
+        }
+        expect(pods(fake)).toHaveLength(1);
+    });
+
+    it('a key\'s port 22 is added once, however the caller wrote theirs', async () => {
+        const { p, fake } = make();
+        const key = await p.addSSHKey(testPublicKey('ports'), 'ports');
+        await p.createServer({ name: 'a', offer: 'NVIDIA RTX A5000', image: 'img', command: ['serve'], ports: ['22'], sshKeyIds: [key.id] });
+        expect(pods(fake).pop().ports).toEqual(['22/tcp']);
+        await p.createServer({ name: 'b', offer: 'NVIDIA RTX A5000', image: 'img', command: ['serve'], ports: ['8000/tcp'], sshKeyIds: [key.id] });
+        expect(pods(fake).pop().ports).toEqual(['8000/tcp', '22/tcp']);
+    });
+});
+
+describe('images by the library\'s names on RunPod: Docker Hub\'s ubuntu and nvidia/cuda', () => {
+    const make = () => {
+        const fake = fakeRunPod();
+        return { fake, p: new RunPod({ apiKey: 'rp-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
+    };
+    const pods = (fake: ReturnType<typeof fakeRunPod>) => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/pods').map((c) => c.body);
+
+    it('a MACHINE_TYPES member is that Ubuntu, placed by no CUDA version; top-level or in `container`', async () => {
+        const { p, fake } = make();
+        await p.createServer({ name: 'a', offer: 'NVIDIA RTX A5000', image: MACHINE_TYPES.UBUNTU_24 });
+        await p.createServer({ name: 'b', offer: 'NVIDIA RTX A5000', container: { image: { os: MACHINE_TYPES.UBUNTU_22 }, command: ['sleep', 'infinity'] } });
+        await p.createServer({ name: 'c', offer: 'NVIDIA RTX A5000', container: { image: MACHINE_TYPES.UBUNTU_20, command: ['nvidia-smi', '-L'] } });
+        // Given no command it is kept up, as the VM this names elsewhere stays up: a bare Ubuntu's own command exits at once.
+        expect(pods(fake).map((b) => [b.image, b.gpu, b.cmd])).toEqual([
+            ['ubuntu:24.04', { id: 'NVIDIA RTX A5000', count: 1 }, ['sleep', 'infinity']],
+            ['ubuntu:22.04', { id: 'NVIDIA RTX A5000', count: 1 }, ['sleep', 'infinity']],
+            ['ubuntu:20.04', { id: 'NVIDIA RTX A5000', count: 1 }, ['nvidia-smi', '-L']],
+        ]);
+        // An image of the caller's own runs its own command.
+        await p.createServer({ name: 'd', offer: 'NVIDIA RTX A5000', image: 'ubuntu:24.04' });
+        expect(pods(fake).pop().cmd).toBeUndefined();
+    });
+
+    it('`{ os, cuda }` is NVIDIA\'s image of that CUDA, on a host whose driver runs it: placed by that version unless minCudaVersion names another', async () => {
+        const { p, fake } = make();
+        const image = { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 };
+        const s = await p.createServer({ name: 'cuda', offer: 'NVIDIA RTX A5000', image });
+        expect(pods(fake).pop()).toMatchObject({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', gpu: { id: 'NVIDIA RTX A5000', count: 1, minCudaVersion: '12.8' } });
+        expect(fake.state.pods.get(s.id)).toMatchObject({ cudaVersion: '12.8' });
+        // The 4090's hosts run 12.4: no pod there for an image that needs 12.8.
+        await expect(p.createServer({ name: 'old', offer: 'NVIDIA GeForce RTX 4090', container: { image } })).rejects.toBeInstanceOf(CapacityError);
+        await p.createServer({ name: 'floor', offer: 'NVIDIA RTX A5000', image: { os: 'ubuntu22', cuda: '12.1' }, minCudaVersion: '12.8' });
+        expect(pods(fake).pop()).toMatchObject({ image: 'nvidia/cuda:12.1.1-base-ubuntu22.04', gpu: { minCudaVersion: '12.8' } });
+    });
+
+    it('a CPU pod runs it with no GPU to place by', async () => {
+        const { p, fake } = make();
+        await p.createServer({ name: 'cpu', offer: 'cpu3c:2', image: { os: 'ubuntu24', cuda: '12.8' } });
+        expect(pods(fake).pop()).toMatchObject({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', cpu: { id: 'cpu3c', vcpuCount: 2 } });
+        expect(pods(fake).pop().gpu).toBeUndefined();
+    });
+
+    it('a CUDA version NVIDIA has no image of for that Ubuntu is refused before anything is sent', async () => {
+        const { p, fake } = make();
+        await expect(p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: { os: 'ubuntu24', cuda: '12.4' } })).rejects.toMatchObject({
+            name: 'NotSupportedError', message: 'runpod: image "ubuntu24" with cuda "12.4" (NVIDIA publishes no CUDA 12.4 image of Ubuntu 24.04: it has 20.04, 22.04) is not supported',
+        });
+        await expect(p.createServer({ name: 'x', offer: 'NVIDIA RTX A5000', image: { os: 'ubuntu24', cuda: '12.7' } as never })).rejects.toMatchObject({
+            name: 'ProviderError', message: expect.stringMatching(/^runpod: bad image cuda "12\.7": use a CUDA_TYPES member/),
+        });
+        expect(pods(fake)).toEqual([]);
+    });
+
+    it('an endpoint\'s GPU workers go where the driver runs the image\'s CUDA, or the floor it is given; a CPU worker has none to place by', async () => {
+        const { p, fake } = make();
+        const posts = () => fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/serverless').map((c) => c.body);
+        const image = { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 };
+        const byImage = await p.createEndpoint({ name: 'cuda', offer: 'NVIDIA GeForce RTX 4090', container: { image } });
+        expect(posts().pop()).toMatchObject({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', gpu: { pools: ['ADA_24'], count: 1, minCudaVersion: '12.8' } });
+        expect(byImage.raw.gpu).toMatchObject({ minCudaVersion: '12.8' });
+        await p.createEndpoint({ name: 'floor', offer: 'NVIDIA GeForce RTX 4090', container: { image: 'acme/app:1' }, minCudaVersion: '13' });
+        expect(posts().pop().gpu).toEqual({ pools: ['ADA_24'], count: 1, minCudaVersion: '13.0' });
+        // The floor given stands over the image's own.
+        await p.createEndpoint({ name: 'both', offer: 'NVIDIA GeForce RTX 4090', container: { image }, minCudaVersion: '12.9' });
+        expect(posts().pop().gpu).toEqual({ pools: ['ADA_24'], count: 1, minCudaVersion: '12.9' });
+        await p.createEndpoint({ name: 'none', offer: 'NVIDIA GeForce RTX 4090', container: { image: 'acme/app:1' } });
+        expect(posts().pop().gpu).toEqual({ pools: ['ADA_24'], count: 1 });
+        await p.createEndpoint({ name: 'cpu', offer: 'cpu3c:2', container: { image }, minCudaVersion: '12.8' });
+        expect(posts().pop()).toMatchObject({ image: 'nvidia/cuda:12.8.2-base-ubuntu24.04', cpu: [{ id: 'cpu3c', vcpuCount: 2 }] });
+        expect(posts().pop().gpu).toBeUndefined();
+        // A floor that is no version is refused before the endpoint is made.
+        const before = posts().length;
+        await expect(p.createEndpoint({ name: 'bad', offer: 'NVIDIA GeForce RTX 4090', container: { image: 'acme/app:1' }, minCudaVersion: 'twelve' })).rejects.toThrow(/bad CUDA version "twelve"/);
+        expect(posts()).toHaveLength(before);
+    });
+
+    it('an endpoint runs it too', async () => {
+        const { p, fake } = make();
+        const e = await p.createEndpoint({ name: 'u', container: { image: MACHINE_TYPES.UBUNTU_24 }, offer: 'cpu3c:2' });
+        expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/serverless').pop()?.body.image).toBe('ubuntu:24.04');
+        expect(e.image).toBe('ubuntu:24.04');
     });
 });
 

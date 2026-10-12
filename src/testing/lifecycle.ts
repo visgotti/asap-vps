@@ -343,11 +343,11 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
          * startServer throws CapacityError and leaves it stopped, as documented: that is checked (stopped, and billing
          * only its disk), and the start tried again, START_TRIES times in all. A start is never assumed.
          */
-        const startChecked = async (pp: ComputeSubject & { startServer(id: string): Promise<void> }, id: string, run?: CostEstimate): Promise<number> => {
+        const startChecked = async (pp: ComputeSubject & { startServer(id: string, o?: WaitOptions): Promise<void> }, id: string, run?: CostEstimate): Promise<number> => {
             for (let attempt = 1; ; attempt++) {
                 const at = Date.now();
                 try {
-                    await pp.startServer(id);
+                    await pp.startServer(id, t.wait);
                     return at;
                 } catch (e) {
                     if (!(t.startMayLackGpu && e instanceof CapacityError)) throw e;
@@ -522,9 +522,8 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
             // Refused by the provider itself, before any request: nothing can be rented by these.
             if (!caps.compute?.userData) await unsupported(() => p.createServer({ name: runName, offer: 'none', userData: USER_DATA }));
             if (vm) await unsupported(() => p.createServer({ name: runName, offer: 'none', env: { A: 'b' } }));
-            else if (supports(p, 'sshKeys')) {
-                await unsupported(() => new ServerProvisioner(p as ProvisionTarget).provision({ serverOptions: { name: runName, offer: 'none' } }, () => undefined));
-            }
+            // A container that keys are to log in to starts an SSH server before its command: an image of the caller's own with none to hand over to is refused.
+            else if (supports(p, 'sshKeys')) await unsupported(() => p.createServer({ name: runName, offer: 'none', image: TEST_IMAGE, sshKeyIds: ['none'] }));
         }, t.timeouts.free);
 
         // ── paid: one server, then the delete ──
@@ -646,7 +645,7 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
                 const server = need(s.server, 'no server');
                 for (let attempt = 1; ; attempt++) {
                     try {
-                        await p.restartServer(server.id);
+                        await p.restartServer(server.id, t.wait);
                         break;
                     } catch (e) {
                         // RunPod restarts a pod by stopping and starting it: on a host with no GPU free, the start is refused
@@ -680,7 +679,7 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
                 const p = requireCapability(provider(), 'power');
                 const server = need(s.server, 'no server');
                 const run = await billedRun(server.id, need(s.rentedAt, 'no create'));
-                await p.stopServer(server.id);
+                await p.stopServer(server.id, t.wait);
                 expect((await p.waitForServer(server.id, (x) => !x || ['stopped', 'error'].includes(x.status), t.wait))?.status).toBe('stopped');
                 await expectStoppedBilling(server.id, run);
                 const startedAt = await startChecked(p, server.id, run);
@@ -701,7 +700,7 @@ export function describeGpuLifecycle(t: LifecycleTarget): void {
                 const server = need(s.server, 'no server');
                 const keys = need(s.keys, 'no key pair');
                 const region = need(server.region, 'no region');
-                await p.stopServer(server.id);
+                await p.stopServer(server.id, t.wait);
                 const name = `${runName}-image`;
                 t.log(`${t.id}: capturing ${server.id} as ${name}`);
                 const image = await p.createImage(server.id, { name, ...t.imageWait });

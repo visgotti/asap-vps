@@ -3,20 +3,21 @@
 // machine) as a volume, an account key as a key, its billing, and what of a
 // query Vast's own search can filter. Pure functions of the raw records, typed by VastTypes.
 
-import { canonicalGpu, cudaVersion, gpuName, gpuVendor, parseSSHPublicKey, sshKeyFingerprint } from '../../Core/utils';
-import type { Billing, InitializedSSHKeyData, Offer, OfferQuery, RefusableOption, Server, ServerImage, ServerMount, ServerStatus, Volume, VolumeStatus } from '../../types';
+import { canonicalGpu, cudaVersion, gpuName, gpuVendor, located, parseSSHPublicKey, sshKeyFingerprint } from '../../Core/utils';
+import type {
+    Billing, InitializedSSHKeyData, Offer, OfferQuery, RefusableOption, Server, ServerImage, ServerMount, ServerStatus, SSHEndpoint, Volume, VolumeStatus,
+} from '../../types';
 import type { VastImage, VastInstance, VastOffer, VastSnapshotRepository, VastSSHKeyData, VastVolume } from './types';
 
 export const VAST_ID = 'vast';
 
 /**
- * The createServer options Vast cannot honor: tags (an instance has none); a
- * disk of its own that goes with it (`volume`: a Vast volume outlives its
- * instance; mount one with `mounts`); and a choice of keys (every account key
- * is authorized on an `ssh` runtype image). Left out of its
- * CreateServerOptions, refused at run time.
+ * The createServer options Vast cannot honor: tags (an instance has none), and
+ * a disk of its own that goes with it (`volume`: a Vast volume outlives its
+ * instance; mount one with `mounts`). Left out of its CreateServerOptions,
+ * refused at run time.
  */
-export const VAST_REFUSED = ['tags', 'volume', 'sshKeyIds'] as const satisfies readonly RefusableOption[];
+export const VAST_REFUSED = ['tags', 'volume'] as const satisfies readonly RefusableOption[];
 
 /** A machine as a region (`machine:<id>`): where a volume is, and the place of an offer finer than its geolocation. */
 export const MACHINE_REGION = 'machine:';
@@ -26,6 +27,11 @@ export function machineRegion(machineId: number): string {
 }
 
 /** The machine a region names (`machine:<id>`), else undefined. */
+/** The country a machine is in: the code its location ends with ('Texas, US', 'Japan, JP'); undefined where Vast gives none. */
+export function countryOf(geolocation: string | null | undefined): string | undefined {
+    return /(?:^|, )([A-Z]{2})$/.exec(geolocation ?? '')?.[1];
+}
+
 export function machineOf(region: string): number | undefined {
     const m = /^machine:(\d+)$/.exec(region.trim());
     return m ? Number(m[1]) : undefined;
@@ -71,7 +77,7 @@ export function toOffer(a: VastOffer, interruptible: boolean): Offer<VastOffer> 
         pricePerHour: bid ?? Number(a.dph_total),
         billing: VAST_BILLING,
         // Where it is, and the machine it is (where a volume of it is: `machine:<id>`).
-        regions: a.rentable === false ? [] : [String(a.geolocation ?? 'unknown'), ...(a.machine_id !== undefined ? [machineRegion(a.machine_id)] : [])],
+        ...located(a.rentable === false ? [] : [String(a.geolocation ?? 'unknown'), ...(a.machine_id !== undefined ? [machineRegion(a.machine_id)] : [])], () => countryOf(a.geolocation)),
         interruptible,
         vcpus: a.cpu_cores_effective,
         memoryGb: a.cpu_ram ? Math.round(a.cpu_ram / 1024) : undefined,
@@ -99,6 +105,18 @@ export function instanceStatus(i: VastInstance, relaunchedAt = 0, now = Date.now
     return 'pending';
 }
 
+/**
+ * Where an instance's sshd is: the public port its own port 22 is mapped to
+ * (what a container started with sshKeyIds listens on); else the proxy host
+ * and port Vast assigns, which is where an instance in Vast's own `ssh` launch
+ * mode is reached.
+ */
+function sshOf(i: VastInstance, ip: string | undefined, ports: Array<{ privatePort: number, publicPort: number, protocol: string }>): SSHEndpoint | undefined {
+    const direct = ports.find((p) => p.privatePort === 22 && p.protocol === 'tcp');
+    if (direct && ip) return { host: ip, port: direct.publicPort, username: 'root' };
+    return i.ssh_host && i.ssh_port ? { host: i.ssh_host, port: Number(i.ssh_port), username: 'root' } : undefined;
+}
+
 export function toServer(i: VastInstance, relaunchedAt?: number): Server<VastInstance> {
     const status = instanceStatus(i, relaunchedAt);
     const ip = i.public_ipaddr ? String(i.public_ipaddr).trim() : undefined;
@@ -116,11 +134,11 @@ export function toServer(i: VastInstance, relaunchedAt?: number): Server<VastIns
         gpu: i.gpu_name ? canonicalGpu(i.gpu_name.replace(/_/g, ' '))?.name ?? i.gpu_name : undefined,
         gpuCount: i.num_gpus ?? undefined,
         region: i.geolocation ?? undefined,
+        ...(countryOf(i.geolocation) ? { country: countryOf(i.geolocation) } : {}),
         ip,
         ...(ports.length ? { ports } : {}),
         ...(mounts.length ? { mounts } : {}),
-        // Vast's ssh endpoint (a proxy host and port it assigns), for images that run sshd.
-        ...(i.ssh_host && i.ssh_port ? { ssh: { host: i.ssh_host, port: Number(i.ssh_port), username: 'root' } } : {}),
+        ...(sshOf(i, ip, ports) ? { ssh: sshOf(i, ip, ports) } : {}),
         pricePerHour: i.dph_total ?? undefined,
         // Billed while it runs; a stopped instance bills only its disk. Vast reports the rental's start, not the
         // current run's, so after a stop and start this counts the stopped time too: an upper bound.

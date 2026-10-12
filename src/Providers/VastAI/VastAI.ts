@@ -16,11 +16,13 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { ComputeProvider, ResolvedMount } from '../../Core/ComputeProvider';
 import {
-    compareCudaVersions, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey, RegistryClient, registryOf, timeLeft,
+    compareCudaVersions, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey, pickSSHKeys, RegistryClient, registryOf,
+    timeLeft, waitOf,
 } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
 import type {
-    CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, LogOptions, Offer, OfferQuery, RegistryAuth, Server, ServerImage, ServerListOptions, Volume, WaitOptions,
+    CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, LogOptions, Offer, OfferQuery, RegistryAuth, ResolvedContainer, Server, ServerImage, ServerListOptions, Volume,
+    WaitOptions,
 } from '../../types';
 import { VastApi } from './api';
 import {
@@ -39,7 +41,7 @@ export const VAST_CAPABILITIES = {
     power: { stoppedBilling: 'storage' },
     restart: {},
     logs: {},
-    sshKeys: { appliedAtBoot: false },
+    sshKeys: { atCreate: 'chosen', appliedAtBoot: false },
     // A snapshot of an instance's container, pushed to a registry of yours (`snapshots`): it boots on any machine.
     images: { scope: 'global' },
     // A volume of one machine, sized when made, that an instance on that machine mounts at a path (one at a time).
@@ -103,40 +105,43 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
      * (default /data).
      */
     public async createServer(o: CreateServerOptions<VastTypes>): Promise<Server<VastInstance>> {
-        // Vast authorizes every account key on its ssh-runtype images; pass
-        // providerOptions { runtype: 'ssh' } for that instead of sshKeyIds.
         this.rejectOptions(o, VAST_REFUSED);
         // The offer is one machine: its GPUs are fixed, and its place is where it is (a region asked for must be one of its).
         const resolved = this.resolveOffer(o);
         this.checkFixedGpuCount(o, resolved.offer?.gpuCount);
         // The container: `container`, or the top-level image, env, command, ports and registryAuth.
         const c = this.containerOf(o);
-        const image = this.imageName(c?.image);
+        const image = c?.image;
         if (!c || !image) throw new ProviderError(this.id, 'an instance needs an image');
         if (c.registryAuth && o.providerOptions?.image_login !== undefined) throw new ProviderError(this.id, 'pass registryAuth or providerOptions.image_login, not both');
         // A snapshot is pulled with the login it was pushed with, unless the create gives one.
         const auth = c.registryAuth ?? (this.tagOf(image) !== undefined ? this.snapshots : undefined);
         const login = auth ? this.imageLogin(auth, image) : undefined;
-        const args = this.argsWith(o.userData, c.command);
+        // The keys that log in: in the `args` launch mode a container has no SSH server, so its start runs one first (sshStart). Vast's
+        // own `ssh` launch mode (providerOptions.runtype) authorizes every key of the account instead, and is not this.
+        const ssh = !!o.sshKeyIds?.length;
+        if (ssh && o.providerOptions?.runtype !== undefined) throw new ProviderError(this.id, 'pass sshKeyIds or providerOptions.runtype, not both');
+        if (ssh) this.sshCommand(c);
+        const keys = ssh ? pickSSHKeys(await this.listSSHKeys(), o.sshKeyIds!, this.id).map((k) => k.publicKey) : [];
+        const args = this.argsWith(c, o.userData, keys);
         const offer = /^(\d+)(?::bid:(\d+(?:\.\d+)?))?$/.exec(resolved.id);
         if (!offer) throw new ProviderError(this.id, `bad offer id "${resolved.id}"`);
         // Env is a JSON object (a docker-flags string is not applied); ports ride in it as "-p" keys.
         const env: Record<string, string> = {};
         for (const [k, v] of Object.entries(c.env ?? {})) env[k] = this.flagValue(v, k);
-        for (const p of c.ports ?? []) {
-            const m = /^(\d+)(?:\/(tcp|udp|http))?$/.exec(p);
-            if (!m) throw new ProviderError(this.id, `bad port "${p}": use <port>/<tcp|udp|http>`);
-            env[`-p ${m[1]}:${m[1]}${m[2] === 'udp' ? '/udp' : ''}`] = '1';
-        }
+        for (const p of this.portsOf(c.ports)) env[`-p ${p.port}:${p.port}${p.protocol === 'udp' ? '/udp' : ''}`] = '1';
+        // sshd's port, mapped to a public one of the machine's: where `server.ssh` then says to log in.
+        if (ssh) env['-p 22:22'] = '1';
         const bid = offer[2] !== undefined ? Number(offer[2]) : undefined;
         const [mount, ...more] = this.mountsOf(o.mounts);
         if (more.length) throw new NotSupportedError(this.id, 'createServer option "mounts" with more than one volume (an instance mounts one)');
         // The machine's ask, read where something needs it: its driver, its place (a region asked of an offer given by id), or the machine a volume must be on.
         const asked = o.region !== undefined ? this.regionName(o.region) : undefined;
-        const ask = o.minCudaVersion !== undefined || (asked !== undefined && !resolved.offer) || (mount && resolved.offer?.raw.machine_id === undefined)
+        const minCuda = this.minCudaOf(o);
+        const ask = minCuda !== undefined || (asked !== undefined && !resolved.offer) || (mount && resolved.offer?.raw.machine_id === undefined)
             ? await this.askOf(Number(offer[1]), bid !== undefined) : undefined;
         if (asked !== undefined) this.checkRegion(resolved.id, (resolved.offer ?? toOffer(ask!, bid !== undefined)).regions, asked);
-        if (o.minCudaVersion !== undefined) this.checkCuda(ask!, cudaVersion(o.minCudaVersion));
+        if (minCuda !== undefined) this.checkCuda(ask!, cudaVersion(minCuda));
         const volumeInfo = mount ? await this.volumeInfo(mount, resolved.offer?.raw.machine_id ?? ask!.machine_id, resolved.id) : undefined;
         const body = await this.api.call<{ new_contract: number }>('PUT', `/api/v0/asks/${offer[1]}/`, {
             image,
@@ -193,18 +198,24 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
 
     // ── power, restart, logs ─────────────────────────────────────────────
 
-    public async stopServer(id: string): Promise<void> {
+    /** Stops the container, and waits until it has stopped (default: 10 minutes): the instance then bills only its disk. */
+    public async stopServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
         await this.api.call('PUT', `/api/v0/instances/${encodeURIComponent(id)}/`, { state: 'stopped' });
+        await this.waitUntilStopped(id, wait);
     }
 
     /**
-     * Starts the container again on its machine. When that machine's GPU is
-     * someone else's now, Vast queues the start ("Required resources are
-     * currently unavailable, state change queued") and would start, and bill,
-     * the instance whenever the GPU frees: that start is cancelled (the
-     * instance stays stopped) and this throws CapacityError.
+     * Starts the container again on its machine, and waits until it runs; one
+     * that runs already is left as it is. When that machine's GPU is someone
+     * else's now, Vast queues the start ("Required resources are currently
+     * unavailable, state change queued") and would start, and bill, the
+     * instance whenever the GPU frees: that start is cancelled (the instance
+     * stays stopped) and this throws CapacityError.
      */
-    public async startServer(id: string): Promise<void> {
+    public async startServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
+        if ((await this.need(id)).status === 'running') return;
         const path = `/api/v0/instances/${encodeURIComponent(id)}/`;
         try {
             await this.api.call('PUT', path, { state: 'running' });
@@ -215,12 +226,29 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
                 { status: e.status, code: e.code, cause: e });
         }
         this.relaunched.set(id, Date.now());
+        await this.waitUntilRunning(id, wait);
     }
 
-    /** Stops and starts the container without giving up the machine's GPU. */
-    public async restartServer(id: string): Promise<void> {
+    /**
+     * Stops and starts the container without giving up the machine's GPU, and
+     * waits until it runs again (waitUntilRestarted: Vast goes on reporting a
+     * rebooted container as it was left for a while). An instance that is
+     * stopped is refused: Vast's reboot is of a container that runs.
+     */
+    public async restartServer(id: string, o: WaitOptions = {}): Promise<void> {
+        const wait = waitOf(o, {});
+        const { status } = await this.need(id);
+        if (status === 'stopped' || status === 'stopping') throw this.notRunning(id, status);
         await this.api.call('PUT', `/api/v0/instances/reboot/${encodeURIComponent(id)}/`);
         this.relaunched.set(id, Date.now());
+        await this.waitUntilRestarted(id, wait);
+    }
+
+    /** The instance, or the error that says Vast has none by that id. */
+    private async need(id: string): Promise<Server<VastInstance>> {
+        const s = await this.getServer(id);
+        if (!s) throw new NotFoundError(this.id, `no instance ${id}`);
+        return s;
     }
 
     /** Vast uploads the container's log on request and hands back a URL to fetch it from. */
@@ -248,7 +276,7 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         if (!(await super.deleteServerAndWait(id, left()))) return false;
         if (held.length) {
             await this.poll(() => this.listVolumes(), (all) => !all.some((v) => held.includes(v.id) && (v.serverIds?.includes(id) || v.status === 'attached')), {
-                timeoutMs: 5 * 60_000, ...left(), what: `volume ${held.join(', ')} to let go of instance ${id}`, describe: () => `still in use by instance ${id}, which is gone`,
+                ...waitOf(left(), { timeoutMs: 5 * 60_000 }), what: `volume ${held.join(', ')} to let go of instance ${id}`, describe: () => `still in use by instance ${id}, which is gone`,
             });
         }
         return true;
@@ -329,7 +357,7 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         }, false);
         const ours = (t: string) => !before.has(t) && SNAPSHOT_TAG.exec(t)?.[1] === String(serverId);
         const fresh = await this.poll(async () => (await registry.tags(repository)).filter(ours), (tags) => tags.length > 0, {
-            timeoutMs: o.timeoutMs ?? 60 * 60_000, intervalMs: o.intervalMs ?? 30_000, what: `the snapshot of instance ${serverId} in ${where}`, describe: () => 'not pushed yet',
+            ...waitOf(o, { timeoutMs: 60 * 60_000, intervalMs: 30_000 }), what: `the snapshot of instance ${serverId} in ${where}`, describe: () => 'not pushed yet',
         });
         const manifest = await registry.manifest(repository, fresh[0]);
         if (!manifest) throw new ProviderError(this.id, `the snapshot ${where}:${fresh[0]} went before it could be named ${o.name}`);
@@ -383,7 +411,7 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         const id = made?.volume_id ?? Number(/^V\.(\d+)$/.exec(made?.volume_name ?? '')?.[1]);
         if (!id) throw new ProviderError(this.id, 'the volume create returned no volume id');
         const volume = await this.poll(() => this.getVolume(String(id)), (v) => v?.status === 'available', {
-            timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 3000, what: `volume ${id}`, describe: (v) => (v ? v.providerStatus : 'not listed'),
+            ...waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 3000 }), what: `volume ${id}`, describe: (v) => (v ? v.providerStatus : 'not listed'),
         });
         return volume!;
     }
@@ -399,7 +427,7 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
         if (v.serverIds?.length) throw new ProviderError(this.id, `volume ${id} is attached to instance ${v.serverIds.join(', ')}: delete the instance first`);
         await falseIfNotFound(this.api.call('DELETE', `/api/v0/volumes/?id=${encodeURIComponent(id)}`, undefined, false));
         await this.poll(() => this.getVolume(id), (x) => !x, {
-            timeoutMs: o.timeoutMs ?? 5 * 60_000, intervalMs: o.intervalMs ?? 3000, what: `delete of volume ${id}`, describe: (x) => x?.providerStatus ?? 'gone',
+            ...waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 3000 }), what: `delete of volume ${id}`, describe: (x) => x?.providerStatus ?? 'gone',
         });
     }
 
@@ -566,17 +594,20 @@ export class VastAI extends ComputeProvider<VastTypes, VastApi> implements Provi
     }
 
     /**
-     * The container's start, in the `args` launch mode: `command` as it is, or,
-     * with a userData script, the script first and then `command` (an entrypoint
-     * of `sh -c`, `onstart` being the entrypoint in this mode). A script needs a
-     * command to hand over to (the image's own is replaced), and is a shell
-     * script: cloud-config is cloud-init's, which a container does not run.
+     * The container's start, in the `args` launch mode: its command as it is,
+     * or, with keys to log in with or a userData script, an SSH server for the
+     * keys first (sshStart), then the script, and then the command (an
+     * entrypoint of `sh -c`, `onstart` being the entrypoint in this mode).
+     * Either needs a command to hand over to (the image's own is replaced), and
+     * a script is a shell script: cloud-config is cloud-init's, which a
+     * container does not run.
      */
-    private argsWith(userData: string | undefined, command: string[] | undefined): { args?: string[], onstart?: string } {
-        if (!userData) return command?.length ? { args: command } : {};
-        if (/^\s*#cloud-config/.test(userData)) throw new NotSupportedError(this.id, 'createServer option "userData" as cloud-config (a Vast container runs no cloud-init: pass a shell script)');
-        if (!command?.length) throw new NotSupportedError(this.id, 'createServer option "userData" without "command" (the script runs before the command, which replaces the image\'s own)');
-        return { onstart: 'sh', args: ['-c', `${userData}\nexec "$@"`, 'asap-vps', ...command] };
+    private argsWith(c: ResolvedContainer, userData: string | undefined, keys: readonly string[]): { args?: string[], onstart?: string } {
+        const command = c.command;
+        if (!userData && !keys.length) return command?.length ? { args: command } : {};
+        if (userData && /^\s*#cloud-config/.test(userData)) throw new NotSupportedError(this.id, 'createServer option "userData" as cloud-config (a Vast container runs no cloud-init: pass a shell script)');
+        if (userData && !command?.length) throw new NotSupportedError(this.id, 'createServer option "userData" without "command" (the script runs before the command, which replaces the image\'s own)');
+        return { onstart: 'sh', args: ['-c', keys.length ? this.sshStart(c, keys, userData) : `${userData}\nexec "$@"`, 'asap-vps', ...command!] };
     }
 
     /**

@@ -8,13 +8,16 @@
 
 import type { CapabilityDescriptor, ComputeTraits, ICompute } from '../capabilities';
 import { MACHINE_TYPES, REGION_TYPES } from '../constants';
-import { CapacityError, isRetriable, NotSupportedError, ProviderError } from '../errors';
+import { CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError } from '../errors';
 import type {
-    ContainerSpec, CostEstimate, CreateServerOptions, EndpointRequestInit, Offer, OfferQuery, PlatformTypes, RefusableOption, RegistryAuth, Server, ServerListOptions,
-    Volume, VolumeMount, WaitOptions,
+    ContainerSpec, CostEstimate, CreateServerOptions, EndpointRequestInit, ImageChoice, ImageSpec, Offer, OfferQuery, PlatformTypes, PortProtocol, RefusableOption, RegistryAuth,
+    ResolvedContainer, Server, ServerListOptions, ServerStatus, Volume, VolumeMount, WaitOptions,
 } from '../types';
 import { BaseProvider } from './BaseProvider';
-import { ApiClient, cloudInitParts, containerBootScript, estimateServerCost } from './utils';
+import {
+    ApiClient, cloudInitParts, containerBootScript, containerImageOf, estimateServerCost, imageSpecOf, NoSuchImageError, parsePort, resolveContainer, restartWatch, sshdBootScript,
+    waitOf,
+} from './utils';
 
 /** What a createServer call rents, resolved from its `offer` (an offer object or an id). */
 export type ResolvedOffer<TRaw = unknown> = {
@@ -39,17 +42,25 @@ export type ResolvedMount<TRaw = unknown> = {
  */
 export type EnumTranslations = {
     regions?: Readonly<Partial<Record<REGION_TYPES, string>>>,
+    /** Its plain OS image of each MACHINE_TYPES member. */
     machines?: Readonly<Partial<Record<MACHINE_TYPES, string>>>,
+    /** Its GPU image of each (the one with the NVIDIA driver installed): what an image asked for with `cuda` boots. */
+    cudaMachines?: Readonly<Partial<Record<MACHINE_TYPES, string>>>,
 };
 
 const REGION_MEMBERS = new Set<string>(Object.values(REGION_TYPES));
-const MACHINE_MEMBERS = new Set<string>(Object.values(MACHINE_TYPES));
 
 export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, TApi extends ApiClient = ApiClient>
     extends BaseProvider<TApi> implements ICompute<T> {
     abstract readonly capabilities: CapabilityDescriptor & { readonly compute: Readonly<ComputeTraits> };
     /** The platform's names for the library's enums (CreateServerOptions.region and .image). */
     protected readonly enums: EnumTranslations = {};
+    /**
+     * How many reads in a row as running a restart takes for done, of a server
+     * never seen otherwise (restartWatch): at the default pace, 30 seconds for
+     * a platform's status to show the reboot it was asked for.
+     */
+    static readonly RESTART_SETTLE_READS = 4;
 
     public abstract listOffers(query?: OfferQuery): Promise<Offer<T['offer']>[]>;
     public abstract createServer(options: CreateServerOptions<T>): Promise<Server<T['server']>>;
@@ -71,15 +82,51 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
 
     /**
      * Until the server is running (a VM also needs its public address).
-     * Throws when it errors or disappears instead.
+     * Throws when it errors, or disappears (NotFoundError) instead.
      */
     public async waitUntilRunning(id: string, o: WaitOptions & { requireIp?: boolean } = {}): Promise<Server<T['server']>> {
         const requireIp = o.requireIp ?? this.capabilities.compute.kind === 'vm';
         const s = await this.waitForServer(id, (x) => !x || ['error', 'terminating', 'terminated'].includes(x.status)
             || (x.status === 'running' && (!requireIp || !!x.ip)), o);
-        if (!s) throw new ProviderError(this.id, `server ${id} disappeared before it was running`);
+        if (!s) throw new NotFoundError(this.id, `server ${id} disappeared before it was running`);
         if (s.status !== 'running') throw new ProviderError(this.id, `server ${id} is ${s.status} (${s.providerStatus})`);
         return s;
+    }
+
+    /**
+     * What a stop waits on: until the server is stopped, for ten minutes, read
+     * every five seconds, unless `o` says. Throws when it is gone
+     * (NotFoundError), or errors or is deleted instead of stopping.
+     */
+    protected async waitUntilStopped(id: string, o: WaitOptions = {}): Promise<Server<T['server']>> {
+        const s = await this.waitForServer(id, (x) => !x || ['stopped', 'error', 'terminating', 'terminated'].includes(x.status),
+            waitOf(o, { timeoutMs: 10 * 60_000, intervalMs: 5000 }));
+        if (!s) throw new NotFoundError(this.id, `server ${id} disappeared while it was stopping`);
+        if (s.status !== 'stopped') throw new ProviderError(this.id, `server ${id} is ${s.status} (${s.providerStatus}): it did not stop`);
+        return s;
+    }
+
+    /**
+     * What a restart waits on: until the server is running again, having been
+     * seen not to be, or, where its status never shows the reboot, having read
+     * as running RESTART_SETTLE_READS times (restartWatch). One that is gone
+     * (NotFoundError), errors, stops or is deleted instead did not restart,
+     * and is thrown at once, but for a status in `passing`: one the platform
+     * shows of a server that is rebooting (a Lambda instance reads as
+     * unhealthy, a RunPod pod as stopped), which is waited through.
+     */
+    protected async waitUntilRestarted(id: string, o: WaitOptions = {}, passing: readonly ServerStatus[] = []): Promise<Server<T['server']>> {
+        const back = restartWatch(ComputeProvider.RESTART_SETTLE_READS);
+        const failed = (['error', 'stopped', 'terminating', 'terminated'] as const).filter((x) => !passing.includes(x));
+        const s = await this.waitForServer(id, (x) => !x || (failed as readonly ServerStatus[]).includes(x.status) || back(x.status === 'running'), o);
+        if (!s) throw new NotFoundError(this.id, `server ${id} disappeared while it was restarting`);
+        if (s.status !== 'running') throw new ProviderError(this.id, `server ${id} is ${s.status} (${s.providerStatus}): it did not restart`);
+        return s;
+    }
+
+    /** The refusal of a restart of a server that does not run: the same on every provider that reads it first. */
+    protected notRunning(id: string, status: ServerStatus): ProviderError {
+        return new ProviderError(this.id, `server ${id} is ${status}: only a server that runs is restarted (start it)`, { code: 'not_running' });
     }
 
     /**
@@ -92,7 +139,7 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
      * `o.timeoutMs` bounds the whole of it, the provider's own waits included.
      */
     public async deleteServerAndWait(id: string, o: WaitOptions = {}): Promise<boolean> {
-        const timeoutMs = o.timeoutMs ?? 5 * 60_000;
+        const { timeoutMs, intervalMs } = waitOf(o, { timeoutMs: 5 * 60_000, intervalMs: 5000 });
         const end = Date.now() + timeoutMs;
         let refused: unknown;
         for (;;) {
@@ -122,7 +169,7 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
                 throw new ProviderError(this.id, `server ${id} is not deleted after ${Math.round(timeoutMs / 1000)} s: the delete kept failing (${(refused as Error).message})`,
                     { code: 'timeout', cause: refused });
             }
-            await this.sleep(o.intervalMs ?? 5000);
+            await this.sleep(intervalMs);
         }
     }
 
@@ -167,12 +214,70 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
         return mapped;
     }
 
-    /** An image as the platform names it: a MACHINE_TYPES member it maps, or the caller's own reference; undefined stays undefined. */
-    protected imageName(image: string | undefined): string | undefined {
-        if (image === undefined || !MACHINE_MEMBERS.has(image)) return image;
-        const mapped = this.enums.machines?.[image as MACHINE_TYPES];
-        if (!mapped) throw new NotSupportedError(this.id, `image "${image}" (MACHINE_TYPES has no ${this.id} image by that name)`);
+    /**
+     * A VM's image as the platform names it: the caller's own name for one, as
+     * it is; a MACHINE_TYPES member (or `{ os }`), the platform's image of that
+     * Ubuntu; `{ os, cuda }`, its GPU image of it (`cudaMachines`: the
+     * platform's, or the caller's where it depends on what is rented).
+     * undefined stays undefined.
+     */
+    protected imageName(image: ImageChoice | undefined, cudaMachines: EnumTranslations['cudaMachines'] = this.enums.cudaMachines): string | undefined {
+        const spec = this.imageSpec(image);
+        if (!spec) return image as string | undefined;
+        const mapped = (spec.cuda === undefined ? this.enums.machines : cudaMachines)?.[spec.os as MACHINE_TYPES];
+        if (!mapped) {
+            throw new NotSupportedError(this.id, spec.cuda === undefined
+                ? `image "${spec.os}" (MACHINE_TYPES has no ${this.id} image by that name)`
+                : `image "${spec.os}" with cuda (${this.id} has no GPU image of that Ubuntu)`);
+        }
         return mapped;
+    }
+
+    /**
+     * A container's image as a registry reference: the caller's own, as it is;
+     * a MACHINE_TYPES member or `{ os, cuda }`, the image Docker Hub has for it
+     * (`ubuntu`, `nvidia/cuda`), the same on every platform. undefined stays
+     * undefined. A combination no image exists for is refused as a VM's is
+     * (NotSupportedError).
+     */
+    protected containerImageName(image: ImageChoice | undefined): string | undefined {
+        const spec = this.imageSpec(image);
+        return spec ? this.checked(() => containerImageOf(spec)) : image as string | undefined;
+    }
+
+    /**
+     * The CUDA version a container's host must run: `minCudaVersion`, else the
+     * version its image is asked for by (`{ os, cuda }`: NVIDIA's CUDA image
+     * does not start on an older driver). undefined when neither says.
+     */
+    protected minCudaOf(o: { minCudaVersion?: string, image?: ImageChoice, container?: ContainerSpec }): string | undefined {
+        return o.minCudaVersion ?? this.imageSpec(o.container ? o.container.image : o.image)?.cuda;
+    }
+
+    /**
+     * An image named by the library's enums, as a spec (imageSpecOf), for a
+     * provider to check against what is rented; undefined for a name of the
+     * platform's own, and for none. One that names what the enums do not have
+     * is refused.
+     */
+    protected imageSpec(image: ImageChoice | undefined): ImageSpec | undefined {
+        return this.checked(() => imageSpecOf(image));
+    }
+
+    /**
+     * What `read` makes of a caller's option (an image named by the library's
+     * enums, a port, a container), its errors as this provider's: an image no
+     * such combination exists of is not supported (NotSupportedError, as an
+     * option the platform cannot honor is); anything not well formed is a
+     * ProviderError, `what` saying whose it is.
+     */
+    private checked<R>(read: () => R, what = ''): R {
+        try {
+            return read();
+        } catch (e) {
+            if (e instanceof NoSuchImageError) throw new NotSupportedError(this.id, `${what}image ${e.message}`);
+            throw new ProviderError(this.id, `${what}${(e as Error).message}`);
+        }
     }
 
     /**
@@ -202,18 +307,51 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
     }
 
     /**
+     * The start of a container that `publicKeys` are to log in to, on a
+     * platform that gives a container no SSH server: the shell its start runs
+     * first (sshdBootScript: an SSH server taking them as root's), then
+     * `script` where the caller has one, then the container's own command,
+     * which it becomes (`sh -c '<this>' asap-vps <command...>`). The command
+     * must be known to be handed over to: a container named by the library's
+     * enums has one (it is kept up), an image of the caller's own is given one,
+     * or the keys are refused: its own start cannot be read from here, and
+     * would be replaced by nothing.
+     */
+    protected sshStart(c: ResolvedContainer, publicKeys: readonly string[], script?: string): string {
+        this.sshCommand(c);
+        return `${this.checked(() => sshdBootScript(publicKeys))}${script ? `${script}\n` : ''}exec "$@"`;
+    }
+
+    /**
+     * The command a container that is to be logged in to hands over to, once
+     * its SSH server is started; one that has none is refused (sshStart says
+     * why), which a provider asks before it reads anything of the account.
+     */
+    protected sshCommand(c: ResolvedContainer): string[] {
+        if (c.command?.length) return c.command;
+        throw new NotSupportedError(this.id, 'createServer option "sshKeyIds" without "command" on an image of your own (the SSH server is started before the command, which replaces the image\'s own start: say what it runs)');
+    }
+
+    /** `ports` as each is read (parsePort): its number and protocol, the same on every provider; one that is not a port is refused. */
+    protected portsOf(ports: readonly string[] | undefined): Array<{ port: number, protocol: PortProtocol }> {
+        return (ports ?? []).map((p) => this.checked(() => parsePort(p)));
+    }
+
+    /**
      * A container platform's container: `container`, or the top-level `image`,
      * `env`, `command`, `ports` and `registryAuth` it stands for, never both
-     * (refused); undefined when neither names an image.
+     * (refused); undefined when neither names an image. It is as it runs
+     * (resolveContainer): its image a registry reference, and one named by the
+     * library's enums kept up when it is given no command.
      */
     protected containerOf(o: {
-        image?: string, env?: Record<string, string>, command?: string[], ports?: string[], registryAuth?: RegistryAuth, container?: ContainerSpec,
-    }): ContainerSpec | undefined {
-        if (!o.container) return o.image === undefined ? undefined
-            : { image: o.image, ...(o.env ? { env: o.env } : {}), ...(o.command ? { command: o.command } : {}), ...(o.ports ? { ports: o.ports } : {}), ...(o.registryAuth ? { registryAuth: o.registryAuth } : {}) };
-        const both = (['image', 'env', 'command', 'ports', 'registryAuth'] as const).filter((k) => o[k] !== undefined);
+        image?: ImageChoice, env?: Record<string, string>, command?: string[], ports?: string[], registryAuth?: RegistryAuth, container?: ContainerSpec,
+    }): ResolvedContainer | undefined {
+        const both = o.container ? (['image', 'env', 'command', 'ports', 'registryAuth'] as const).filter((k) => o[k] !== undefined) : [];
         if (both.length) throw new ProviderError(this.id, `pass "container" or ${both.map((k) => `"${k}"`).join(', ')}, not both`);
-        return o.container;
+        const c: ContainerSpec | undefined = o.container ?? (o.image === undefined ? undefined
+            : { image: o.image, ...(o.env ? { env: o.env } : {}), ...(o.command ? { command: o.command } : {}), ...(o.ports ? { ports: o.ports } : {}), ...(o.registryAuth ? { registryAuth: o.registryAuth } : {}) });
+        return c && this.checked(() => resolveContainer(c));
     }
 
     /**
@@ -223,12 +361,9 @@ export abstract class ComputeProvider<T extends PlatformTypes = PlatformTypes, T
      * it has any, in that order, as one cloud-init document.
      */
     protected userDataWith(o: { userData?: string, container?: ContainerSpec }, gpu: boolean, own: string[] = []): string | undefined {
-        if (o.container && !o.container.image) throw new ProviderError(this.id, 'a container needs an image');
-        try {
-            return cloudInitParts([o.userData, ...own, o.container ? containerBootScript(o.container, { gpu }) : undefined]);
-        } catch (e) {
-            throw new ProviderError(this.id, `container: ${(e as Error).message}`);
-        }
+        const c = o.container;
+        if (c && !c.image) throw new ProviderError(this.id, 'a container needs an image');
+        return cloudInitParts([o.userData, ...own, c ? this.checked(() => containerBootScript(c, { gpu }), 'container: ') : undefined]);
     }
 
     /**

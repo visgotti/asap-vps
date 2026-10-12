@@ -1,4 +1,4 @@
-import { MACHINE_TYPES, PLATFORM, PlatformFamily, REGION_TYPES } from "./constants";
+import { COUNTRY_TYPES, CUDA_TYPES, MACHINE_TYPES, PLATFORM, PlatformFamily, REGION_TYPES } from "./constants";
 import type { NodeSSH } from 'node-ssh';
 import type { Sleep } from './Core/utils/async';
 import type { FetchImpl } from './Core/utils/http';
@@ -23,7 +23,7 @@ export type UnencryptedSSHData = SSHData<false>
 /** How often SSHService.connect tries before it gives up, and how long it waits between tries (ms). */
 export type SSHRetryOptions = { maxRetries: number, retryTimeout: number };
 
-/** Where a server's sshd listens, and as whom to log in. */
+/** Where a server's sshd listens, and as whom to log in: what RemoteMachine.connect reads from a server. A container's is its host's address and the port mapped to its 22. */
 export type SSHEndpoint = {
     host: string,
     port: number,
@@ -222,8 +222,10 @@ export type Offer<TRaw = unknown> = {
     pricePerHour: number,
     /** How a server of this offer is billed by time. */
     billing?: Billing,
-    /** Where it can be created right now; [] = no stock anywhere. */
+    /** Where it can be created right now, by the provider's own names for its places (what `region` takes); [] = no stock anywhere. */
     regions: string[],
+    /** `regions`, each with the country it is in where the provider says: what OfferQuery.countries narrows by, the same on every provider. */
+    locations?: Location[],
     interruptible?: boolean,
     vcpus?: number,
     memoryGb?: number,
@@ -252,6 +254,13 @@ export type OfferQuery = {
     /** Exactly this many GPUs. */
     gpuCount?: number,
     maxPricePerHour?: number,
+    /**
+     * Only offers with stock in one of these countries (ISO 3166-1 alpha-2:
+     * COUNTRY_TYPES, or any other code), their `regions` narrowed to the ones
+     * there: the same on every provider, whatever it calls its places. An
+     * offer in stock nowhere is in no country.
+     */
+    countries?: Array<COUNTRY_TYPES | `${COUNTRY_TYPES}` | (string & {})>,
     /** Also return offers with no stock right now (default false). */
     includeUnavailable?: boolean,
     /** Also return interruptible (spot / bid) offers (default false). */
@@ -272,14 +281,27 @@ export type ServerListOptions = {
     kind?: ComputeKind,
 };
 
+/**
+ * A place a provider has machines in: its own name for it (a region, a zone,
+ * a data center; what `region` takes), and the country it is in (ISO 3166-1
+ * alpha-2: 'US', 'FR'), where the provider's name or record says.
+ */
+export type Location = {
+    region: string,
+    country?: string,
+};
+
 export type ServerStatus = 'pending' | 'running' | 'stopping' | 'stopped' | 'terminating' | 'terminated' | 'error' | 'unknown';
+
+/** How a port is exposed: 'http' is a container platform's proxied port (RunPod), plain TCP anywhere else. */
+export type PortProtocol = 'tcp' | 'udp' | 'http';
 
 export type ServerPort = {
     privatePort: number,
     publicPort?: number,
     ip?: string,
-    /** 'tcp', 'udp' or 'http'. */
-    protocol: string,
+    /** A PortProtocol, or the platform's own word where it reports another. */
+    protocol: PortProtocol | (string & {}),
 };
 
 /** A server; its addresses are named as in CreatedServerData. */
@@ -296,6 +318,8 @@ export type Server<TRaw = unknown> = {
     gpu?: string,
     gpuCount?: number,
     region?: string,
+    /** The country `region` is in (ISO 3166-1 alpha-2), where the provider says. */
+    country?: string,
     ip?: string,
     ipv6?: string,
     privateIp?: string,
@@ -349,17 +373,21 @@ export type CreateServerBase = {
      */
     gpuCount?: number,
     /**
-     * VM: an OS image slug or id (default: the provider's image for the offer: its
-     * GPU-ready image for a GPU, plain Ubuntu otherwise), or a MACHINE_TYPES member
-     * the provider maps onto its own. Container: an image reference.
+     * What it boots, by the library's names, the same on every provider: a
+     * MACHINE_TYPES member (that Ubuntu), or `{ os, cuda }` (that Ubuntu, for
+     * a machine that runs CUDA software: ImageSpec). Or by a name of the
+     * platform's own. VM: an OS image slug or id, or an image of the account's
+     * (listImages); default: the provider's image for the offer, its GPU image
+     * for a GPU, plain Ubuntu otherwise. Container: a registry reference.
      */
-    image?: string | MACHINE_TYPES,
+    image?: ImageChoice,
     /**
      * Container: place the server only on a host whose driver runs at least
-     * this CUDA version ('major.minor'). An offer that stands for many machines
-     * (RunPod's GPU types) is placed by it; an offer that is one machine
-     * (Vast) is checked before it is rented (CapacityError when below). A VM
-     * runs its image's driver: nothing to place by, so VM providers ignore it.
+     * this CUDA version ('major.minor'); default: the version its image is
+     * asked for by (`image: { os, cuda }`). An offer that stands for many
+     * machines (RunPod's GPU types) is placed by it; an offer that is one
+     * machine (Vast) is checked before it is rented (CapacityError when below).
+     * A VM runs its image's driver: nothing to place by, so VM providers ignore it.
      */
     minCudaVersion?: string,
 };
@@ -371,17 +399,27 @@ export type CreateServerBase = {
  */
 export type CreateServerExtras<T extends PlatformTypes = PlatformTypes> = {
     /**
-     * Keys registered with the provider (listSSHKeys / addSSHKey) to authorize on
-     * the server, by id: exactly these; an id the account does not hold is refused.
+     * Keys registered with the provider (listSSHKeys / addSSHKey) that log in to
+     * the server, by id (or name, fingerprint or public key); one the account
+     * does not hold is refused. The same on every provider: each key named logs
+     * in at the endpoint the running server reports (`ssh`), as RemoteMachine
+     * does. On a VM the platform installs them; in a container the library
+     * starts an SSH server ahead of its command, which an image of the caller's
+     * own must therefore name (`command`). Where the account's other keys log in
+     * besides, `capabilities.sshKeys.atCreate` says so ('account').
      */
     sshKeyIds?: Array<string | number>,
     /** VM: cloud-init user data, plain text. */
     userData?: string,
     /** Container: environment variables. */
     env?: Record<string, string>,
-    /** Container: the command (Docker CMD); the image's ENTRYPOINT is kept. */
+    /**
+     * Container: the command (Docker CMD); the image's ENTRYPOINT is kept. With
+     * `sshKeyIds` on a container platform it is the whole command line: the SSH
+     * server's start takes the entrypoint's place and then runs the command.
+     */
     command?: string[],
-    /** Container: ports to expose, as '<port>/<tcp|udp|http>'. */
+    /** Container: ports to expose, as '<port>/<tcp|udp|http>' (a bare port is tcp; 'http' is a proxied port on RunPod, plain TCP elsewhere), 1-65535. */
     ports?: string[],
     /** Container: the login for the private registry `image` is pulled from. */
     registryAuth?: RegistryAuth,
@@ -431,16 +469,50 @@ export type CreateServerOptions<T extends PlatformTypes = PlatformTypes> = Creat
  * (DigitalOcean, Scaleway, Lambda), which boots its OS image (`image`) first.
  */
 export type ContainerSpec = {
-    /** The image, a registry reference. */
-    image: string,
+    /** The image: a registry reference, or one Docker Hub has by the library's names (a MACHINE_TYPES member: `ubuntu`; `{ os, cuda }`: `nvidia/cuda`). */
+    image: ImageChoice,
     env?: Record<string, string>,
     /** The command (Docker CMD); the image's ENTRYPOINT is kept. */
     command?: string[],
-    /** Ports to publish, as '<port>/<tcp|udp>' (on a VM, on the host's own). */
+    /** Ports to publish, as '<port>/<tcp|udp|http>' (a bare port is tcp; on a VM, each on the host's own, 'http' as tcp), 1-65535. */
     ports?: string[],
     /** The login for the image's private registry. */
     registryAuth?: RegistryAuth,
 };
+
+/**
+ * An image by the library's names, the same on every provider: an Ubuntu,
+ * and with `cuda`, that Ubuntu for a machine that runs CUDA software.
+ *
+ * A container runs Docker Hub's `ubuntu:<release>`, or NVIDIA's
+ * `nvidia/cuda:<version>-base-ubuntu<release>` (the newest patch of that
+ * CUDA version), on a host whose driver runs that version (minCudaVersion
+ * defaults to it). Given no command it runs `sleep infinity`, so it stays up
+ * as a VM does: those images' own command, a shell, exits at once.
+ *
+ * A VM boots the provider's plain image of that Ubuntu, or, with `cuda`, its
+ * GPU image of it: the one with the NVIDIA driver, which is what CUDA
+ * software needs of the machine. What else that image carries is the
+ * provider's (DigitalOcean's the CUDA toolkit, Lambda's CUDA and the
+ * frameworks, Scaleway's Docker with NVIDIA's runtime, CUDA coming in the
+ * containers it runs), and so is its driver: the version asked for picks
+ * nothing there, and is not checked.
+ *
+ * What no image exists for is refused (NotSupportedError), never sent as it
+ * is: a CUDA version NVIDIA does not publish for that Ubuntu, an Ubuntu a
+ * provider has no image of, a provider's GPU image on a machine it does not
+ * boot. A spec that is not well formed (a typo) is a ProviderError.
+ */
+export type ImageSpec = {
+    os: MACHINE_TYPES | `${MACHINE_TYPES}`,
+    cuda?: CUDA_TYPES | `${CUDA_TYPES}`,
+};
+
+/** What an `image` may be: a MACHINE_TYPES member, an ImageSpec, or the platform's own name for one (a slug, an id, a registry reference). */
+export type ImageChoice = string | MACHINE_TYPES | ImageSpec;
+
+/** A container as it runs: its image as a registry reference (resolveContainer). */
+export type ResolvedContainer = Omit<ContainerSpec, 'image'> & { image: string };
 
 /** The login for a private container registry, as `docker login` takes it (CreateServerOptions.registryAuth). */
 export type RegistryAuth = {
@@ -557,6 +629,13 @@ export type CreateEndpointOptions<T extends PlatformTypes = PlatformTypes> = {
     maxWorkers?: number,
     /** Seconds an idle worker is kept before it is stopped (the platform's default when absent). */
     idleTimeoutSeconds?: number,
+    /**
+     * GPU workers only on hosts whose driver runs at least this CUDA version
+     * ('major.minor'), as CreateServerOptions.minCudaVersion places a server;
+     * default: the version the image is asked for by (`{ os, cuda }`). A
+     * platform whose workers have no GPU refuses it.
+     */
+    minCudaVersion?: string,
     /** Fields merged into the platform's own create request, as its API names them. */
     providerOptions?: Partial<T['endpointBody']> & Record<string, unknown>,
 } & WaitOptions;

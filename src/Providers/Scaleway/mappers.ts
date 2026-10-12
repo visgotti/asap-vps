@@ -8,7 +8,7 @@
 // ScalewayTypes; the API client (api.ts) builds on them, never the other way.
 
 import type { EnumTranslations } from '../../Core/ComputeProvider';
-import { errorText, gpuName, gpuVendor, sshKeyFingerprint } from '../../Core/utils';
+import { errorText, gpuName, gpuVendor, located, sshKeyFingerprint } from '../../Core/utils';
 import { MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import type {
     Billing, Endpoint, EndpointStatus, GpuVendor, ImageStatus, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerImage, ServerStatus, Volume, VolumeStatus,
@@ -103,7 +103,21 @@ export function billingOf(name: string, t?: ScalewayServerType): Billing | undef
     return t && (gpuOf(t) ? BILLING_PER_MINUTE : BILLING_PER_HOUR);
 }
 
-/** The library's enums by Scaleway's names: a region is its first zone, `_N` the zone; each Ubuntu is its Marketplace label. */
+/** The country a zone or a region is in: the two letters its name begins with ('fr-par-2', 'nl-ams': 'FR', 'NL'). */
+export function countryOf(place: string): string {
+    return place.slice(0, 2).toUpperCase();
+}
+
+/** Scaleway's GPU OS image of Ubuntu 24.04 (Marketplace label), which boots every GPU type and no other: the NVIDIA driver, and Docker with NVIDIA's runtime to run CUDA containers in. */
+export const SCALEWAY_GPU_IMAGE = 'ubuntu_noble_gpu_os_13_nvidia';
+/** Its plain Ubuntu 24.04, which boots the types without GPUs and no GPU type. */
+export const SCALEWAY_CPU_IMAGE = 'ubuntu_noble';
+
+/**
+ * The library's enums by Scaleway's names: a region is its first zone, `_N` the zone; each Ubuntu is its Marketplace
+ * label, and with `cuda` its GPU OS image's (the NVIDIA driver and Docker with NVIDIA's runtime; none of Ubuntu 20.04).
+ * A plain label boots only types without GPUs and a GPU OS one only GPU types (Marketplace: compatible_commercial_types).
+ */
 export const SCALEWAY_ENUMS: EnumTranslations = Object.freeze({
     regions: {
         [REGION_TYPES.PARIS]: 'fr-par-1',
@@ -122,9 +136,13 @@ export const SCALEWAY_ENUMS: EnumTranslations = Object.freeze({
         [REGION_TYPES.MILAN_1]: 'it-mil-1',
     },
     machines: {
-        [MACHINE_TYPES.UBUNTU_24]: 'ubuntu_noble',
+        [MACHINE_TYPES.UBUNTU_24]: SCALEWAY_CPU_IMAGE,
         [MACHINE_TYPES.UBUNTU_22]: 'ubuntu_jammy',
         [MACHINE_TYPES.UBUNTU_20]: 'ubuntu_focal',
+    },
+    cudaMachines: {
+        [MACHINE_TYPES.UBUNTU_24]: SCALEWAY_GPU_IMAGE,
+        [MACHINE_TYPES.UBUNTU_22]: 'ubuntu_jammy_gpu_os_12',
     },
 });
 
@@ -161,7 +179,7 @@ export function toOffer(name: string, raw: ScalewayOfferRaw, regions: ScalewayZo
         vramGb: g?.vramGb ?? 0,
         pricePerHour: t.hourly_price * eurToUsd,
         billing: billingOf(name, t),
-        regions: [...regions],
+        ...located(regions, countryOf),
         vcpus: t.ncpus,
         memoryGb: t.ram / GIB,
         // A GPU type has no local disk: its root volume is Block Storage, sized by diskGb.
@@ -184,6 +202,7 @@ export function toServer(s: ScalewayServer, type: ScalewayServerType | undefined
         gpu: g?.name,
         gpuCount: g?.count,
         region: s.zone,
+        country: countryOf(s.zone),
         ip,
         ipv6,
         privateIp,
@@ -359,7 +378,7 @@ export function toContainerOffer(s: ScalewayContainerSize, eurToUsd: number): Of
     const eurPerHour = ((s.mvcpu / 1000) * CONTAINER_PRICE.vcpuSecond + (s.memoryBytes / 1e9) * CONTAINER_PRICE.gbSecond) * 3600;
     return {
         provider: SCALEWAY_ID, id: containerSizeId(s), gpu: '', vendor: null, gpuCount: 0, vramGb: 0, pricePerHour: eurPerHour * eurToUsd,
-        billing: BILLING_PER_SECOND, regions: [...SCALEWAY_REGIONS], vcpus: s.mvcpu / 1000, memoryGb: s.memoryBytes / 1e9, raw: s,
+        billing: BILLING_PER_SECOND, ...located(SCALEWAY_REGIONS, countryOf), vcpus: s.mvcpu / 1000, memoryGb: s.memoryBytes / 1e9, raw: s,
     };
 }
 

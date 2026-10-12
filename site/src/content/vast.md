@@ -7,11 +7,12 @@
 `listOffers` searches Vast for you (its API returns at most 64 offers a page, so the library pages by price). Each offer is one machine, and says where it is:
 
 ```ts run title="Rent the cheapest machine that runs your CUDA"
-import { VastAI } from "asap-vps";
+import { CUDA_TYPES, MACHINE_TYPES, VastAI } from "asap-vps";
 
 const vast = new VastAI(process.env.VAST_API_KEY!);
+const cuda = CUDA_TYPES.CUDA_12_8;
 
-const offers = await vast.listOffers({ minVramGb: 16, minCudaVersion: "12.2", maxPricePerHour: 1 });
+const offers = await vast.listOffers({ minVramGb: 16, minCudaVersion: cuda, maxPricePerHour: 1 });
 const [offer] = offers;
 console.log(`${offer.gpuCount}x ${offer.gpu}, ${offer.vramGb} GB, $${offer.pricePerHour}/h`);
 console.log("regions:", offer.regions); // its location, and the machine itself: machine:<id>
@@ -19,7 +20,7 @@ console.log("regions:", offer.regions); // its location, and the machine itself:
 const server = await vast.createServer({
   name: "trainer",
   offer,
-  image: "nvidia/cuda:12.8.1-base-ubuntu24.04",
+  image: { os: MACHINE_TYPES.UBUNTU_24, cuda }, // NVIDIA's CUDA 12.8 image: the machine's driver is checked for it first
   command: ["sh", "-c", 'nvidia-smi -L; echo "PORT is $PORT"; sleep infinity'],
   env: { PORT: "8080" },
   ports: ["8080/tcp"], // mapped to a random public port
@@ -28,11 +29,13 @@ const running = await vast.waitUntilRunning(server.id);
 console.log(running.status, running.ports); // { privatePort: 8080, publicPort: <random>, ip, protocol }
 console.log(await vast.getServerLogs(running.id));
 
-await vast.stopServer(server.id); // a stopped instance bills only its disk
+await vast.stopServer(server.id); // returns once it is stopped: a stopped instance bills only its disk
 await vast.deleteServerAndWait(server.id);
 ```
 
-`includeInterruptible: true` adds the **interruptible** offers (a bid price instead of the on-demand one: the offer's id carries the bid). `minCudaVersion` is checked against the machine's driver before anything is rented.
+`includeInterruptible: true` adds the **interruptible** offers (a bid price instead of the on-demand one: the offer's id carries the bid). `minCudaVersion`, or the CUDA version of an image asked for as `{ os, cuda }`, is checked against the machine's driver before anything is rented.
+
+An instance is **logged in to like any server**: name the keys with `sshKeyIds` and the library starts an SSH server in the container ahead of its command (and of a `userData` script), with exactly those keys, and maps its port: the running instance reports where as `server.ssh`. An image of your own needs a `command` for it to hand over to. See [Logging in and setting up](#/ssh).
 
 ## One machine, one place
 

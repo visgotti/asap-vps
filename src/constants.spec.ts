@@ -1,6 +1,15 @@
-import { PLATFORM, PLATFORM_FAMILY, MACHINE_TYPES } from './constants';
+import { CUDA_TYPES, PLATFORM, PLATFORM_FAMILY, MACHINE_TYPES } from './constants';
 
 describe('constants', () => {
+    describe('CUDA_TYPES', () => {
+        it('each member is its version as major.minor, and there is no 12.7', () => {
+            expect(CUDA_TYPES).toEqual({
+                CUDA_11_8: '11.8', CUDA_12_0: '12.0', CUDA_12_1: '12.1', CUDA_12_2: '12.2', CUDA_12_3: '12.3', CUDA_12_4: '12.4', CUDA_12_5: '12.5', CUDA_12_6: '12.6',
+                CUDA_12_8: '12.8', CUDA_12_9: '12.9', CUDA_13_0: '13.0', CUDA_13_1: '13.1', CUDA_13_2: '13.2', CUDA_13_3: '13.3', CUDA_13_4: '13.4',
+            });
+        });
+    });
+
     describe('MACHINE_TYPES', () => {
         it('should include UBUNTU_24', () => {
             expect(MACHINE_TYPES.UBUNTU_24).toBe('ubuntu24');

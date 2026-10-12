@@ -58,15 +58,45 @@ export interface ICompute<T extends PlatformTypes = PlatformTypes> {
     getServerCost(id: string, at?: number): Promise<CostEstimate | null>;
 }
 
-/** Power a server off and on again, keeping it. */
+/**
+ * Power a server off and on again, keeping it. Both wait, for at most
+ * `o.timeoutMs` (the provider's own default without one), reading every
+ * `o.intervalMs`: a wait that runs out throws a ProviderError with code
+ * 'timeout', which says what the server still was and how long the whole
+ * wait was. An option that is no number of milliseconds from 0 up is refused
+ * before the platform is asked for anything; one given as `undefined` is the
+ * default. A server the provider does not have is a NotFoundError.
+ */
 export interface IPower {
-    stopServer(id: string): Promise<void>;
-    startServer(id: string): Promise<void>;
+    /**
+     * Stops the server and returns once it is stopped (at once when it already
+     * is). Throws when it is gone, or errors or is deleted instead of stopping.
+     */
+    stopServer(id: string, o?: WaitOptions): Promise<void>;
+    /**
+     * Starts a stopped server and returns once it is running (at once, and
+     * with nothing asked of the platform, when it already is); a VM's public
+     * address is waitUntilRunning's to wait for. Throws CapacityError when
+     * there is no stock for it to come back to: it is then left stopped.
+     */
+    startServer(id: string, o?: WaitOptions): Promise<void>;
 }
 
 /** Reboot a server. */
 export interface IRestart {
-    restartServer(id: string): Promise<void>;
+    /**
+     * Reboots a server that runs, and returns once it runs again, for at most
+     * `o.timeoutMs` (wait options as IPower's). It is back once it was seen
+     * not to run and runs again; one whose status never shows the reboot is
+     * taken to be back after reading as running a few times in a row
+     * (ComputeProvider.RESTART_SETTLE_READS: thirty seconds at the default
+     * pace), which is how long a platform is given to show it. A status can
+     * lag a reboot by longer than that: where it matters that the machine has
+     * really booted again, ask the machine (its boot id over SSH, a mark in
+     * its log). A server that is stopped is refused (start it); one that is
+     * gone, errors, stops or is deleted instead of coming back is thrown.
+     */
+    restartServer(id: string, o?: WaitOptions): Promise<void>;
 }
 
 /** A container server's recent output. */
@@ -217,6 +247,16 @@ export type PowerTraits = {
 };
 
 export type SSHKeyTraits = {
+    /**
+     * Which keys log in to a server created with CreateServerOptions.sshKeyIds.
+     * The keys named always do, on every platform; what differs, and cannot be
+     * made the same, is whether any other does:
+     * - 'chosen': exactly the keys named, and no other.
+     * - 'account': every key of the account besides, whatever is named
+     *   (Scaleway applies a Project's keys to all its servers): naming keys
+     *   there only checks that the account holds them.
+     */
+    atCreate: 'chosen' | 'account',
     /**
      * The provider applies the account's registered keys to a server at every
      * boot, not only when it is created (Scaleway: a Project's keys, read at each

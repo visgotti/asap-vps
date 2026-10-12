@@ -3,7 +3,7 @@
 // account's key list as a key, its status words, its billing, and its log
 // stream's events as lines. Pure functions of the raw records, typed by RunPodTypes.
 
-import { canonicalGpu, compareCudaVersions, cudaVersion, gpuName, parseSSHPublicKey, sshKeyFingerprint } from '../../Core/utils';
+import { canonicalGpu, compareCudaVersions, cudaVersion, gpuName, located, parseSSHPublicKey, sshKeyFingerprint } from '../../Core/utils';
 import type { Billing, Endpoint, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerStatus, Volume } from '../../types';
 import type { RunPodCloud, RunPodCpuOffer, RunPodCpuType, RunPodEndpoint, RunPodGpuType, RunPodNetworkVolume, RunPodPod, RunPodPodStatus } from './types';
 
@@ -14,6 +14,19 @@ export const RUNPOD_REFUSED = ['userData', 'tags'] as const satisfies readonly R
 
 /** Where a pod mounts a network volume unless a mount says otherwise: where RunPod's own pods do. */
 export const RUNPOD_MOUNT_PATH = '/workspace';
+
+/**
+ * The country a data center is in, from its id: the United States' and
+ * Canada's begin with the country ('US-TX-3', 'CA-MTL-1'), the others with
+ * their part of the world and then the country ('EU-RO-1', 'EUR-IS-2',
+ * 'AP-JP-1', 'OC-AU-1'), as the catalog listed them on 2026-10-12. undefined
+ * for an id of another shape.
+ */
+export function countryOf(dataCenter: string | null | undefined): string | undefined {
+    const [first, second] = (dataCenter ?? '').split('-');
+    if (first === 'US' || first === 'CA') return first;
+    return /^(EU|EUR|AP|OC)$/.test(first) && /^[A-Z]{2}$/.test(second ?? '') ? second : undefined;
+}
 
 export const POD_STATUS: Readonly<Record<RunPodPodStatus, ServerStatus>> = {
     PROVISIONING: 'pending',
@@ -59,7 +72,7 @@ export function toOffer(g: RunPodGpuType, count: number, cloud: RunPodCloud): Of
         vramGb: Number(g.memory ?? canonicalGpu(g.id)?.vramGb ?? 0),
         pricePerHour: Number(price) * count,
         billing: RUNPOD_BILLING,
-        regions: (g.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id),
+        ...located((g.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id), countryOf),
         ...(cuda ? { cudaVersion: cuda } : {}),
         raw: g,
     };
@@ -99,7 +112,7 @@ export function toCpuOffer(cpu: RunPodCpuType, vcpuCount: number): Offer<RunPodC
         vramGb: 0,
         pricePerHour: Number(cpu.price.securePerVcpu) * vcpuCount,
         billing: RUNPOD_BILLING,
-        regions: (cpu.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id),
+        ...located((cpu.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id), countryOf),
         vcpus: vcpuCount,
         memoryGb: Number(cpu.ramGbPerVcpu) * vcpuCount,
         raw: { cpu, vcpuCount },
@@ -123,6 +136,7 @@ export function toServer(p: RunPodPod): Server<RunPodPod> {
         gpu: p.gpu ? runPodGpuName(p.gpu.id) : undefined,
         gpuCount: p.gpu?.count,
         region: p.dataCenterId ?? undefined,
+        ...(countryOf(p.dataCenterId) ? { country: countryOf(p.dataCenterId) } : {}),
         // The host's public address: sshd's direct endpoint, else a mapped tcp port.
         // An http port's ip is RunPod's proxy network, not the host.
         ip: p.ssh?.direct?.host ?? ports.find((x) => x.protocol === 'tcp' && x.ip && x.publicPort != null)?.ip,
@@ -217,7 +231,7 @@ export function toServerlessGpuOffer(g: RunPodGpuType): Offer<RunPodGpuType> | n
         vramGb: Number(g.memory ?? canonicalGpu(g.id)?.vramGb ?? 0),
         pricePerHour: price,
         billing: RUNPOD_BILLING,
-        regions: (g.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id),
+        ...located((g.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id), countryOf),
         raw: g,
     };
 }

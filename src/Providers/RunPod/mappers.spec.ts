@@ -3,13 +3,27 @@
 // default), never NaN or a crash, and a status word it adds later reads as
 // 'unknown'.
 
-import { toCpuOffer, toEndpoint, toOffer, toServer, toServerlessCpuOffer, toServerlessGpuOffer, toSSHKey } from './mappers';
+import { countryOf, toCpuOffer, toEndpoint, toOffer, toServer, toServerlessCpuOffer, toServerlessGpuOffer, toSSHKey } from './mappers';
 import type { RunPodCpuType, RunPodEndpoint, RunPodGpuType, RunPodPod } from './types';
 
 const gpu = (o: Partial<RunPodGpuType> = {}) => ({ id: 'NVIDIA L4', secure: true, community: true, price: { secure: 0.4, community: 0.3, serverless: 0.5 }, ...o }) as RunPodGpuType;
 const cpu = (o: Partial<RunPodCpuType> = {}) => ({ id: 'cpu3c', vcpu: { min: 2, max: 8 }, ramGbPerVcpu: 2, price: { securePerVcpu: 0.02, serverlessPerVcpu: 0.03 }, ...o }) as RunPodCpuType;
 const pod = (o: Partial<RunPodPod> = {}) => ({ id: 'pod_1', name: 'p', status: 'RUNNING', ...o }) as RunPodPod;
 const endpoint = (o: Partial<RunPodEndpoint> = {}) => ({ id: 'ep1', name: 'e', ...o }) as RunPodEndpoint;
+
+describe('RunPod places', () => {
+    it('the country of each data center the catalog lists (2026-10-12), from its id; none for an id of another shape', () => {
+        const live: Array<[string, string]> = [
+            ['AP-IN-1', 'IN'], ['AP-JP-1', 'JP'], ['CA-MTL-1', 'CA'], ['CA-MTL-3', 'CA'], ['EU-CZ-1', 'CZ'], ['EU-FR-1', 'FR'], ['EU-NL-1', 'NL'], ['EU-RO-1', 'RO'], ['EU-SE-1', 'SE'],
+            ['EUR-IS-1', 'IS'], ['EUR-IS-5', 'IS'], ['EUR-NO-2', 'NO'], ['OC-AU-1', 'AU'], ['US-CA-2', 'US'], ['US-CO-1', 'US'], ['US-GA-2', 'US'], ['US-IL-1', 'US'], ['US-KS-2', 'US'],
+            ['US-MD-1', 'US'], ['US-MO-1', 'US'], ['US-NC-2', 'US'], ['US-NE-1', 'US'], ['US-PA-1', 'US'], ['US-TX-3', 'US'], ['US-TX-4', 'US'], ['US-WA-2', 'US'],
+        ];
+        expect(live.map(([id]) => countryOf(id))).toEqual(live.map(([, country]) => country));
+        // A state of the United States is no country: California is not Canada.
+        expect(countryOf('US-CA-2')).toBe('US');
+        expect(['', null, undefined, 'XX-RO-1', 'EU-ROM-1', 'EU', 'eu-ro-1', 'EU-ro-1'].map(countryOf)).toEqual(Array(8).fill(undefined));
+    });
+});
 
 describe('RunPod GPU and CPU offers', () => {
     it('a type its cloud sells but has no price for is no offer', () => {

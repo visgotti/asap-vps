@@ -35,7 +35,7 @@ export const PAGES: Page[] = [
     { slug: 'serverless', title: 'Serverless', group: 'Guides', summary: 'Endpoints from zero workers.', md: serverless },
     { slug: 'costs', title: 'Costs', group: 'Guides', summary: "Billing, counted each provider's way.", md: costs },
     { slug: 'errors', title: 'Errors and retries', group: 'Guides', summary: 'Typed failures.', md: errors },
-    { slug: 'ssh', title: 'Setting a server up', group: 'Guides', summary: 'ServerProvisioner and SSH.', md: ssh },
+    { slug: 'ssh', title: 'Logging in and setting up', group: 'Guides', summary: 'RemoteMachine, users, ServerProvisioner.', md: ssh },
     { slug: 'sandbox', title: 'How the sandbox works', group: 'Sandbox', summary: 'What is real, what is simulated.', md: sandbox },
     { slug: 'playground', title: 'Playground', group: 'Sandbox', summary: 'A blank file with the fakes behind it.', md: playground },
 ];

@@ -12,6 +12,10 @@ export { BaseProvider } from './Core/BaseProvider';
 export { ComputeProvider } from './Core/ComputeProvider';
 export type { EnumTranslations, ResolvedMount, ResolvedOffer } from './Core/ComputeProvider';
 
+// A machine behind SSH, whichever provider rented it
+export { RemoteMachine } from './Core/RemoteMachine';
+export type { RemoteLogin, RunOptions, RunResult, WriteFileOptions } from './Core/RemoteMachine';
+
 // Setting a server up over SSH
 export { SetupPipeline } from './Core/SetupPipeline';
 export { ProvisionError, ServerProvisioner, asRoot } from './Core/ServerProvisioner';
@@ -23,6 +27,7 @@ export {
     CreateDirectoryStep,
     RunCommandStep,
     AddAuthorizedKeyStep,
+    AddUserStep,
     InstallNodeStep,
 } from './Core/steps';
 export { SSHService } from './Core/SSHService';
@@ -62,16 +67,21 @@ export * from './Providers/Scaleway/types';
 
 // Every provider by id
 export { PROVIDERS, createProvider, isProviderId, providerInfo, providerParams, providersFromEnv, providersWith } from './Providers/registry';
-export type { AnyProvider, ProviderId, ProviderInfo, ProviderOf } from './Providers/registry';
+export type { AnyProvider, ProviderId, ProviderInfo, ProviderOf, ProviderParamsOf } from './Providers/registry';
 
 export {
+    addUserScript,
     ApiClient,
     asksForGpu,
+    authorizeKeysScript,
     canonicalGpu,
     compareCudaVersions,
+    CONTAINER_KEEP_ALIVE,
     containerBootScript,
+    containerImageOf,
     copyRegistryImage,
     createSSHKeyPair,
+    CUDA_IMAGES,
     cudaVersion,
     decrypt,
     encrypt,
@@ -82,19 +92,26 @@ export {
     findSSHKey,
     gpuName,
     gpuVendor,
+    imageSpecOf,
     isKind,
+    located,
+    NoSuchImageError,
     parseImageRef,
+    parsePort,
     parseSSHPublicKey,
     PER_SECOND,
     pickSSHKeys,
+    placed,
     RegistryClient,
     registryHost,
+    resolveContainer,
     shellQuote,
     sshKeyFingerprint,
     sshKeyMatches,
+    sshdBootScript,
     toOpenSSHPublicKey,
     VM_CONTAINER_ENV_FILE,
     VM_CONTAINER_NAME,
     withUserData,
 } from './Core/utils';
-export type { ApiEndpoint, FetchImpl, GpuModel, HttpMethod, HttpResult, ImageRef, Manifest, ParsedSSHPublicKey, RequestInfo, RequestOptions, Sleep } from './Core/utils';
+export type { ApiEndpoint, FetchImpl, GpuModel, HttpMethod, HttpResult, ImageRef, Manifest, ParsedSSHPublicKey, RemoteUser, RequestInfo, RequestOptions, Sleep } from './Core/utils';

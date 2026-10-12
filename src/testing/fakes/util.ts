@@ -28,12 +28,34 @@ export type FakeApi = {
      */
     authorized?(host: string, publicKey: string): boolean,
     /**
-     * The server reachable at `host` right now, as its sshd would show it, for
-     * a fake of VMs; undefined when nothing answers there. Asking is a request
-     * like any other: time passes.
+     * The server whose sshd is reachable at `host` (and `port`, where servers
+     * share an address) right now, as it would show it; undefined when nothing
+     * answers there: no server, or one that runs no SSH server. Asking is a
+     * request like any other: time passes.
      */
-    machine?(host: string): FakeMachine | undefined,
+    machine?(host: string, port?: number): FakeMachine | undefined,
 };
+
+/**
+ * The keys a script makes log in as `user`: what sshdBootScript (a
+ * container's start) or authorizeKeysScript (a VM's first boot) was given. A
+ * fake runs no script: it reads the one line these write, word by word as a
+ * shell would. undefined for a script that names no keys for that user.
+ */
+export function scriptKeys(script: unknown, user: string): string[] | undefined {
+    for (const line of String(script ?? '').split('\n')) {
+        const m = /^\s*asap_vps_keys\s+(.*)$/.exec(line);
+        if (!m) continue;
+        const words = [...m[1].matchAll(/'((?:[^']|'\\'')*)'|(\S+)/g)].map((w) => (w[1] !== undefined ? w[1].replace(/'\\''/g, "'") : w[2]));
+        if (words[0] === user) return words.slice(1);
+    }
+    return undefined;
+}
+
+/** Whether a container's start script starts an SSH server (sshdBootScript), and so answers at its port 22. */
+export function startsSshd(script: unknown): boolean {
+    return /^asap_vps_sshd\(\) \($/m.test(String(script ?? '')) && /^ASAP_VPS_PATH=\$PATH asap_vps_sshd \|\| /m.test(String(script ?? ''));
+}
 
 /**
  * The files a user-data script's `echo <text> > <path>` lines write: what a
@@ -50,6 +72,30 @@ export function userDataFiles(userData: unknown): Record<string, string> {
 export function fakeBootId(server: string | number, n: number): string {
     const head = (typeof server === 'number' ? server.toString(16) : server.replace(/[^0-9a-f]/gi, '')).toLowerCase().padStart(8, '0').slice(-8);
     return `${head}-0000-4000-8000-${String(n).padStart(12, '0')}`;
+}
+
+/**
+ * A clock the waits advance, for a spec of how long something waits: while
+ * it is installed Date.now() is the real time plus every pause `sleep` was
+ * asked for (each on record in `slept`), so a wait of minutes ends at once
+ * and reports the time it was told. `restore()` puts the real clock back.
+ */
+export function waitingClock() {
+    const real = Date.now.bind(Date);
+    const now = Date.now;
+    const slept: number[] = [];
+    let offset = 0;
+    Date.now = () => real() + offset;
+    return {
+        slept,
+        sleep: async (ms: number) => {
+            slept.push(ms);
+            offset += ms;
+        },
+        restore: () => {
+            Date.now = now;
+        },
+    };
 }
 
 /** Files carried in a fake disk export (a QCOW2): written after its magic, so a byte-for-byte copy keeps them. */

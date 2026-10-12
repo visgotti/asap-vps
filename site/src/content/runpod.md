@@ -4,36 +4,38 @@
 
 ## A GPU pod
 
-`listOffers` takes the same query on every provider. `minCudaVersion` matters most on container platforms: the pod runs your image on the host's driver, so only hosts whose driver runs at least that CUDA are offered.
+`listOffers` takes the same query on every provider. `minCudaVersion` matters most on container platforms: the pod runs your image on the host's driver, so only hosts whose driver runs at least that CUDA are offered. An image asked for by the library's names (`{ os, cuda }`) is placed by its CUDA version without being told; with an image of your own, pass `minCudaVersion` to `createServer` too.
 
 ```ts run title="Rent a GPU, read its logs, stop it, start it"
-import { RunPod } from "asap-vps";
+import { CUDA_TYPES, MACHINE_TYPES, RunPod } from "asap-vps";
 
 const runpod = new RunPod(process.env.RUNPOD_API_KEY!);
+const cuda = CUDA_TYPES.CUDA_12_8;
 
 // what can be rented right now, cheapest first, on hosts whose driver runs the image's CUDA
-const [offer] = await runpod.listOffers({ minVramGb: 24, maxPricePerHour: 1, minCudaVersion: "12.8" });
+const [offer] = await runpod.listOffers({ minVramGb: 24, maxPricePerHour: 1, minCudaVersion: cuda });
 console.log(`${offer.gpuCount}x ${offer.gpu}, ${offer.vramGb} GB, $${offer.pricePerHour}/h in ${offer.regions.join(", ")}`);
 
 // the offer brings its region, GPU count and (interruptible) bid: nothing to repeat
 const server = await runpod.createServer({
   name: "my-gpu",
   offer,
-  image: "nvidia/cuda:12.8.1-base-ubuntu24.04",
+  image: { os: MACHINE_TYPES.UBUNTU_24, cuda }, // NVIDIA's CUDA 12.8 image; the pod is placed on a host whose driver runs it
   command: ["sh", "-c", 'nvidia-smi -L; echo "hello from $MODEL"; sleep infinity'],
   env: { MODEL: "llama-3-8b" },
-  minCudaVersion: "12.8",
 });
 await runpod.waitUntilRunning(server.id);
 console.log(await runpod.getServerLogs(server.id)); // the container's own output
 
-await runpod.stopServer(server.id); // a stopped pod bills only its volume
+await runpod.stopServer(server.id); // returns once it is stopped: a stopped pod bills only its volume
 console.log("cost while stopped:", await runpod.getServerCost(server.id)); // null
-await runpod.startServer(server.id);
+await runpod.startServer(server.id); // returns once it runs again
 await runpod.deleteServerAndWait(server.id);
 ```
 
-A stopped pod can resume without its GPU (the host gave it to someone else): `startServer` then stops it again and throws `CapacityError`, so a retry loop knows to move on. See [Errors](#/errors).
+`stopServer`, `startServer` and `restartServer` wait on every provider that has them, and take `{ timeoutMs?, intervalMs? }` to say for how long. A pod rented by an offer goes to the offer's first data center with stock; where that one cannot place it (no host there runs the CUDA your image needs), the offer's next is tried. Pass `region` to pin it. A stopped pod can resume without its GPU (the host gave it to someone else): `startServer` then stops it again and throws `CapacityError`, so a retry loop knows to move on. See [Errors](#/errors).
+
+A pod is **logged in to like any server**: name the keys with `sshKeyIds` and the library starts an SSH server in the container ahead of its command, with exactly those keys, at the endpoint the running pod reports as `server.ssh`. An image of your own needs a `command` for it to hand over to. See [Logging in and setting up](#/ssh).
 
 Pods also come **without a GPU**: `listOffers({ kind: "cpu" })` returns CPU flavors, and the rest of the call is the same.
 

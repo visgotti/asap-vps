@@ -20,7 +20,7 @@
 // reasons are in errors[]; a create that cannot be placed is a 400 with only a
 // human-readable detail.
 
-import { echoed, FakeApi, json, readRequest } from './util';
+import { echoed, fakeBootId, FakeApi, json, readRequest, scriptKeys, startsSshd } from './util';
 
 /** What the fake records of a GPU type in one data center: its stock in each context (absent: none there), its hosts' CUDA. */
 type GpuStock = {
@@ -131,6 +131,8 @@ export function fakeRunPod(o: {
         workers: new Map<string, { cold: number, up: number }>(),
         nextId: 1,
         bootReads: o.bootReads ?? 2,
+        /** Pods made so far: each has public ports of its own. */
+        slots: 0,
         /** "You may be allocated zero GPUs if capacity has changed": a start that comes back with none. */
         resumeWithoutGpu: o.resumeWithoutGpu ?? false,
     };
@@ -177,13 +179,14 @@ export function fakeRunPod(o: {
         return { rows: newestFirst.slice(Number(at), end), pagination: { nextCursor: more ? Buffer.from(`${operation}:${end}`).toString('base64url') : null, hasNextPage: more } };
     };
     const view = (p: any) => {
-        const { reads, logs, rate, ...rest } = p;
+        const { reads, logs, rate, slot, ...rest } = p;
         const running = p.status === 'RUNNING';
         const ports = (p.ports ?? []).map((x: string) => {
             const [n, type = 'tcp'] = x.split('/');
             // An http port rides RunPod's proxy network (a private address); a tcp port is mapped on the host's public IP.
             return type === 'http' ? { private: Number(n), public: Number(n), type, ip: '100.65.0.101' }
-                : { private: Number(n), public: 40000 + Number(n) % 1000, type, ip: '194.68.245.10' };
+                // On a public port of its own: pods share the host's address, never a port.
+                : { private: Number(n), public: 40000 + Number(n) % 1000 + (p.slot ?? 0) * 1000, type, ip: '194.68.245.10' };
         });
         const direct = ports.find((x: any) => x.private === 22 && x.type === 'tcp');
         return {
@@ -215,6 +218,7 @@ export function fakeRunPod(o: {
         const id = `pod_${state.nextId++}`;
         const rate = c.price.securePerVcpu * n;
         const pod: any = { id, name: body.name, status: 'PROVISIONING', image: body.image, env: body.env ?? {}, ports: body.ports ?? [], cmd: body.cmd,
+                ...(body.entrypoint ? { entrypoint: body.entrypoint } : {}), slot: state.slots++,
             ...(body.mounts ? { mounts: body.mounts } : {}), registry: body.registry ?? null, cpu: { id: c.id, vcpuCount: n, memory: c.ramGbPerVcpu * n },
             dataCenterId: dc, cudaVersion: null, cost: rate, rate, startedAt: null, createdAt: new Date().toISOString(), reads: 0 };
         pod.logs = containerRun(pod);
@@ -248,6 +252,7 @@ export function fakeRunPod(o: {
             if (body.gpu) {
                 if (!body.gpu.pools?.length || body.gpu.pools.some((p: string) => !pools().has(p))) return problem(400, `unknown GPU pool in ${JSON.stringify(body.gpu.pools)}`);
                 if ((body.gpu.excludedTypes ?? []).some((t: string) => !state.gpus.some((g) => g.id === t))) return problem(400, 'unknown GPU type in excludedTypes');
+                if (body.gpu.minCudaVersion !== undefined && !/^\d+\.\d+$/.test(String(body.gpu.minCudaVersion))) return invalid(['$.gpu.minCudaVersion: does not match pattern ^\\d+\\.\\d+$']);
             }
             for (const c of body.cpu ?? []) {
                 const flavor = CPUS.find((x) => x.id === c.id);
@@ -264,7 +269,7 @@ export function fakeRunPod(o: {
                 ...(body.cmd ? { cmd: body.cmd } : {}), ...(body.entrypoint ? { entrypoint: body.entrypoint } : {}), disk: body.disk ?? 10, registry: body.registry ?? null,
                 requestUrls: body.type === 'LOAD_BALANCER' ? { base, health: `${base}/ping` }
                     : { run: `${q}/run`, runSync: `${q}/runsync`, status: `${q}/status`, stream: `${q}/stream`, cancel: `${q}/cancel`, retry: `${q}/retry`, purgeQueue: `${q}/purge-queue`, health: `${q}/health` },
-                gpu: body.gpu ? { pools: body.gpu.pools, ...(body.gpu.excludedTypes ? { excludedTypes: body.gpu.excludedTypes } : {}), count: body.gpu.count ?? 1, allowedCudaVersions: [], minCudaVersion: null } : null,
+                gpu: body.gpu ? { pools: body.gpu.pools, ...(body.gpu.excludedTypes ? { excludedTypes: body.gpu.excludedTypes } : {}), count: body.gpu.count ?? 1, allowedCudaVersions: [], minCudaVersion: body.gpu.minCudaVersion ?? null } : null,
                 ...(body.cpu ? { cpu: body.cpu.map((c: any) => ({ ...c, memory: CPUS.find((x) => x.id === c.id)!.ramGbPerVcpu * c.vcpuCount })) } : {}),
                 workers: { min: w.min ?? 0, max: w.max ?? 3, idleTimeout: w.idleTimeout ?? 10 }, scaling: sc,
                 dataCenterIds: body.dataCenterIds ?? [], networkVolumes: body.networkVolumes ?? [], timeout: body.timeout ?? 300000, flashboot: body.flashboot ?? 'OFF',
@@ -411,6 +416,7 @@ export function fakeRunPod(o: {
             if (body.disk === undefined && !body.templateId) return problem(400, 'You must either provide a template id or pod configuration parameters');
             const id = `pod_${state.nextId++}`;
             const pod: any = { id, name: body.name, status: 'PROVISIONING', image: body.image, env: body.env ?? {}, ports: body.ports ?? [], cmd: body.cmd,
+                ...(body.entrypoint ? { entrypoint: body.entrypoint } : {}), slot: state.slots++,
                 ...(body.mounts ? { mounts: body.mounts } : {}), registry: body.registry ?? null,
                 gpu: { id: g.id, count }, cloud, dataCenterId: dc.id, cudaVersion: dc.cuda,
                 // Billed at its cloud's rate, for each of its GPUs.
@@ -533,6 +539,16 @@ export function fakeRunPod(o: {
         calls,
         state,
         liveServers: () => [...state.pods.values()].filter((x) => x.status !== 'TERMINATED').length,
+        // A pod answers at its port 22's public mapping once it runs, and only where its start runs an SSH server: RunPod gives it none.
+        machine: (host: string, port?: number) => {
+            const pod = [...state.pods.values()].find((x) => {
+                const direct = x.status === 'RUNNING' ? view(x).ssh.direct : null;
+                return !!direct && direct.host === host && (port === undefined || direct.port === port);
+            });
+            const start = pod?.entrypoint?.[0] === 'sh' && pod.entrypoint[1] === '-c' ? pod.entrypoint[2] : undefined;
+            if (!pod || !startsSshd(start)) return undefined;
+            return { bootId: fakeBootId(pod.id, pod.boots ?? 1), files: {}, keys: scriptKeys(start, 'root') ?? [] };
+        },
     };
     return api;
 }

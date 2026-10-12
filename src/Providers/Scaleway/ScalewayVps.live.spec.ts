@@ -83,6 +83,7 @@ const SSH_RETRY = { maxRetries: 30, retryTimeout: 10_000 };
         // The labels MACHINE_TYPES maps onto are Marketplace's own.
         const labels = (await vps.api.listMarketplaceImages()).map((i) => i.label);
         for (const t of [MACHINE_TYPES.UBUNTU_24, MACHINE_TYPES.UBUNTU_22, MACHINE_TYPES.UBUNTU_20]) expect(labels).toContain(SCALEWAY_ENUMS.machines?.[t]);
+        for (const t of [MACHINE_TYPES.UBUNTU_24, MACHINE_TYPES.UBUNTU_22]) expect(labels).toContain(SCALEWAY_ENUMS.cudaMachines?.[t]);
     }, 5 * 60_000);
 
     it('addSSHKey registers a key once and returns that registration for the same key again; deleteSSHKey removes it', async () => {

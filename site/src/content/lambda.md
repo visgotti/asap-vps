@@ -4,7 +4,7 @@
 
 ## Rent a GPU
 
-Lambda takes **exactly one SSH key** at launch, and the instance's login is `ubuntu` (the library reports it as `server.ssh.username`, so you never hard-code it):
+Lambda's launch takes **exactly one SSH key**, so at least one must be named; the library gives it the first of `sshKeyIds` and adds any others at the first boot. The instance's login is `ubuntu` (reported as `server.ssh.username`, so you never hard-code it, and [`RemoteMachine`](#/ssh) logs in as it):
 
 ```ts run title="A GPU instance, restarted and deleted"
 import { LambdaCloud } from "asap-vps";
@@ -20,7 +20,7 @@ const server = await lambda.createServer({ name: "worker-1", offer: offers[0], s
 const running = await lambda.waitUntilRunning(server.id);
 console.log(running.status, running.ip, "log in as", running.ssh?.username);
 
-await lambda.restartServer(server.id);
+await lambda.restartServer(server.id); // returns once the instance reads as active
 console.log("cost so far:", (await lambda.getServerCost(server.id))?.usd);
 await lambda.deleteServerAndWait(server.id);
 await lambda.deleteSSHKey(key.id);
