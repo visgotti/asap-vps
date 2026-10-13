@@ -14,7 +14,7 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { MACHINE_TYPES } from '../../constants';
-import { ComputeProvider } from '../../Core/ComputeProvider';
+import { BaseProvider } from '../../Core/BaseProvider';
 import { Deadline, filterOffers, findSSHKey, pickSSHKeys, pollUntil, sshKeyFingerprint, timeLeft, waitOf } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, QuotaError, quotedMessage } from '../../errors';
 import type {
@@ -52,7 +52,7 @@ export const DIGITALOCEAN_CAPABILITIES = {
 
 type Caps = typeof DIGITALOCEAN_CAPABILITIES;
 
-export class DigitalOcean extends ComputeProvider<DigitalOceanTypes, DigitalOceanApi> implements ProviderCapabilities<DigitalOceanTypes, Caps> {
+export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanApi> implements ProviderCapabilities<DigitalOceanTypes, Caps> {
     static readonly capabilities: Caps = DIGITALOCEAN_CAPABILITIES;
     readonly id = DIGITALOCEAN_ID;
     readonly capabilities: Caps = DIGITALOCEAN_CAPABILITIES;

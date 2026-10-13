@@ -7,10 +7,9 @@ export { NodeSSH }
 // Capabilities: what a provider can do, as interfaces, and how to ask
 export * from './capabilities';
 
-// The base classes a provider extends
+// The base class a provider extends
 export { BaseProvider } from './Core/BaseProvider';
-export { ComputeProvider } from './Core/ComputeProvider';
-export type { EnumTranslations, ResolvedMount, ResolvedOffer } from './Core/ComputeProvider';
+export type { EnumTranslations, ResolvedMount, ResolvedOffer } from './Core/BaseProvider';
 
 // A machine behind SSH, whichever provider rented it
 export { RemoteMachine } from './Core/RemoteMachine';

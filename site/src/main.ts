@@ -88,8 +88,8 @@ async function renderHeritage(host: HTMLElement, id: string) {
         <div class="her-title">API client</div><p class="her-api">${api}. <code>${esc(h.class)}</code> holds one as <code>provider.api</code>: <code>provider.api.request('GET', '/path')</code> reaches any endpoint the capabilities do not cover.</p>
         <div class="her-title">Capability interfaces it implements</div>
         <div class="table-wrap"><table><thead><tr><th>Capability</th><th>Interface</th><th>Methods</th></tr></thead><tbody>${caps}</tbody></table></div>
-        <p class="her-legend"><code class="her-m">name</code> is written in <code>${esc(h.class)}</code>; <code class="her-m inh">name</code> is written once in <code>ComputeProvider</code> and shared by all providers.</p>
-        <div class="her-title">What the base classes give it</div>${inherited}
+        <p class="her-legend"><code class="her-m">name</code> is written in <code>${esc(h.class)}</code>; <code class="her-m inh">name</code> is written once in <code>BaseProvider</code> and shared by all providers.</p>
+        <div class="her-title">What the base class gives it</div>${inherited}
         <p class="her-legend">⟂ marks an abstract member: each provider must write it.</p>
     </div>`;
 }

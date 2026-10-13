@@ -115,7 +115,7 @@ await vast.deleteImage(image.id); // every tag of it
 
 ## Class hierarchy
 
-`VastAI` is a `ComputeProvider`, which is a `BaseProvider`. Below is what each gives it, generated from the source when the site is built: the chain of classes, the capability interfaces it implements, and which of their methods are written once for every provider and which this class writes itself.
+`VastAI` is a `BaseProvider`. Below is what that gives it, generated from the source when the site is built: the chain of classes, the capability interfaces it implements, and which of their methods are written once for every provider and which this class writes itself.
 
 ```heritage
 vast

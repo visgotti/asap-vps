@@ -1,4 +1,4 @@
-// The compute base class's own behaviour, on a scripted provider: waits
+// The base class's own behaviour, on a scripted provider: waits
 // through transient failures, verified deletes, the library's enums in a
 // platform's names, refusing what a provider cannot honor, what capabilities
 // say, and sending the key only to the provider's own API.
@@ -7,7 +7,7 @@ import { CapabilityDescriptor, requireCapability, supports } from '../capabiliti
 import { CUDA_TYPES, MACHINE_TYPES, REGION_TYPES } from '../constants';
 import { NotSupportedError, ProviderError, TransportError } from '../errors';
 import type { ContainerSpec, CreateServerOptions, ImageChoice, ImageSpec, Offer, Server, ServerStatus, Volume, VolumeMount, WaitOptions } from '../types';
-import { ComputeProvider, EnumTranslations } from './ComputeProvider';
+import { BaseProvider, EnumTranslations } from './BaseProvider';
 import { ApiClient, containerBootScript } from './utils';
 
 const SCRIPTED_CAPABILITIES = {
@@ -15,7 +15,7 @@ const SCRIPTED_CAPABILITIES = {
 } as const satisfies CapabilityDescriptor;
 
 /** A provider whose getServer answers from a script, for the base class's helpers. */
-class ScriptedProvider extends ComputeProvider {
+class ScriptedProvider extends BaseProvider {
     readonly id = 'scripted';
     readonly capabilities = SCRIPTED_CAPABILITIES;
     protected readonly enums: EnumTranslations = {
@@ -115,7 +115,7 @@ class ScriptedProvider extends ComputeProvider {
     }
 }
 
-describe('ComputeProvider', () => {
+describe('BaseProvider', () => {
     const fast = { intervalMs: 0, timeoutMs: 1000 };
 
     it('waits through transient failures until running with an address', async () => {
@@ -406,7 +406,7 @@ describe('ComputeProvider', () => {
         });
 
         it('a restart of a server whose status shows no reboot is over once it has read as running four times: the time a platform is given to show one', async () => {
-            expect(ComputeProvider.RESTART_SETTLE_READS).toBe(4);
+            expect(BaseProvider.RESTART_SETTLE_READS).toBe(4);
             const slept: number[] = [];
             const steady = new ScriptedProvider([{ status: 'running' }], async (ms) => { slept.push(ms); });
             await steady.restarted();
@@ -416,9 +416,9 @@ describe('ComputeProvider', () => {
         });
 
         it('the reboot is given thirty seconds to show at whatever pace the server is read: read every second that is thirty-one reads, not four (three seconds, before a reboot has begun)', async () => {
-            expect(ComputeProvider.RESTART_SETTLE_MS).toBe(30_000);
+            expect(BaseProvider.RESTART_SETTLE_MS).toBe(30_000);
             // The reads in a row as running that span thirty seconds, and four at least.
-            expect([10_000, 5000, 1000, 250, 7000, 30_000, 60_000, 0].map((intervalMs) => ComputeProvider.settleReads(intervalMs))).toEqual([4, 7, 31, 121, 6, 4, 4, 4]);
+            expect([10_000, 5000, 1000, 250, 7000, 30_000, 60_000, 0].map((intervalMs) => BaseProvider.settleReads(intervalMs))).toEqual([4, 7, 31, 121, 6, 4, 4, 4]);
             for (const [intervalMs, reads] of [[1000, 31], [5000, 7], [250, 121], [20_000, 4]] as const) {
                 const slept: number[] = [];
                 const steady = new ScriptedProvider([{ status: 'running' }], async (ms) => { slept.push(ms); });

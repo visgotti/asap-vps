@@ -151,7 +151,7 @@ A droplet is a VM, so `container` runs your image with Docker from cloud-init at
 
 ## Class hierarchy
 
-`DigitalOcean` is a `ComputeProvider`, which is a `BaseProvider`. Below is what each gives it, generated from the source when the site is built: the chain of classes, the capability interfaces it implements, and which of their methods are written once for every provider and which this class writes itself.
+`DigitalOcean` is a `BaseProvider`. Below is what that gives it, generated from the source when the site is built: the chain of classes, the capability interfaces it implements, and which of their methods are written once for every provider and which this class writes itself.
 
 ```heritage
 digitalocean

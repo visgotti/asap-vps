@@ -115,7 +115,7 @@ The registry login rides in the instance's user data, which the account and the 
 
 ## Class hierarchy
 
-`LambdaCloud` is a `ComputeProvider`, which is a `BaseProvider`. Below is what each gives it, generated from the source when the site is built: the chain of classes, the capability interfaces it implements, and which of their methods are written once for every provider and which this class writes itself.
+`LambdaCloud` is a `BaseProvider`. Below is what that gives it, generated from the source when the site is built: the chain of classes, the capability interfaces it implements, and which of their methods are written once for every provider and which this class writes itself.
 
 ```heritage
 lambda

@@ -732,8 +732,7 @@ The behaviors that shape the primitives. Each is a test in `src/Providers/<Platf
 src/types.ts                    the shared shapes: offers, servers, images, volumes, create options, SSH, PlatformTypes
 src/capabilities.ts             the capability interfaces, their traits, supports() / requireCapability()
 src/errors.ts, constants.ts     the typed errors; the enums (MACHINE_TYPES, CUDA_TYPES, COUNTRY_TYPES, REGION_TYPES, PLATFORM)
-src/Core/BaseProvider.ts        what every provider shares: id, capabilities, the platform's API client
-src/Core/ComputeProvider.ts     the compute capability's shared logic: waits, verified deletes, cost, offers, enum names
+src/Core/BaseProvider.ts        what every provider shares: id, capabilities, the platform's API client, and the compute capability's shared logic: waits, verified deletes, cost, offers, enum names
 src/Core/RemoteMachine.ts       a machine behind SSH, whichever provider rented it: commands, files, users
 src/Core/ServerProvisioner.ts   SetupPipeline over SSH on any provider; SetupPipeline.ts, steps/, SSHService.ts
 src/Core/utils/                 pure helpers: http (ApiClient), offers, gpus, cost, ssh (key formats), sshd (a container's SSH server, users), async, crypto
@@ -753,7 +752,7 @@ Specs sit next to the code they test.
 
 1. Make a folder `src/Providers/<Platform>/` with the files above.
 2. Name its records in a `<Platform>Types` bundle: its server, offer, image, volume and create requests, the options it refuses, and what a volume size and a mount take there.
-3. Extend `ComputeProvider<<Platform>Types, <Platform>Api>` and declare its capabilities as a `const` descriptor.
+3. Extend `BaseProvider<<Platform>Types, <Platform>Api>` and declare its capabilities as a `const` descriptor.
 4. `implements ProviderCapabilities<<Platform>Types, typeof CAPABILITIES>`: the compiler then asks for every method of every capability declared.
 5. Write a fake of its API in `src/testing/fakes`, and add it to `src/testing/subjects.ts` and `PROVIDERS`.
 
@@ -763,8 +762,6 @@ The contract suite (`src/Providers/contract.spec.ts`) and the lifecycle suite th
 
 1. Add an interface in `src/capabilities.ts`, its traits in `CapabilityTraits`, an entry in `CapabilityInterfaces`, and its methods in `CAPABILITY_METHODS`.
 2. Implement and declare it on the providers whose platforms have it.
-
-A provider with no servers at all extends `BaseProvider` instead of `ComputeProvider`.
 
 ## Documentation site
 

@@ -14,7 +14,7 @@
 // to a registry of yours (`snapshots`), whose tags are then the account's images.
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
-import { ComputeProvider, ResolvedMount } from '../../Core/ComputeProvider';
+import { BaseProvider, ResolvedMount } from '../../Core/BaseProvider';
 import {
     compareCudaVersions, countryCodes, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey,
     pickSSHKeys, RegistryClient, registryOf, timeLeft, waitOf,
@@ -50,7 +50,7 @@ export const VAST_CAPABILITIES = {
 
 type Caps = typeof VAST_CAPABILITIES;
 
-export class VastAI extends ComputeProvider<VastTypes, VastApi> implements ProviderCapabilities<VastTypes, Caps> {
+export class VastAI extends BaseProvider<VastTypes, VastApi> implements ProviderCapabilities<VastTypes, Caps> {
     static readonly capabilities: Caps = VAST_CAPABILITIES;
     readonly id = VAST_ID;
     readonly capabilities: Caps = VAST_CAPABILITIES;

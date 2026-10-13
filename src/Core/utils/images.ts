@@ -1,7 +1,7 @@
 // Images by the library's own names (MACHINE_TYPES, CUDA_TYPES): what an
 // `image` may be besides a platform's name for one, read as a spec, and the
 // registry reference it is wherever a container runs. A VM provider's own
-// names for the same spec are its EnumTranslations (ComputeProvider).
+// names for the same spec are its EnumTranslations (BaseProvider).
 
 import { CUDA_TYPES, MACHINE_TYPES } from '../../constants';
 import type { ImageChoice, ImageSpec } from '../../types';
