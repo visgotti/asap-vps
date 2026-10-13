@@ -837,24 +837,22 @@ Scaleway needs `SCW_SECRET_KEY` and `SCW_DEFAULT_PROJECT_ID`.
 
 #### From GitHub Actions
 
-Each provider has a workflow that runs its live suites from GitHub. They run by hand only, never on a push or a pull request: **Actions > Live: RunPod > Run workflow**, or
+The live suites also run from GitHub, one click each and nothing to fill in: **Actions**, the workflow, **Run workflow**. They are started by hand and by nothing else, never by a push or a pull request.
 
-```sh
-gh workflow run live-runpod.yml -f suite=ssh -f rent=true     # one suite, renting what it needs
-gh workflow run live-digitalocean.yml -f suite=vps            # the same suite, only its checks that rent nothing
-```
+| Workflow | What a click runs | What it rents |
+|---|---|---|
+| **Live: RunPod** | every RunPod suite | the cheapest GPU at or under $1/h, minutes each: well under a dollar |
+| **Live: Vast** | every Vast suite | the cheapest machines at or under $1/h: cents |
+| **Live: Lambda** | every Lambda suite | a GPU VM for each (Lambda rents nothing else), at or under $1.50/h: a dollar or two |
+| **Live: DigitalOcean** | every DigitalOcean suite but the GPU lifecycle | the smallest droplets: cents |
+| **Live: Scaleway** | every Scaleway suite but the GPU lifecycle | STARDUST1-S Instances: cents |
+| **Live: DigitalOcean GPU** | the lifecycle on a GPU droplet, images too | the cheapest GPU at or under $1/h for an hour or more: dollars |
+| **Live: Scaleway GPU** | the lifecycle on a GPU Instance | the cheapest GPU at or under $1/h: dollars (an account's GPU quota starts at 0) |
 
-| Workflow | `suite` |
-|---|---|
-| `live-digitalocean.yml` | `vps`, `cpu`, `lifecycle`, `container`, `image-import`, `shares`, `volumes`, `all` |
-| `live-scaleway.yml` | `vps`, `cpu`, `lifecycle`, `container`, `disks`, `images`, `serverless`, `shares`, `volumes`, `all` |
-| `live-lambda.yml` | `ssh`, `lifecycle`, `container`, `volumes`, `all` |
-| `live-runpod.yml` | `ssh`, `lifecycle`, `cpu`, `registry`, `serverless`, `volumes`, `all` |
-| `live-vast.yml` | `ssh`, `lifecycle`, `extras`, `images`, `registry`, `volumes`, `all` |
-
-- `rent` is off unless you turn it on: without it a suite runs only the checks that rent nothing (`ASAP_VPS_LIVE_FREE`). `max_price` is the price cap (default 1), and `images` (DigitalOcean, Scaleway) can leave the image phase out.
-- The runs of one provider queue behind each other, since a renting run first deletes what earlier runs left on the account. Start none while a run on that provider goes from a laptop.
-- A renting run ends by sweeping the provider's account for leftovers, whatever happened to it: a job that is cancelled takes the run's own teardown and its watchdog down with it.
+- Each suite is a job of its own, one after another, and one that fails does not stop the rest: the run shows which failed, and **Re-run failed jobs** runs those alone.
+- Where nothing is in stock under the price, or the account may not rent it, the suite rents nothing and fails saying so.
+- Runs on one provider's account wait for each other, since each suite first deletes what earlier runs left there. Start none while a run on that provider goes from a laptop.
+- Each job ends by sweeping the provider's account for leftovers, whatever happened to it: a job that is cancelled takes the run's own teardown and its watchdog down with it.
 - The keys are the repository's secrets, under the names `.env.template` has; `SCW_ZONES`, which is no key, is a variable (unset: every zone). From a filled `.env.test`:
 
   ```sh
@@ -863,7 +861,7 @@ gh workflow run live-digitalocean.yml -f suite=vps            # the same suite, 
   ```
 
 - The logs are public, as the repository is. GitHub masks the secrets in them and the suites print no key, but a run's log does show what it rented and where.
-- [live.yml](.github/workflows/live.yml) is the one job they all call, and [liveWorkflows.spec.ts](src/testing/liveWorkflows.spec.ts) holds them to the suites there are: a suite no option reaches fails `npm test`.
+- [live.yml](.github/workflows/live.yml) is the one job they all call, once for each suite, and [liveWorkflows.spec.ts](src/testing/liveWorkflows.spec.ts) holds them to the suites there are: a suite no workflow runs fails `npm test`.
 
 A lifecycle run ([src/testing/lifecycle.ts](src/testing/lifecycle.ts)) rents the cheapest single NVIDIA GPU in stock under the price cap and checks:
 

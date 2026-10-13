@@ -1,0 +1,38 @@
+# Scaleway's whole lifecycle on a GPU Instance: the cheapest single NVIDIA GPU in stock at or under $1 an
+# hour (dollars, where the other Scaleway suites are cents). An account's GPU quota starts at 0: until it is
+# lifted this rents nothing and fails with Scaleway's refusal.
+#
+# Started by hand and by nothing else, with nothing to fill in: Actions > "Live: Scaleway GPU" > Run workflow
+# (or `gh workflow run live-scaleway-gpu.yml`). Each suite is a job of its own, one after another, so the run
+# shows which of them failed, and "Re-run failed jobs" runs those alone:
+#   Scaleway.live                  the whole lifecycle on a GPU Instance
+# Runs on one provider's account wait for each other: each suite first deletes what earlier runs left there.
+# What runs a suite, its keys and its clean-up: live.yml.
+name: 'Live: Scaleway GPU'
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-scaleway
+  cancel-in-progress: false
+
+jobs:
+  suite:
+    name: ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite:
+          - Scaleway
+    uses: ./.github/workflows/live.yml
+    secrets: inherit
+    with:
+      provider: scaleway
+      targets: scaleway,scaleway-cpu,scaleway-vps
+      pattern: src/Providers/Scaleway/${{ matrix.suite }}.live.spec
+      timeout_minutes: 300

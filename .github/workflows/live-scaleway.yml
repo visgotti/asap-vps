@@ -1,64 +1,51 @@
-# Scaleway against its real API, by hand only: Actions > "Live: Scaleway" > Run workflow,
-# or `gh workflow run live-scaleway.yml -f suite=vps -f rent=true`. One suite at a time, or all of them:
-#   vps           ScalewayVps.live: as a VPS host: one STARDUST1-S Instance
-#   cpu           ScalewayCpu.live: the whole lifecycle on a STARDUST1-S Instance (cents)
-#   lifecycle     Scaleway.live: the whole lifecycle on a GPU Instance
-#   container     ScalewayContainer.live: a container run on an Instance
-#   disks         ScalewayDisks.live: an Instance's own disks
-#   images        ScalewayImages.live: images
-#   serverless    ScalewayServerless.live: serverless containers
-#   shares        ScalewayShares.live: shared volumes
-#   volumes       ScalewayVolumes.live: Block Storage volumes
-#   all           every one of them, one after another
-# `rent` is off unless ticked: without it a suite runs only its checks that rent nothing.
-# What runs it, its keys and its guards: live.yml.
+# Scaleway against its real API: every suite that rents no GPU, on STARDUST1-S Instances, for cents.
+# The lifecycle on a GPU Instance is its own workflow (live-scaleway-gpu.yml).
+#
+# Started by hand and by nothing else, with nothing to fill in: Actions > "Live: Scaleway" > Run workflow
+# (or `gh workflow run live-scaleway.yml`). Each suite is a job of its own, one after another, so the run
+# shows which of them failed, and "Re-run failed jobs" runs those alone:
+#   ScalewayVps.live               as a VPS host: one STARDUST1-S Instance
+#   ScalewayCpu.live               the whole lifecycle on a STARDUST1-S Instance
+#   ScalewayContainer.live         a container run on an Instance
+#   ScalewayDisks.live             an Instance's own disks
+#   ScalewayImages.live            images
+#   ScalewayServerless.live        serverless containers
+#   ScalewayShares.live            shared volumes
+#   ScalewayVolumes.live           Block Storage volumes
+# Runs on one provider's account wait for each other: each suite first deletes what earlier runs left there.
+# What runs a suite, its keys and its clean-up: live.yml.
 name: 'Live: Scaleway'
 
 on:
   workflow_dispatch:
-    inputs:
-      suite:
-        description: Which suite
-        required: true
-        type: choice
-        default: vps
-        options:
-          - all
-          - vps
-          - cpu
-          - lifecycle
-          - container
-          - disks
-          - images
-          - serverless
-          - shares
-          - volumes
-      rent:
-        description: Rent real machines (billed). Off, only the checks that rent nothing run.
-        type: boolean
-        default: false
-      max_price:
-        description: The most a rented GPU may cost, USD per hour
-        type: string
-        default: '1'
-      images:
-        description: Run the image phase too (tens of minutes)
-        type: boolean
-        default: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: live-scaleway
+  cancel-in-progress: false
+
 jobs:
   suite:
-    name: ${{ inputs.suite }}
+    name: ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite:
+          - ScalewayVps
+          - ScalewayCpu
+          - ScalewayContainer
+          - ScalewayDisks
+          - ScalewayImages
+          - ScalewayServerless
+          - ScalewayShares
+          - ScalewayVolumes
     uses: ./.github/workflows/live.yml
     secrets: inherit
     with:
       provider: scaleway
       targets: scaleway,scaleway-cpu,scaleway-vps
-      pattern: ${{ fromJSON('{"all":"src/Providers/Scaleway/","vps":"src/Providers/Scaleway/ScalewayVps.live.spec","cpu":"src/Providers/Scaleway/ScalewayCpu.live.spec","lifecycle":"src/Providers/Scaleway/Scaleway.live.spec","container":"src/Providers/Scaleway/ScalewayContainer.live.spec","disks":"src/Providers/Scaleway/ScalewayDisks.live.spec","images":"src/Providers/Scaleway/ScalewayImages.live.spec","serverless":"src/Providers/Scaleway/ScalewayServerless.live.spec","shares":"src/Providers/Scaleway/ScalewayShares.live.spec","volumes":"src/Providers/Scaleway/ScalewayVolumes.live.spec"}')[inputs.suite] }}
-      rent: ${{ inputs.rent }}
-      max_price: ${{ inputs.max_price }}
-      images: ${{ inputs.images }}
+      pattern: src/Providers/Scaleway/${{ matrix.suite }}.live.spec
       timeout_minutes: 300

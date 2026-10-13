@@ -1,53 +1,47 @@
-# Vast.ai against its real API, by hand only: Actions > "Live: Vast" > Run workflow,
-# or `gh workflow run live-vast.yml -f suite=ssh -f rent=true`. One suite at a time, or all of them:
-#   ssh           VastSsh.live: logging in over SSH, and a user of its own
-#   lifecycle     VastAI.live: the whole lifecycle on a GPU instance
-#   extras        VastExtras.live: userData and diskGb
-#   images        VastImages.live: snapshots as images
-#   registry      VastRegistry.live: a private image
-#   volumes       VastVolumes.live: volumes
-#   all           every one of them, one after another
-# `rent` is off unless ticked: without it a suite runs only its checks that rent nothing.
-# What runs it, its keys and its guards: live.yml.
+# Vast.ai against its real API: every suite, on the cheapest machines in stock at or under $1 an hour
+# (cents for them all).
+#
+# Started by hand and by nothing else, with nothing to fill in: Actions > "Live: Vast" > Run workflow
+# (or `gh workflow run live-vast.yml`). Each suite is a job of its own, one after another, so the run
+# shows which of them failed, and "Re-run failed jobs" runs those alone:
+#   VastSsh.live                   logging in over SSH, and a user of its own
+#   VastAI.live                    the whole lifecycle on a GPU instance
+#   VastExtras.live                userData and diskGb
+#   VastImages.live                snapshots as images
+#   VastRegistry.live              a private image
+#   VastVolumes.live               volumes
+# Runs on one provider's account wait for each other: each suite first deletes what earlier runs left there.
+# What runs a suite, its keys and its clean-up: live.yml.
 name: 'Live: Vast'
 
 on:
   workflow_dispatch:
-    inputs:
-      suite:
-        description: Which suite
-        required: true
-        type: choice
-        default: ssh
-        options:
-          - all
-          - ssh
-          - lifecycle
-          - extras
-          - images
-          - registry
-          - volumes
-      rent:
-        description: Rent real machines (billed). Off, only the checks that rent nothing run.
-        type: boolean
-        default: false
-      max_price:
-        description: The most a rented GPU may cost, USD per hour
-        type: string
-        default: '1'
 
 permissions:
   contents: read
 
+concurrency:
+  group: live-vast
+  cancel-in-progress: false
+
 jobs:
   suite:
-    name: ${{ inputs.suite }}
+    name: ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite:
+          - VastSsh
+          - VastAI
+          - VastExtras
+          - VastImages
+          - VastRegistry
+          - VastVolumes
     uses: ./.github/workflows/live.yml
     secrets: inherit
     with:
       provider: vast
       targets: vast
-      pattern: ${{ fromJSON('{"all":"src/Providers/VastAI/","ssh":"src/Providers/VastAI/VastSsh.live.spec","lifecycle":"src/Providers/VastAI/VastAI.live.spec","extras":"src/Providers/VastAI/VastExtras.live.spec","images":"src/Providers/VastAI/VastImages.live.spec","registry":"src/Providers/VastAI/VastRegistry.live.spec","volumes":"src/Providers/VastAI/VastVolumes.live.spec"}')[inputs.suite] }}
-      rent: ${{ inputs.rent }}
-      max_price: ${{ inputs.max_price }}
+      pattern: src/Providers/VastAI/${{ matrix.suite }}.live.spec
       timeout_minutes: 180
