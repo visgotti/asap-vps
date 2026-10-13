@@ -42,8 +42,8 @@ for (const p of PAGES.filter((x) => !only.length || only.includes(x.slug))) {
     // An editor that mounted with nothing in it is a broken page, not a pass.
     const empty = await page.$$eval('.snippet.live', (els) => els.map((el, i) => (el.querySelectorAll('.view-line').length ? -1 : i)).filter((i) => i >= 0));
     if (empty.length) fail(p.slug, `${empty.length} editor(s) are empty (blocks ${empty.map((i) => i + 1).join(', ')})`);
-    const heritage = await page.$$eval('[data-heritage]', (els) => els.map((el) => el.querySelectorAll('.her-node').length));
-    heritage.forEach((n) => { if (n < 3) fail(p.slug, `the class hierarchy shows ${n} class(es), expected the provider, ComputeProvider and BaseProvider`); });
+    const heritage = await page.$$eval('[data-heritage]', (els) => els.map((el) => [...el.querySelectorAll('.her-node .her-name')].map((n) => n.textContent.split('<')[0])));
+    heritage.forEach((chain) => { if (chain.length !== 2 || chain[1] !== 'BaseProvider') fail(p.slug, `the class hierarchy shows ${chain.join(' > ') || 'no class'}, expected the provider and BaseProvider`); });
     let ran = 0;
     for (const [i, s] of info.entries()) {
         if (s.kind === 'error' && !s.errors.length) fail(p.slug, `block ${i + 1} should show a type error and shows none`);

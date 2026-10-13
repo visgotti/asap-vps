@@ -7,7 +7,7 @@
 // dates, sizes, error text). Pure functions of the raw records, typed by
 // ScalewayTypes; the API client (api.ts) builds on them, never the other way.
 
-import type { EnumTranslations } from '../../Core/ComputeProvider';
+import type { EnumTranslations } from '../../Core/BaseProvider';
 import { errorText, gpuName, gpuVendor, located, sshKeyFingerprint } from '../../Core/utils';
 import { MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import type {

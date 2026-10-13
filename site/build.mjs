@@ -5,7 +5,7 @@
 //   sandbox.worker.js         the library and its fakes, where snippets run
 //   types.json                the library's declarations, for the editors
 //   capabilities.json         what each provider declares, read from the code, for the overview table
-//   heritage.json             each provider's base classes, interfaces and where each method comes from, read from the source, for the provider pages
+//   heritage.json             each provider's base class, interfaces and where each method comes from, read from the source, for the provider pages
 //
 //   node build.mjs              build once        node build.mjs --serve     rebuild on change and serve on http://localhost:8765
 

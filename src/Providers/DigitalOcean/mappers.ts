@@ -4,7 +4,7 @@
 // and the library's region and OS enums by DigitalOcean's names. Pure functions
 // of the raw records, typed by DigitalOceanTypes.
 
-import type { EnumTranslations } from '../../Core/ComputeProvider';
+import type { EnumTranslations } from '../../Core/BaseProvider';
 import { canonicalGpu, gpuName, located, sshKeyFingerprint } from '../../Core/utils';
 import { MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import type { Billing, ImageStatus, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerImage, ServerStatus, Volume, VolumeStatus } from '../../types';

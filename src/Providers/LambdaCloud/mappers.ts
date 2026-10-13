@@ -3,7 +3,7 @@
 // status words and its billing. Pure functions of the raw records, typed by LambdaTypes.
 
 import { MACHINE_TYPES } from '../../constants';
-import type { EnumTranslations } from '../../Core/ComputeProvider';
+import type { EnumTranslations } from '../../Core/BaseProvider';
 import { canonicalGpu, gpuName, placed, sshKeyFingerprint } from '../../Core/utils';
 import type { Billing, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerStatus, Volume } from '../../types';
 import type { LambdaFilesystem, LambdaInstance, LambdaInstanceStatus, LambdaInstanceTypes, LambdaSSHKeyData } from './types';

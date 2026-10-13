@@ -21,7 +21,7 @@
 // the ones it was created with from `mounts` out of its deletion and its images.
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
-import { ComputeProvider, ResolvedMount } from '../../Core/ComputeProvider';
+import { BaseProvider, ResolvedMount } from '../../Core/BaseProvider';
 import { randomBytes } from 'crypto';
 import { filterOffers, findSSHKey, isKind, pickSSHKeys, restartWatch, S3Client, stageDownload, timeLeft, urlSource, waitOf } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError, quotedMessage } from '../../errors';
@@ -68,7 +68,7 @@ type Caps = typeof SCALEWAY_CAPABILITIES;
 /** An image's creation time, for ordering: one with no date is oldest. */
 const createdAt = (i: ScalewayImage) => epochMs(i.creation_date) ?? 0;
 
-export class Scaleway extends ComputeProvider<ScalewayTypes, ScalewayApi> implements ProviderCapabilities<ScalewayTypes, Caps> {
+export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implements ProviderCapabilities<ScalewayTypes, Caps> {
     static readonly capabilities: Caps = SCALEWAY_CAPABILITIES;
     readonly id = SCALEWAY_ID;
     readonly capabilities: Caps = SCALEWAY_CAPABILITIES;

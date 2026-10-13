@@ -8,7 +8,7 @@
 // and one launch per 12 s.
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
-import { ComputeProvider } from '../../Core/ComputeProvider';
+import { BaseProvider } from '../../Core/BaseProvider';
 import { authorizeKeysScript, filterOffers, findSSHKey, isKind, pickSSHKeys, timeLeft, waitOf } from '../../Core/utils';
 import { falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
 import type { CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerListOptions, Volume, WaitOptions } from '../../types';
@@ -27,7 +27,7 @@ export const LAMBDA_CAPABILITIES = {
 
 type Caps = typeof LAMBDA_CAPABILITIES;
 
-export class LambdaCloud extends ComputeProvider<LambdaTypes, LambdaApi> implements ProviderCapabilities<LambdaTypes, Caps> {
+export class LambdaCloud extends BaseProvider<LambdaTypes, LambdaApi> implements ProviderCapabilities<LambdaTypes, Caps> {
     static readonly capabilities: Caps = LAMBDA_CAPABILITIES;
     readonly id = LAMBDA_ID;
     readonly capabilities: Caps = LAMBDA_CAPABILITIES;

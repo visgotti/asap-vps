@@ -89,7 +89,7 @@ export interface IRestart {
      * `o.timeoutMs` (wait options as IPower's). It is back once it was seen
      * not to run and runs again; one whose status never shows the reboot is
      * taken to be back after reading as running a few times in a row
-     * (ComputeProvider.RESTART_SETTLE_READS: thirty seconds at the default
+     * (BaseProvider.RESTART_SETTLE_READS: thirty seconds at the default
      * pace), which is how long a platform is given to show it. A status can
      * lag a reboot by longer than that: where it matters that the machine has
      * really booted again, ask the machine (its boot id over SSH, a mark in
@@ -379,7 +379,7 @@ type UnionToIntersection<U> = (U extends unknown ? (x: U) => void : never) exten
  * `implements`, so that declaring a capability without its methods does not compile.
  *
  *     const CAPABILITIES = { compute: {...}, power: {...} } as const satisfies CapabilityDescriptor;
- *     class Acme extends ComputeProvider<AcmeTypes> implements ProviderCapabilities<AcmeTypes, typeof CAPABILITIES> { ... }
+ *     class Acme extends BaseProvider<AcmeTypes> implements ProviderCapabilities<AcmeTypes, typeof CAPABILITIES> { ... }
  */
 export type ProviderCapabilities<T extends PlatformTypes, D extends CapabilityDescriptor> =
     UnionToIntersection<{ [K in keyof D & CapabilityName]: CapabilityInterfaces<T>[K] }[keyof D & CapabilityName]>;

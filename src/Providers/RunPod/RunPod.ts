@@ -10,7 +10,7 @@
 // pulled with a registry login RunPod stores (`/v2/registries`).
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
-import { ComputeProvider } from '../../Core/ComputeProvider';
+import { BaseProvider } from '../../Core/BaseProvider';
 import { asksForGpu, cudaVersion, filterOffers, findSSHKey, isKind, parsePort, parseSSHPublicKey, pickSSHKeys, registryAuthName, registryOf, waitOf } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, TransportError } from '../../errors';
 import type {
@@ -44,7 +44,7 @@ export const RUNPOD_CAPABILITIES = {
 
 type Caps = typeof RUNPOD_CAPABILITIES;
 
-export class RunPod extends ComputeProvider<RunPodTypes, RunPodApi> implements ProviderCapabilities<RunPodTypes, Caps> {
+export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements ProviderCapabilities<RunPodTypes, Caps> {
     static readonly capabilities: Caps = RUNPOD_CAPABILITIES;
     readonly id = RUNPOD_ID;
     readonly capabilities: Caps = RUNPOD_CAPABILITIES;

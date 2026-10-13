@@ -4,7 +4,7 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { supports } from '../capabilities';
-import { ComputeProvider } from '../Core/ComputeProvider';
+import { BaseProvider } from '../Core/BaseProvider';
 import { LambdaCloud } from './LambdaCloud/LambdaCloud';
 import { createProvider, isProviderId, PROVIDERS, providerInfo, providerParams, providersFromEnv, providersWith } from './registry';
 import type { ProviderParamsOf } from './registry';
@@ -15,7 +15,7 @@ describe('provider registry', () => {
         expect(Object.keys(PROVIDERS).sort()).toEqual(['digitalocean', 'lambda', 'runpod', 'scaleway', 'vast']);
         for (const [id, info] of Object.entries(PROVIDERS)) {
             const p = createProvider(id, `${id}-key`);
-            expect(p).toBeInstanceOf(ComputeProvider);
+            expect(p).toBeInstanceOf(BaseProvider);
             expect([p.id, info.id, p.apiKey]).toEqual([id, id, `${id}-key`]);
             // What it can do is known without building one, and is what the class says.
             expect(info.capabilities).toBe(p.capabilities);

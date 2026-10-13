@@ -1,6 +1,6 @@
 // What each provider class inherits, read from the library's source with the TypeScript compiler (so the page cannot drift from the code):
 // its chain of base classes (with their type arguments), the interfaces each class implements, the API client's own chain, and for every
-// capability the provider declares: the interface and which class supplies each of its methods (the provider itself, or ComputeProvider).
+// capability the provider declares: the interface and which class supplies each of its methods (the provider itself, or BaseProvider).
 
 import { createRequire } from 'node:module';
 import path from 'node:path';
