@@ -1,0 +1,53 @@
+# RunPod against its real API, by hand only: Actions > "Live: RunPod" > Run workflow,
+# or `gh workflow run live-runpod.yml -f suite=ssh -f rent=true`. One suite at a time, or all of them:
+#   ssh           RunPodSsh.live: logging in over SSH, and a user of its own
+#   lifecycle     RunPod.live: the whole lifecycle on a GPU pod
+#   cpu           RunPodCpu.live: a CPU pod
+#   registry      RunPodRegistry.live: a private image
+#   serverless    RunPodServerless.live: serverless endpoints
+#   volumes       RunPodVolumes.live: network volumes
+#   all           every one of them, one after another
+# `rent` is off unless ticked: without it a suite runs only its checks that rent nothing.
+# What runs it, its keys and its guards: live.yml.
+name: 'Live: RunPod'
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Which suite
+        required: true
+        type: choice
+        default: ssh
+        options:
+          - all
+          - ssh
+          - lifecycle
+          - cpu
+          - registry
+          - serverless
+          - volumes
+      rent:
+        description: Rent real machines (billed). Off, only the checks that rent nothing run.
+        type: boolean
+        default: false
+      max_price:
+        description: The most a rented GPU may cost, USD per hour
+        type: string
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: ${{ inputs.suite }}
+    uses: ./.github/workflows/live.yml
+    secrets: inherit
+    with:
+      provider: runpod
+      targets: runpod
+      pattern: ${{ fromJSON('{"all":"src/Providers/RunPod/","ssh":"src/Providers/RunPod/RunPodSsh.live.spec","lifecycle":"src/Providers/RunPod/RunPod.live.spec","cpu":"src/Providers/RunPod/RunPodCpu.live.spec","registry":"src/Providers/RunPod/RunPodRegistry.live.spec","serverless":"src/Providers/RunPod/RunPodServerless.live.spec","volumes":"src/Providers/RunPod/RunPodVolumes.live.spec"}')[inputs.suite] }}
+      rent: ${{ inputs.rent }}
+      max_price: ${{ inputs.max_price }}
+      timeout_minutes: 180

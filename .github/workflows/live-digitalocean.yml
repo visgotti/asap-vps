@@ -1,0 +1,60 @@
+# DigitalOcean (the account is a production one) against its real API, by hand only: Actions > "Live: DigitalOcean" > Run workflow,
+# or `gh workflow run live-digitalocean.yml -f suite=vps -f rent=true`. One suite at a time, or all of them:
+#   vps           DigitalOceanVps.live: as a VPS host: one s-1vcpu-1gb droplet
+#   cpu           DigitalOceanCpu.live: the whole lifecycle on the cheapest droplet (cents)
+#   lifecycle     DigitalOcean.live: the whole lifecycle on a GPU droplet
+#   container     DigitalOceanContainer.live: a container run on a droplet
+#   image-import  DigitalOceanImageImport.live: an image imported from a URL
+#   shares        DigitalOceanShares.live: shared volumes
+#   volumes       DigitalOceanVolumes.live: block volumes
+#   all           every one of them, one after another
+# `rent` is off unless ticked: without it a suite runs only its checks that rent nothing.
+# What runs it, its keys and its guards: live.yml.
+name: 'Live: DigitalOcean'
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Which suite
+        required: true
+        type: choice
+        default: vps
+        options:
+          - all
+          - vps
+          - cpu
+          - lifecycle
+          - container
+          - image-import
+          - shares
+          - volumes
+      rent:
+        description: Rent real machines (billed). Off, only the checks that rent nothing run.
+        type: boolean
+        default: false
+      max_price:
+        description: The most a rented GPU may cost, USD per hour
+        type: string
+        default: '1'
+      images:
+        description: Run the image phase too (tens of minutes)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: ${{ inputs.suite }}
+    uses: ./.github/workflows/live.yml
+    secrets: inherit
+    with:
+      provider: digitalocean
+      targets: digitalocean,digitalocean-cpu,digitalocean-vps
+      pattern: ${{ fromJSON('{"all":"src/Providers/DigitalOcean/","vps":"src/Providers/DigitalOcean/DigitalOceanVps.live.spec","cpu":"src/Providers/DigitalOcean/DigitalOceanCpu.live.spec","lifecycle":"src/Providers/DigitalOcean/DigitalOcean.live.spec","container":"src/Providers/DigitalOcean/DigitalOceanContainer.live.spec","image-import":"src/Providers/DigitalOcean/DigitalOceanImageImport.live.spec","shares":"src/Providers/DigitalOcean/DigitalOceanShares.live.spec","volumes":"src/Providers/DigitalOcean/DigitalOceanVolumes.live.spec"}')[inputs.suite] }}
+      rent: ${{ inputs.rent }}
+      max_price: ${{ inputs.max_price }}
+      images: ${{ inputs.images }}
+      timeout_minutes: 300
