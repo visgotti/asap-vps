@@ -835,6 +835,36 @@ npm run test:scw:volumes                                    # Scaleway volumes: 
 
 Scaleway needs `SCW_SECRET_KEY` and `SCW_DEFAULT_PROJECT_ID`.
 
+#### From GitHub Actions
+
+Each provider has a workflow that runs its live suites from GitHub. They run by hand only, never on a push or a pull request: **Actions > Live: RunPod > Run workflow**, or
+
+```sh
+gh workflow run live-runpod.yml -f suite=ssh -f rent=true     # one suite, renting what it needs
+gh workflow run live-digitalocean.yml -f suite=vps            # the same suite, only its checks that rent nothing
+```
+
+| Workflow | `suite` |
+|---|---|
+| `live-digitalocean.yml` | `vps`, `cpu`, `lifecycle`, `container`, `image-import`, `shares`, `volumes`, `all` |
+| `live-scaleway.yml` | `vps`, `cpu`, `lifecycle`, `container`, `disks`, `images`, `serverless`, `shares`, `volumes`, `all` |
+| `live-lambda.yml` | `ssh`, `lifecycle`, `container`, `volumes`, `all` |
+| `live-runpod.yml` | `ssh`, `lifecycle`, `cpu`, `registry`, `serverless`, `volumes`, `all` |
+| `live-vast.yml` | `ssh`, `lifecycle`, `extras`, `images`, `registry`, `volumes`, `all` |
+
+- `rent` is off unless you turn it on: without it a suite runs only the checks that rent nothing (`ASAP_VPS_LIVE_FREE`). `max_price` is the price cap (default 1), and `images` (DigitalOcean, Scaleway) can leave the image phase out.
+- The runs of one provider queue behind each other, since a renting run first deletes what earlier runs left on the account. Start none while a run on that provider goes from a laptop.
+- A renting run ends by sweeping the provider's account for leftovers, whatever happened to it: a job that is cancelled takes the run's own teardown and its watchdog down with it.
+- The keys are the repository's secrets, under the names `.env.template` has; `SCW_ZONES`, which is no key, is a variable (unset: every zone). From a filled `.env.test`:
+
+  ```sh
+  gh secret set -f <(grep -v '^SCW_ZONES=' .env.test)
+  gh variable set SCW_ZONES --body fr-par-1,fr-par-2            # only to narrow the zones
+  ```
+
+- The logs are public, as the repository is. GitHub masks the secrets in them and the suites print no key, but a run's log does show what it rented and where.
+- [live.yml](.github/workflows/live.yml) is the one job they all call, and [liveWorkflows.spec.ts](src/testing/liveWorkflows.spec.ts) holds them to the suites there are: a suite no option reaches fails `npm test`.
+
 A lifecycle run ([src/testing/lifecycle.ts](src/testing/lifecycle.ts)) rents the cheapest single NVIDIA GPU in stock under the price cap and checks:
 
 - create, get, list and both waits, and the cost: a run begins no earlier than the create, none bills while stopped, and a new one starts after a start

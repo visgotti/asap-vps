@@ -1,0 +1,49 @@
+# Lambda Cloud against its real API, by hand only: Actions > "Live: Lambda" > Run workflow,
+# or `gh workflow run live-lambda.yml -f suite=ssh -f rent=true`. One suite at a time, or all of them:
+#   ssh           LambdaSsh.live: logging in over SSH, and a user of its own
+#   lifecycle     LambdaCloud.live: the whole lifecycle on a GPU VM
+#   container     LambdaContainer.live: a container run on a VM
+#   volumes       LambdaVolumes.live: filesystems
+#   all           every one of them, one after another
+# `rent` is off unless ticked: without it a suite runs only its checks that rent nothing.
+# What runs it, its keys and its guards: live.yml.
+name: 'Live: Lambda'
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Which suite
+        required: true
+        type: choice
+        default: ssh
+        options:
+          - all
+          - ssh
+          - lifecycle
+          - container
+          - volumes
+      rent:
+        description: Rent real machines (billed). Off, only the checks that rent nothing run.
+        type: boolean
+        default: false
+      max_price:
+        description: The most a rented GPU may cost, USD per hour
+        type: string
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: ${{ inputs.suite }}
+    uses: ./.github/workflows/live.yml
+    secrets: inherit
+    with:
+      provider: lambda
+      targets: lambda
+      pattern: ${{ fromJSON('{"all":"src/Providers/LambdaCloud/","ssh":"src/Providers/LambdaCloud/LambdaSsh.live.spec","lifecycle":"src/Providers/LambdaCloud/LambdaCloud.live.spec","container":"src/Providers/LambdaCloud/LambdaContainer.live.spec","volumes":"src/Providers/LambdaCloud/LambdaVolumes.live.spec"}')[inputs.suite] }}
+      rent: ${{ inputs.rent }}
+      max_price: ${{ inputs.max_price }}
+      timeout_minutes: 180
