@@ -1,21 +1,20 @@
-# The live suites (*.live.spec.ts): every method of a provider against its real
-# API, with the account's keys from this repository's secrets. They rent real
-# servers, so nothing here runs on a push or a pull request: only when one of
-# the per-provider workflows (live-<provider>.yml) is run by hand, which calls
-# this one with the suite to run.
+# One live suite (a *.live.spec.ts): a provider against its real API, with the
+# account's keys from this repository's secrets. A live suite rents real
+# servers, so nothing here runs on a push or a pull request: this is only ever
+# called by the workflows that are started by hand (live-<provider>.yml), once
+# for each suite they run.
 #
-# Two guards on what a run may cost. `rent` is off unless ticked: without it
-# only the checks that rent nothing run (ASAP_VPS_LIVE_FREE). And the runs of
-# one provider queue behind each other: every renting run first deletes what
-# earlier runs left on that account (asap-vps-smoke-*), which would end one
-# still going. For the same reason, start none while a run on that provider
-# goes anywhere else (a laptop).
+# It ends by deleting whatever the provider's test runs have left on the
+# account (asap-vps-smoke-*), whatever happened to the suite: a run deletes
+# what it made and a watchdog does it for a run that dies, but a job that is
+# cancelled or times out takes both down with it.
 #
 # The keys: `gh secret set` for DIGITAL_OCEAN_API_KEY, LAMBDA_API_KEY,
 # RUNPOD_API_KEY, VAST_API_KEY, SCW_SECRET_KEY, SCW_ACCESS_KEY and
-# SCW_DEFAULT_PROJECT_ID; `gh variable set` for SCW_ZONES. Every suite is given
-# all of them: some need a second account (a private registry is made in
-# Scaleway's for the registry, container and Vast image suites).
+# SCW_DEFAULT_PROJECT_ID; `gh variable set` for SCW_ZONES (unset: every zone).
+# Every suite is given all of them: some need a second account (a private
+# registry is made in Scaleway's for the registry, container and Vast image
+# suites).
 #
 # Like ci.yml, the job runs on GitHub's runners or on the self-hosted ones the
 # variable CI_RUNS_ON names. The logs are public, as the repository is: GitHub
@@ -37,18 +36,10 @@ on:
         description: The path pattern of the suite's file (jest's)
         required: true
         type: string
-      rent:
-        description: Rent real machines (billed)
-        required: true
-        type: boolean
       max_price:
         description: The most a rented GPU may cost, USD per hour
         type: string
         default: '1'
-      images:
-        description: Run the image phase (DigitalOcean, Scaleway)
-        type: boolean
-        default: true
       timeout_minutes:
         type: number
         default: 180
@@ -58,13 +49,9 @@ permissions:
 
 jobs:
   live:
-    name: ${{ inputs.provider }}${{ !inputs.rent && ' (what rents nothing)' || '' }}
+    name: ${{ inputs.provider }}
     runs-on: ${{ vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-latest' }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    # One run at a time on a provider's account, and one waiting: a second is not started over the first, nor is the first cancelled for it.
-    concurrency:
-      group: live-${{ inputs.provider }}
-      cancel-in-progress: false
     env:
       DIGITAL_OCEAN_API_KEY: ${{ secrets.DIGITAL_OCEAN_API_KEY }}
       LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
@@ -75,9 +62,7 @@ jobs:
       SCW_DEFAULT_PROJECT_ID: ${{ secrets.SCW_DEFAULT_PROJECT_ID }}
       SCW_ZONES: ${{ vars.SCW_ZONES }}
       ASAP_VPS_LIVE: ${{ inputs.targets }}
-      ASAP_VPS_LIVE_FREE: ${{ inputs.rent && '0' || '1' }}
       ASAP_VPS_LIVE_MAX_PRICE: ${{ inputs.max_price }}
-      ASAP_VPS_LIVE_IMAGES: ${{ inputs.images && '1' || '0' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -89,10 +74,8 @@ jobs:
         env:
           PATTERN: ${{ inputs.pattern }}
         run: npx jest --config jest.live.config.js "$PATTERN"
-      # A run ends by deleting what it made, and a watchdog does it for a run that dies. A job that is cancelled or times out takes
-      # both down with it, so what is left of this provider's runs is deleted here whatever happened above (and a leftover fails the job).
       - name: Delete what a run that was cut short left behind
-        if: ${{ always() && inputs.rent }}
+        if: ${{ always() }}
         env:
           PROVIDER: ${{ inputs.provider }}
         run: npm run -s gpu:smoke -- "$PROVIDER" --sweep

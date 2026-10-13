@@ -1,53 +1,47 @@
-# RunPod against its real API, by hand only: Actions > "Live: RunPod" > Run workflow,
-# or `gh workflow run live-runpod.yml -f suite=ssh -f rent=true`. One suite at a time, or all of them:
-#   ssh           RunPodSsh.live: logging in over SSH, and a user of its own
-#   lifecycle     RunPod.live: the whole lifecycle on a GPU pod
-#   cpu           RunPodCpu.live: a CPU pod
-#   registry      RunPodRegistry.live: a private image
-#   serverless    RunPodServerless.live: serverless endpoints
-#   volumes       RunPodVolumes.live: network volumes
-#   all           every one of them, one after another
-# `rent` is off unless ticked: without it a suite runs only its checks that rent nothing.
-# What runs it, its keys and its guards: live.yml.
+# RunPod against its real API: every suite, on the cheapest GPU in stock at or under $1 an hour
+# (minutes each: well under a dollar for them all).
+#
+# Started by hand and by nothing else, with nothing to fill in: Actions > "Live: RunPod" > Run workflow
+# (or `gh workflow run live-runpod.yml`). Each suite is a job of its own, one after another, so the run
+# shows which of them failed, and "Re-run failed jobs" runs those alone:
+#   RunPodSsh.live                 logging in over SSH, and a user of its own
+#   RunPod.live                    the whole lifecycle on a GPU pod
+#   RunPodCpu.live                 a CPU pod
+#   RunPodRegistry.live            a private image
+#   RunPodServerless.live          serverless endpoints
+#   RunPodVolumes.live             network volumes
+# Runs on one provider's account wait for each other: each suite first deletes what earlier runs left there.
+# What runs a suite, its keys and its clean-up: live.yml.
 name: 'Live: RunPod'
 
 on:
   workflow_dispatch:
-    inputs:
-      suite:
-        description: Which suite
-        required: true
-        type: choice
-        default: ssh
-        options:
-          - all
-          - ssh
-          - lifecycle
-          - cpu
-          - registry
-          - serverless
-          - volumes
-      rent:
-        description: Rent real machines (billed). Off, only the checks that rent nothing run.
-        type: boolean
-        default: false
-      max_price:
-        description: The most a rented GPU may cost, USD per hour
-        type: string
-        default: '1'
 
 permissions:
   contents: read
 
+concurrency:
+  group: live-runpod
+  cancel-in-progress: false
+
 jobs:
   suite:
-    name: ${{ inputs.suite }}
+    name: ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite:
+          - RunPodSsh
+          - RunPod
+          - RunPodCpu
+          - RunPodRegistry
+          - RunPodServerless
+          - RunPodVolumes
     uses: ./.github/workflows/live.yml
     secrets: inherit
     with:
       provider: runpod
       targets: runpod
-      pattern: ${{ fromJSON('{"all":"src/Providers/RunPod/","ssh":"src/Providers/RunPod/RunPodSsh.live.spec","lifecycle":"src/Providers/RunPod/RunPod.live.spec","cpu":"src/Providers/RunPod/RunPodCpu.live.spec","registry":"src/Providers/RunPod/RunPodRegistry.live.spec","serverless":"src/Providers/RunPod/RunPodServerless.live.spec","volumes":"src/Providers/RunPod/RunPodVolumes.live.spec"}')[inputs.suite] }}
-      rent: ${{ inputs.rent }}
-      max_price: ${{ inputs.max_price }}
+      pattern: src/Providers/RunPod/${{ matrix.suite }}.live.spec
       timeout_minutes: 180

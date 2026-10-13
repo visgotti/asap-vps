@@ -1,49 +1,44 @@
-# Lambda Cloud against its real API, by hand only: Actions > "Live: Lambda" > Run workflow,
-# or `gh workflow run live-lambda.yml -f suite=ssh -f rent=true`. One suite at a time, or all of them:
-#   ssh           LambdaSsh.live: logging in over SSH, and a user of its own
-#   lifecycle     LambdaCloud.live: the whole lifecycle on a GPU VM
-#   container     LambdaContainer.live: a container run on a VM
-#   volumes       LambdaVolumes.live: filesystems
-#   all           every one of them, one after another
-# `rent` is off unless ticked: without it a suite runs only its checks that rent nothing.
-# What runs it, its keys and its guards: live.yml.
+# Lambda Cloud against its real API: every suite. Lambda rents GPU VMs only, so each of them rents one:
+# the cheapest in stock at or under $1.50 an hour (its cheapest has been $1.29), a dollar or two for them all.
+#
+# Started by hand and by nothing else, with nothing to fill in: Actions > "Live: Lambda" > Run workflow
+# (or `gh workflow run live-lambda.yml`). Each suite is a job of its own, one after another, so the run
+# shows which of them failed, and "Re-run failed jobs" runs those alone:
+#   LambdaSsh.live                 logging in over SSH, and a user of its own
+#   LambdaCloud.live               the whole lifecycle on a GPU VM
+#   LambdaContainer.live           a container run on a VM
+#   LambdaVolumes.live             filesystems
+# Runs on one provider's account wait for each other: each suite first deletes what earlier runs left there.
+# What runs a suite, its keys and its clean-up: live.yml.
 name: 'Live: Lambda'
 
 on:
   workflow_dispatch:
-    inputs:
-      suite:
-        description: Which suite
-        required: true
-        type: choice
-        default: ssh
-        options:
-          - all
-          - ssh
-          - lifecycle
-          - container
-          - volumes
-      rent:
-        description: Rent real machines (billed). Off, only the checks that rent nothing run.
-        type: boolean
-        default: false
-      max_price:
-        description: The most a rented GPU may cost, USD per hour
-        type: string
-        default: '1'
 
 permissions:
   contents: read
 
+concurrency:
+  group: live-lambda
+  cancel-in-progress: false
+
 jobs:
   suite:
-    name: ${{ inputs.suite }}
+    name: ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite:
+          - LambdaSsh
+          - LambdaCloud
+          - LambdaContainer
+          - LambdaVolumes
     uses: ./.github/workflows/live.yml
     secrets: inherit
     with:
       provider: lambda
       targets: lambda
-      pattern: ${{ fromJSON('{"all":"src/Providers/LambdaCloud/","ssh":"src/Providers/LambdaCloud/LambdaSsh.live.spec","lifecycle":"src/Providers/LambdaCloud/LambdaCloud.live.spec","container":"src/Providers/LambdaCloud/LambdaContainer.live.spec","volumes":"src/Providers/LambdaCloud/LambdaVolumes.live.spec"}')[inputs.suite] }}
-      rent: ${{ inputs.rent }}
-      max_price: ${{ inputs.max_price }}
+      pattern: src/Providers/LambdaCloud/${{ matrix.suite }}.live.spec
+      max_price: '1.5'
       timeout_minutes: 180

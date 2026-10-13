@@ -1,0 +1,38 @@
+# DigitalOcean's whole lifecycle on a GPU droplet, images too: the cheapest single NVIDIA GPU in stock at or
+# under $1 an hour, for an hour or more (dollars, where the other DigitalOcean suites are cents). With none in
+# stock under that price it rents nothing and fails saying so.
+#
+# Started by hand and by nothing else, with nothing to fill in: Actions > "Live: DigitalOcean GPU" > Run workflow
+# (or `gh workflow run live-digitalocean-gpu.yml`). Each suite is a job of its own, one after another, so the run
+# shows which of them failed, and "Re-run failed jobs" runs those alone:
+#   DigitalOcean.live              the whole lifecycle on a GPU droplet
+# Runs on one provider's account wait for each other: each suite first deletes what earlier runs left there.
+# What runs a suite, its keys and its clean-up: live.yml.
+name: 'Live: DigitalOcean GPU'
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-digitalocean
+  cancel-in-progress: false
+
+jobs:
+  suite:
+    name: ${{ matrix.suite }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        suite:
+          - DigitalOcean
+    uses: ./.github/workflows/live.yml
+    secrets: inherit
+    with:
+      provider: digitalocean
+      targets: digitalocean,digitalocean-cpu,digitalocean-vps
+      pattern: src/Providers/DigitalOcean/${{ matrix.suite }}.live.spec
+      timeout_minutes: 300
