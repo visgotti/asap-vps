@@ -1,0 +1,11 @@
+// The declarations: what `npm run build` ships beside the JavaScript, and what the docs site's editors read
+// (site/scripts/build-types.mjs). They keep the doc comments, which editors show on hover; the JavaScript is
+// built by tsconfig.build.json, without them.
+{
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "removeComments": false
+  }
+}

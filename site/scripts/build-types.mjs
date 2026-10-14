@@ -1,8 +1,9 @@
 // The library's type declarations, as the editors on the site see them.
 //
-// tsc emits the declarations of src/ (what `npm run build` ships in dist/), then a TypeScript program over the entry finds every .d.ts
-// it reaches: the library's own and the third-party ones (Node's, node-ssh's, ssh2's). They go into .cache/types.json under the paths a
-// real install would have (`/node_modules/asap-vps/...`, `/node_modules/@types/node/...`), so module resolution in the editor is the one in your project.
+// tsc emits the declarations of src/ as `npm run build` ships them in dist/ (tsconfig.types.json: with their doc comments, which the
+// editors show on hover), then a TypeScript program over the entry finds every .d.ts it reaches: the library's own and the third-party
+// ones (Node's, node-ssh's, ssh2's). They go into .cache/types.json under the paths a real install would have (`/node_modules/asap-vps/...`,
+// `/node_modules/@types/node/...`), so module resolution in the editor is the one in your project.
 
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -17,7 +18,7 @@ export const TYPES_JSON = path.join(SITE, '.cache/types.json');
 
 export function buildTypes({ quiet = false } = {}) {
     fs.rmSync(DTS, { recursive: true, force: true });
-    const tsc = spawnSync(process.execPath, [require.resolve('typescript/bin/tsc'), '-p', 'tsconfig.build.json', '--emitDeclarationOnly', '--declaration', '--outDir', DTS, '--incremental', 'false', '--sourceMap', 'false'], {
+    const tsc = spawnSync(process.execPath, [require.resolve('typescript/bin/tsc'), '-p', 'tsconfig.types.json', '--outDir', DTS, '--incremental', 'false', '--sourceMap', 'false'], {
         cwd: ROOT, encoding: 'utf8',
     });
     if (tsc.status !== 0) throw new Error(`tsc could not emit the declarations:\n${tsc.stdout}${tsc.stderr}`);
