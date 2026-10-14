@@ -5,10 +5,11 @@
 // of the raw records, typed by DigitalOceanTypes.
 
 import type { EnumTranslations } from '../../Core/BaseProvider';
-import { canonicalGpu, gpuName, located, sshKeyFingerprint } from '../../Core/utils';
-import { MACHINE_TYPES, REGION_TYPES } from '../../constants';
+import { canonicalGpu, gpuName, located, regionTable, sshKeyFingerprint } from '../../Core/utils';
+import { COUNTRY_TYPES, MACHINE_TYPES } from '../../constants';
+import { DIGITALOCEAN_DATACENTERS } from './places';
 import type { Billing, ImageStatus, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerImage, ServerStatus, Volume, VolumeStatus } from '../../types';
-import type { DigitalOceanDropletData, DigitalOceanDropletStatus, DigitalOceanGpuInfo, DigitalOceanImageData, DigitalOceanNetworkData, DigitalOceanNfsShare, DigitalOceanSizeData, DigitalOceanSSHData, DigitalOceanVolumeData } from './types';
+import type { DigitalOceanDropletData, DigitalOceanDropletStatus, DigitalOceanRegionName, DigitalOceanGpuInfo, DigitalOceanImageData, DigitalOceanNetworkData, DigitalOceanNfsShare, DigitalOceanSizeData, DigitalOceanSSHData, DigitalOceanVolumeData } from './types';
 
 export const DIGITALOCEAN_ID = 'digitalocean';
 
@@ -30,41 +31,26 @@ export const DIGITALOCEAN_BILLING: Billing = Object.freeze({ incrementSeconds: 1
 
 /**
  * The library's enums by DigitalOcean's names: its regions and its Ubuntu
- * images (its GPU image of an Ubuntu depends on the size: DigitalOcean.cudaImages). A region is its first datacenter that takes new resources: San
- * Francisco is sfo3, as sfo1 is a legacy datacenter DigitalOcean has closed
- * to them (docs.digitalocean.com/platform/regional-availability); it is still
- * there by its own name, SAN_FRANCISCO_1.
+ * images (its GPU image of an Ubuntu depends on the size: DigitalOcean.cudaImages).
+ * The regions are its datacenters' (DIGITALOCEAN_DATACENTERS): each open one by
+ * its own region, and a city by its first open datacenter (New York: nyc1, San
+ * Francisco: sfo2, Amsterdam: ams3). The legacy ams2 and sfo1 have none.
  */
-export const DIGITALOCEAN_ENUMS: EnumTranslations = Object.freeze({
-    regions: {
-        [REGION_TYPES.TORONTO]: 'tor1',
-        [REGION_TYPES.NYC]: 'nyc1',
-        [REGION_TYPES.NYC_1]: 'nyc1',
-        [REGION_TYPES.NYC_2]: 'nyc2',
-        [REGION_TYPES.NYC_3]: 'nyc3',
-        [REGION_TYPES.SAN_FRANCISCO]: 'sfo3',
-        [REGION_TYPES.SAN_FRANCISCO_1]: 'sfo1',
-        [REGION_TYPES.SAN_FRANCISCO_2]: 'sfo2',
-        [REGION_TYPES.SAN_FRANCISCO_3]: 'sfo3',
-        // ams2 is closed to new resources, as sfo1 is: Amsterdam is ams3.
-        [REGION_TYPES.AMSTERDAM]: 'ams3',
-        [REGION_TYPES.AMSTERDAM_3]: 'ams3',
-    },
+export const DIGITALOCEAN_ENUMS = Object.freeze({
+    regions: regionTable(DIGITALOCEAN_DATACENTERS, (d) => d.slug),
     machines: {
         [MACHINE_TYPES.UBUNTU_24]: 'ubuntu-24-04-x64',
         [MACHINE_TYPES.UBUNTU_22]: 'ubuntu-22-04-x64',
         [MACHINE_TYPES.UBUNTU_20]: 'ubuntu-20-04-x64',
     },
-});
+} as const satisfies EnumTranslations);
 
-/** The country each of DigitalOcean's datacenters is in, by the letters its slug begins with (GET /v2/regions, 2026-10-12). */
-const DATACENTER_COUNTRIES: Readonly<Record<string, string>> = Object.freeze({
-    nyc: 'US', sfo: 'US', atl: 'US', ric: 'US', mkc: 'US', mem: 'US', tor: 'CA', lon: 'GB', ams: 'NL', fra: 'DE', sgp: 'SG', blr: 'IN', syd: 'AU',
-});
+/** Each datacenter's country, by its slug, and by its city's letters (the slug's): a datacenter the list does not have yet is in its city's country. */
+const DATACENTER_COUNTRIES = new Map<string, COUNTRY_TYPES>(DIGITALOCEAN_DATACENTERS.flatMap((d) => [[d.slug, d.country], [d.slug.replace(/\d+$/, ''), d.country]]));
 
-/** The country a region is in ('tor1': 'CA'); undefined for a datacenter this does not know. */
-export function countryOf(region: string | undefined): string | undefined {
-    return DATACENTER_COUNTRIES[/^[a-z]+/.exec(region ?? '')?.[0] ?? ''];
+/** The country a region is in ('tor1': 'CA', and 'tor2' were there one); undefined for a city this does not know. */
+export function countryOf(region: string | undefined): COUNTRY_TYPES | undefined {
+    return DATACENTER_COUNTRIES.get(region ?? '') ?? DATACENTER_COUNTRIES.get(/^[a-z]+/.exec(region ?? '')?.[0] ?? '');
 }
 
 /** A GPU model as DigitalOcean writes it ('nvidia_rtx_4000_ada_generation'), by its canonical name. */
@@ -82,13 +68,13 @@ function gpuOf(info: DigitalOceanGpuInfo, slug: string | undefined): string {
 }
 
 /** A size: its GPUs where it has `gpu_info`, else a machine without GPUs. */
-export function toOffer(s: DigitalOceanSizeData): Offer<DigitalOceanSizeData> {
+export function toOffer(s: DigitalOceanSizeData): Offer<DigitalOceanSizeData, DigitalOceanRegionName> {
     const base = {
         provider: DIGITALOCEAN_ID,
         id: s.slug,
         pricePerHour: Number(s.price_hourly),
         billing: DIGITALOCEAN_BILLING,
-        ...located(s.available ? s.regions ?? [] : [], countryOf),
+        ...located((s.available ? s.regions ?? [] : []) as DigitalOceanRegionName[], countryOf),
         vcpus: s.vcpus,
         memoryGb: s.memory / 1024,
         diskGb: s.disk,
@@ -109,7 +95,7 @@ export function toOffer(s: DigitalOceanSizeData): Offer<DigitalOceanSizeData> {
     };
 }
 
-export function toServer(d: DigitalOceanDropletData): Server<DigitalOceanDropletData> {
+export function toServer(d: DigitalOceanDropletData): Server<DigitalOceanDropletData, DigitalOceanRegionName> {
     const ip = (list: DigitalOceanNetworkData[] | undefined, type: string) => list?.find((n) => n.type === type)?.ip_address;
     const info = d.gpu_info ?? d.size?.gpu_info;
     const publicIp = ip(d.networks?.v4, 'public');
@@ -122,7 +108,7 @@ export function toServer(d: DigitalOceanDropletData): Server<DigitalOceanDroplet
         offerId: d.size_slug ?? d.size?.slug,
         gpu: info ? gpuOf(info, d.size_slug ?? d.size?.slug) || undefined : undefined,
         gpuCount: info?.count,
-        region: d.region?.slug,
+        region: d.region?.slug as DigitalOceanRegionName | undefined,
         ...(countryOf(d.region?.slug) ? { country: countryOf(d.region?.slug) } : {}),
         ip: publicIp,
         ipv6: ip(d.networks?.v6, 'public'),
@@ -198,13 +184,13 @@ export function volumeMountScript(volumes: ReadonlyArray<Pick<DigitalOceanVolume
  * each droplet created with it (volumeMountPath, volumeMountScript); one that
  * was not is a bare disk.
  */
-export function toVolume(v: DigitalOceanVolumeData): Volume<DigitalOceanVolumeData> {
+export function toVolume(v: DigitalOceanVolumeData): Volume<DigitalOceanVolumeData, DigitalOceanRegionName> {
     const droplets = (v.droplet_ids ?? []).map(String);
     return {
         provider: DIGITALOCEAN_ID,
         id: v.id,
         name: v.name,
-        region: v.region?.slug,
+        region: v.region?.slug as DigitalOceanRegionName,
         sizeGb: v.size_gigabytes,
         status: droplets.length ? 'attached' : 'available',
         providerStatus: droplets.length ? 'attached' : 'detached',
@@ -216,7 +202,7 @@ export function toVolume(v: DigitalOceanVolumeData): Volume<DigitalOceanVolumeDa
     };
 }
 
-export function toImage(i: DigitalOceanImageData): ServerImage<DigitalOceanImageData> {
+export function toImage(i: DigitalOceanImageData): ServerImage<DigitalOceanImageData, DigitalOceanRegionName> {
     // A droplet's snapshot list carries no status: a listed snapshot is ready.
     const word = i.status ?? 'available';
     const status: ImageStatus = word === 'available' ? 'available'
@@ -228,7 +214,7 @@ export function toImage(i: DigitalOceanImageData): ServerImage<DigitalOceanImage
         name: i.name,
         status,
         providerStatus: word,
-        regions: [...(i.regions ?? [])],
+        regions: [...(i.regions ?? [])] as DigitalOceanRegionName[],
         // The spec has it nullable: no size known is no size, never null.
         sizeGb: i.size_gigabytes ?? undefined,
         createdAt: Date.parse(i.created_at) || undefined,
@@ -272,12 +258,12 @@ export function nfsMounts(tags: readonly string[] | undefined): Array<{ volumeId
 export const NFS_STATUS: Readonly<Record<string, VolumeStatus>> = Object.freeze({ CREATING: 'pending', ACTIVE: 'available', INACTIVE: 'unknown', FAILED: 'error', DELETED: 'deleting' });
 
 /** A Network File Storage share as a volume: shared, mounted by the library at the mount's path (default /mnt/<name>). DigitalOcean does not say which droplets mount it. */
-export function toNfsVolume(s: DigitalOceanNfsShare): Volume<DigitalOceanNfsShare> {
+export function toNfsVolume(s: DigitalOceanNfsShare): Volume<DigitalOceanNfsShare, DigitalOceanRegionName> {
     return {
         provider: DIGITALOCEAN_ID,
         id: s.id,
         name: s.name,
-        region: s.region,
+        region: s.region as DigitalOceanRegionName,
         shared: true,
         sizeGb: s.size_gib,
         status: NFS_STATUS[s.status] ?? 'unknown',

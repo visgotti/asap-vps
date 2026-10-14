@@ -13,8 +13,8 @@ import { NotFoundError } from '../errors';
 import { SCALEWAY_ENDPOINTS } from '../Providers/Scaleway/endpoints';
 import { regionOfZone, TMP_BUCKET_PREFIX } from '../Providers/Scaleway/mappers';
 import { Scaleway } from '../Providers/Scaleway/Scaleway';
-import type { ScalewayImage, ScalewayRegion, ScalewayServer, ScalewayTypes, ScalewayZone } from '../Providers/Scaleway/types';
-import type { CreateServerOptions, ImportImageOptions, Server, ServerImage, ServerListOptions, WaitOptions } from '../types';
+import type { ScalewayImage, ScalewayRegion, ScalewayRegionName, ScalewayServer, ScalewayTypes, ScalewayZone } from '../Providers/Scaleway/types';
+import type { CreateServerOptions, ImportImageOptions, RegionChoice, Server, ServerImage, ServerListOptions, WaitOptions } from '../types';
 import { RUN_PREFIX } from './live';
 
 /** When this run began (this module loaded), less a margin for the clocks: a temporary bucket made since is the run's. */
@@ -25,14 +25,14 @@ const volumes = new Set<string>();
 /** `zone/snapshot id/volume type` of every snapshot an image of this run held. */
 const snapshots = new Set<string>();
 
-function rememberServer(s: Server<ScalewayServer> | null | undefined): void {
+function rememberServer(s: Server<ScalewayServer, ScalewayRegionName> | null | undefined): void {
     if (!s || !s.name.startsWith(RUN_PREFIX)) return;
     for (const v of Object.values(s.raw.volumes)) {
         if (v.volume_type === 'sbs_volume') volumes.add(`${s.region}/${v.id}`);
     }
 }
 
-function rememberImage(i: ServerImage<ScalewayImage> | null | undefined): void {
+function rememberImage(i: ServerImage<ScalewayImage, ScalewayRegionName> | null | undefined): void {
     if (!i || !i.name.startsWith(RUN_PREFIX)) return;
     const image = i.raw;
     for (const v of [image.root_volume, ...Object.values(image.extra_volumes)]) {
@@ -42,50 +42,50 @@ function rememberImage(i: ServerImage<ScalewayImage> | null | undefined): void {
 
 /** Scaleway, noting the volumes of the run's servers and the snapshots of its images as it reads them. */
 export class AuditedScaleway extends Scaleway {
-    async createServer(o: CreateServerOptions<ScalewayTypes>): Promise<Server<ScalewayServer>> {
+    async createServer(o: CreateServerOptions<ScalewayTypes>): Promise<Server<ScalewayServer, ScalewayRegionName>> {
         const s = await super.createServer(o);
         rememberServer(s);
         return s;
     }
 
-    async getServer(id: string): Promise<Server<ScalewayServer> | null> {
+    async getServer(id: string): Promise<Server<ScalewayServer, ScalewayRegionName> | null> {
         const s = await super.getServer(id);
         rememberServer(s);
         return s;
     }
 
-    async listServers(o?: ServerListOptions): Promise<Server<ScalewayServer>[]> {
+    async listServers(o?: ServerListOptions): Promise<Server<ScalewayServer, ScalewayRegionName>[]> {
         const all = await super.listServers(o);
         all.forEach(rememberServer);
         return all;
     }
 
-    async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<ScalewayImage>> {
+    async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<ScalewayImage, ScalewayRegionName>> {
         const image = await super.createImage(serverId, o);
         rememberImage(image);
         return image;
     }
 
-    async getImage(id: string): Promise<ServerImage<ScalewayImage> | null> {
+    async getImage(id: string): Promise<ServerImage<ScalewayImage, ScalewayRegionName> | null> {
         const image = await super.getImage(id);
         rememberImage(image);
         return image;
     }
 
-    async listImages(): Promise<ServerImage<ScalewayImage>[]> {
+    async listImages(): Promise<ServerImage<ScalewayImage, ScalewayRegionName>[]> {
         const all = await super.listImages();
         all.forEach(rememberImage);
         return all;
     }
 
-    async importImage(o: ImportImageOptions<ScalewayTypes>): Promise<ServerImage<ScalewayImage>> {
+    async importImage(o: ImportImageOptions<ScalewayTypes>): Promise<ServerImage<ScalewayImage, ScalewayRegionName>> {
         const image = await super.importImage(o);
         rememberImage(image);
         return image;
     }
 
     /** Notes its copies (named as it is) too. */
-    async copyImage(id: string, regions: string[], o?: WaitOptions): Promise<ServerImage<ScalewayImage>> {
+    async copyImage(id: string, regions: Array<RegionChoice<ScalewayTypes>>, o?: WaitOptions): Promise<ServerImage<ScalewayImage, ScalewayRegionName>> {
         const image = await super.copyImage(id, regions, o);
         rememberImage(image);
         (await super.listImages()).filter((i) => i.name === image.name).forEach(rememberImage);

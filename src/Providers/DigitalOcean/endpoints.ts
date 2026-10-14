@@ -15,6 +15,8 @@ const DOCS = 'https://docs.digitalocean.com/reference/api/reference';
 export const DIGITALOCEAN_ENDPOINTS = {
     // ── Droplets ──
     listSizes: { operationId: 'sizes_list', method: 'GET', path: '/v2/sizes', query: ['per_page', 'page'], docs: `${DOCS}/sizes/#sizes_list` },
+    /** Every datacenter, open to new resources or not: what DIGITALOCEAN_DATACENTERS is held to (npm run places:check). */
+    listRegions: { operationId: 'regions_list', method: 'GET', path: '/v2/regions', query: ['per_page', 'page'], docs: `${DOCS}/regions/#regions_list` },
     /** The droplet limit, for the live suites' preflight. */
     getAccount: { operationId: 'account_get', method: 'GET', path: '/v2/account', docs: `${DOCS}/account/#account_get` },
     createDroplet: { operationId: 'droplets_create', method: 'POST', path: '/v2/droplets', docs: `${DOCS}/droplets/#droplets_create` },

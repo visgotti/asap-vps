@@ -14,12 +14,23 @@ const offerOf = (it: LambdaInstanceType, regions?: string[]) =>
     toOffer({ instance_type: it, regions_with_capacity_available: regions?.map((name) => ({ name, description: name })) } as LambdaInstanceTypes[string]);
 
 describe('the library\'s enums by Lambda\'s names', () => {
-    it('each Ubuntu it has is its image family, and with cuda its Lambda Stack family; no regions', () => {
-        expect(LAMBDA_ENUMS).toEqual({
+    it('each Ubuntu it has is its image family, and with cuda its Lambda Stack family', () => {
+        expect(LAMBDA_ENUMS).toMatchObject({
             machines: { ubuntu24: 'ubuntu-24-04', ubuntu22: 'ubuntu-22-04' },
             cudaMachines: { ubuntu24: 'lambda-stack-24-04', ubuntu22: 'lambda-stack-22-04' },
         });
+        expect(Object.keys(LAMBDA_ENUMS).sort()).toEqual(['cudaMachines', 'machines', 'regions']);
         expect(Object.isFrozen(LAMBDA_ENUMS)).toBe(true);
+    });
+
+    it('a region is its own; a city, state or country its first region there, by Lambda\'s numbering (Washington DC: us-east-2, not us-east-3)', () => {
+        expect(LAMBDA_ENUMS.regions).toMatchObject({
+            us_virginia: 'us-east-1', us_virginia_1: 'us-east-1', us_washington_dc: 'us-east-2', us_washington_dc_2: 'us-east-2', us_washington_dc_3: 'us-east-3',
+            us_texas_1: 'us-south-1', us_north_texas_2: 'us-south-2', us_central_texas_3: 'us-south-3', japan_osaka_1: 'asia-northeast-1', japan_tokyo: 'asia-northeast-2',
+            india: 'asia-south-1', germany_1: 'europe-central-1', israel: 'me-west-1', australia_sydney_1: 'australia-east-1',
+        });
+        // 18 regions in 17 places (Washington DC has two).
+        expect(Object.keys(LAMBDA_ENUMS.regions)).toHaveLength(18 + 17);
     });
 });
 

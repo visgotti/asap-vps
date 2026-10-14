@@ -112,8 +112,8 @@ export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
 
     async provision(
         options: ProvisionOptions<T>,
-        configurePipeline: (pipeline: SetupPipeline, server: Server<T['server']>) => void | Promise<void>,
-    ): Promise<ProvisionResult<Server<T['server']>>> {
+        configurePipeline: (pipeline: SetupPipeline, server: Server<T['server'], T['regionName']>) => void | Promise<void>,
+    ): Promise<ProvisionResult<Server<T['server'], T['regionName']>>> {
         const p = this.provider;
         const {
             sshKeyName = `provision-${Date.now()}`,
@@ -127,7 +127,7 @@ export class ServerProvisioner<T extends PlatformTypes = PlatformTypes> {
 
         const sshKeyData = await SSHService.createKeys();
         const key = await p.addSSHKey(sshKeyData.publicKey, sshKeyName);
-        let server: Server<T['server']> | undefined;
+        let server: Server<T['server'], T['regionName']> | undefined;
         let ssh: NodeSSH | undefined;
         // The key goes, unless a server it logs in to is left for the caller (made, or kept), where cleanupProviderKey says.
         let keepKey = false;

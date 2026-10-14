@@ -15,11 +15,11 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { MACHINE_TYPES } from '../../constants';
 import { BaseProvider } from '../../Core/BaseProvider';
-import { Deadline, filterOffers, findSSHKey, pickSSHKeys, pollUntil, sshKeyFingerprint, timeLeft, waitOf } from '../../Core/utils';
+import { computeKind, Deadline, filterOffers, findSSHKey, pickSSHKeys, pollUntil, readOfferQuery, sshKeyFingerprint, timeLeft, waitOf } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, QuotaError, quotedMessage } from '../../errors';
 import type {
-    CreateServerOptions, CreateVolumeOptions, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerImage, ServerListOptions, Volume,
-    WaitOptions,
+    CreateServerOptions, CreateVolumeOptions, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, RegionChoice, Server, ServerImage, ServerListOptions,
+    Volume, WaitOptions,
 } from '../../types';
 import { DigitalOceanApi, sshKeyRef } from './api';
 import {
@@ -27,8 +27,8 @@ import {
     volumeMountScript,
 } from './mappers';
 import type {
-    DigitalOceanAction, DigitalOceanCreateNfsParams, DigitalOceanDropletData, DigitalOceanImageData, DigitalOceanNfsShare, DigitalOceanSizeData, DigitalOceanTypes,
-    DigitalOceanVolumeData, DigitalOceanVpc,
+    DigitalOceanAction, DigitalOceanCreateNfsParams, DigitalOceanDropletData, DigitalOceanImageData, DigitalOceanNfsShare, DigitalOceanRegionName, DigitalOceanSizeData,
+    DigitalOceanTypes, DigitalOceanVolumeData, DigitalOceanVpc,
 } from './types';
 
 /** What DigitalOcean can do, and how: every capability asap-vps has. */
@@ -100,7 +100,8 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
     }
 
     /** Every size, with its GPUs where it has them (`kind: 'gpu'` for those only, `'cpu'` for plain droplets). */
-    public async listOffers(query: OfferQuery = {}): Promise<Offer<DigitalOceanSizeData>[]> {
+    public async listOffers(query: OfferQuery = {}): Promise<Offer<DigitalOceanSizeData, DigitalOceanRegionName>[]> {
+        if (readOfferQuery(query).matchesNone) return [];
         return filterOffers((await this.api.all<DigitalOceanSizeData>('/v2/sizes', 'sizes')).map(toOffer), query);
     }
 
@@ -116,7 +117,7 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
      * droplet's region that no droplet holds now (each read first: one elsewhere
      * or attached is refused); each is mounted at its mountPath.
      */
-    public async createServer(o: CreateServerOptions<DigitalOceanTypes>): Promise<Server<DigitalOceanDropletData>> {
+    public async createServer(o: CreateServerOptions<DigitalOceanTypes>): Promise<Server<DigitalOceanDropletData, DigitalOceanRegionName>> {
         this.rejectOptions(o, DIGITALOCEAN_REFUSED);
         const { id: size, offer, region } = this.resolveOffer(o);
         this.checkFixedGpuCount(o, offer ? offer.gpuCount : DigitalOcean.gpuCountOf(size) ?? (size.startsWith('gpu-') ? undefined : 0));
@@ -167,7 +168,7 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
         }
     }
 
-    public async getServer(id: string): Promise<Server<DigitalOceanDropletData> | null> {
+    public async getServer(id: string): Promise<Server<DigitalOceanDropletData, DigitalOceanRegionName> | null> {
         const droplet = await this.api.getDroplet(id);
         return droplet ? toServer(droplet) : null;
     }
@@ -177,8 +178,8 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
      * DigitalOcean lists GPU droplets only with `?type=gpus` (its plain list
      * is the others), so `kind` decides which lists are read.
      */
-    public async listServers(options: ServerListOptions = {}): Promise<Server<DigitalOceanDropletData>[]> {
-        const kind = options.kind ?? 'any';
+    public async listServers(options: ServerListOptions = {}): Promise<Server<DigitalOceanDropletData, DigitalOceanRegionName>[]> {
+        const kind = computeKind(options.kind);
         const gpus = kind === 'cpu' ? [] : await this.api.all<DigitalOceanDropletData>('/v2/droplets?type=gpus', 'droplets');
         const plain = kind === 'gpu' ? [] : await this.api.all<DigitalOceanDropletData>('/v2/droplets', 'droplets');
         const seen = new Set<number>();
@@ -319,12 +320,12 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
     // ── images ───────────────────────────────────────────────────────────
 
     /** Every private image of the account: snapshots, backups and custom images alike. */
-    public async listImages(): Promise<ServerImage<DigitalOceanImageData>[]> {
+    public async listImages(): Promise<ServerImage<DigitalOceanImageData, DigitalOceanRegionName>[]> {
         return (await this.api.all<DigitalOceanImageData>('/v2/images?private=true', 'images')).filter((i) => i.status !== 'deleted').map(toImage);
     }
 
     /** A deleted image (DigitalOcean still answers for a custom one, as 'deleted') is null: it is gone. */
-    public async getImage(id: string): Promise<ServerImage<DigitalOceanImageData> | null> {
+    public async getImage(id: string): Promise<ServerImage<DigitalOceanImageData, DigitalOceanRegionName> | null> {
         const found = await nullIfNotFound(this.api.call<{ image: DigitalOceanImageData }>('GET', `/v2/images/${encodeURIComponent(id)}`));
         return found && found.image.status !== 'deleted' ? toImage(found.image) : null;
     }
@@ -338,7 +339,7 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
      * made from it needs an SSH key, and has no IPv6. DigitalOcean ends an import
      * it cannot read 'deleted', with its message: thrown here.
      */
-    public async importImage(o: ImportImageOptions<DigitalOceanTypes>): Promise<ServerImage<DigitalOceanImageData>> {
+    public async importImage(o: ImportImageOptions<DigitalOceanTypes>): Promise<ServerImage<DigitalOceanImageData, DigitalOceanRegionName>> {
         if (!/^(https?|ftp):\/\/[^/]+\/./i.test(o.url)) throw new ProviderError(this.id, `an image is imported from an http(s) or ftp URL of a file, not "${o.url}"`);
         const { image } = await this.api.call<{ image: DigitalOceanImageData }>('POST', '/v2/images', {
             name: o.name, url: o.url, region: this.regionName(o.region), ...o.providerOptions,
@@ -362,7 +363,7 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
      * off first (stopServer) for a consistent disk. Resolves once the snapshot is
      * listed, in the droplet's region only.
      */
-    public async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<DigitalOceanImageData>> {
+    public async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<DigitalOceanImageData, DigitalOceanRegionName>> {
         const path = `/v2/droplets/${encodeURIComponent(serverId)}`;
         await this.act(`${path}/actions`, { type: 'snapshot', name: o.name }, waitOf(o, { timeoutMs: 30 * 60_000 }));
         // The action names no image: the droplet's newest snapshot of that name is it.
@@ -382,10 +383,12 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
     }
 
     /** One transfer per missing region, side by side (DigitalOcean charges nothing extra for more regions). A region is a slug, or a REGION_TYPES member. */
-    public async copyImage(id: string, regions: string[], o: WaitOptions = {}): Promise<ServerImage<DigitalOceanImageData>> {
+    public async copyImage(id: string, regions: Array<RegionChoice<DigitalOceanTypes>>, o: WaitOptions = {}): Promise<ServerImage<DigitalOceanImageData, DigitalOceanRegionName>> {
+        // Where, read first: a region of the library's DigitalOcean has none of is refused before the image is read.
+        const wanted = [...new Set(regions.map((r) => this.regionName(r)))];
         const image = await this.getImage(id);
         if (!image) throw new NotFoundError(this.id, `no image ${id}`);
-        const missing = [...new Set(regions.map((r) => this.regionName(r)))].filter((r) => !image.regions.includes(r));
+        const missing = wanted.filter((r) => !image.regions.includes(r));
         const started = await Promise.all(missing.map((region) =>
             this.api.call<{ action: DigitalOceanAction }>('POST', `/v2/images/${encodeURIComponent(id)}/actions`, { type: 'transfer', region })));
         await Promise.all(started.map(({ action }) => this.waitForAction(action.id, o)));
@@ -397,13 +400,13 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
     // ── volumes ──────────────────────────────────────────────────────────
 
     /** The account's Block Storage volumes and Network File Storage shares (`shared`), in every region. */
-    public async listVolumes(): Promise<Volume<DigitalOceanVolumeData | DigitalOceanNfsShare>[]> {
+    public async listVolumes(): Promise<Volume<DigitalOceanVolumeData | DigitalOceanNfsShare, DigitalOceanRegionName>[]> {
         const [blocks, shares] = await Promise.all([this.api.all<DigitalOceanVolumeData>('/v2/volumes', 'volumes'), this.shares()]);
         return [...blocks.map(toVolume), ...shares.map(toNfsVolume)];
     }
 
     /** A Block Storage volume or an NFS share, by its id. */
-    public async getVolume(id: string): Promise<Volume<DigitalOceanVolumeData | DigitalOceanNfsShare> | null> {
+    public async getVolume(id: string): Promise<Volume<DigitalOceanVolumeData | DigitalOceanNfsShare, DigitalOceanRegionName> | null> {
         const v = await this.api.getVolume(id);
         if (v) return toVolume(v);
         const share = await this.findShare(id);
@@ -417,10 +420,10 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
      * letters, digits and dashes, starting with a letter (at most 64). It bills
      * until deleteVolume, attached or not.
      */
-    public async createVolume(o: CreateVolumeOptions<DigitalOceanTypes> & { shared: true }): Promise<Volume<DigitalOceanNfsShare>>;
-    public async createVolume(o: CreateVolumeOptions<DigitalOceanTypes> & { shared?: false }): Promise<Volume<DigitalOceanVolumeData>>;
-    public async createVolume(o: CreateVolumeOptions<DigitalOceanTypes>): Promise<Volume<DigitalOceanVolumeData | DigitalOceanNfsShare>>;
-    public async createVolume(o: CreateVolumeOptions<DigitalOceanTypes>): Promise<Volume<DigitalOceanVolumeData | DigitalOceanNfsShare>> {
+    public async createVolume(o: CreateVolumeOptions<DigitalOceanTypes> & { shared: true }): Promise<Volume<DigitalOceanNfsShare, DigitalOceanRegionName>>;
+    public async createVolume(o: CreateVolumeOptions<DigitalOceanTypes> & { shared?: false }): Promise<Volume<DigitalOceanVolumeData, DigitalOceanRegionName>>;
+    public async createVolume(o: CreateVolumeOptions<DigitalOceanTypes>): Promise<Volume<DigitalOceanVolumeData | DigitalOceanNfsShare, DigitalOceanRegionName>>;
+    public async createVolume(o: CreateVolumeOptions<DigitalOceanTypes>): Promise<Volume<DigitalOceanVolumeData | DigitalOceanNfsShare, DigitalOceanRegionName>> {
         if (!/^[a-z][a-z0-9-]{0,63}$/.test(o.name)) throw new ProviderError(this.id, `volume name "${o.name}": lowercase letters, digits and dashes, starting with a letter (at most 64)`);
         if (o.shared) return this.createShare(o);
         const size = Math.ceil(o.sizeGb);
@@ -569,7 +572,7 @@ export class DigitalOcean extends BaseProvider<DigitalOceanTypes, DigitalOceanAp
      * default VPC (or the VPCs providerOptions.vpc_ids names), once ACTIVE. One
      * that fails is deleted, and its failure thrown.
      */
-    private async createShare(o: CreateVolumeOptions<DigitalOceanTypes> & { shared: true }): Promise<Volume<DigitalOceanNfsShare>> {
+    private async createShare(o: CreateVolumeOptions<DigitalOceanTypes> & { shared: true }): Promise<Volume<DigitalOceanNfsShare, DigitalOceanRegionName>> {
         const size = Math.ceil(o.sizeGb);
         if (!(size >= 50 && size <= 32768)) throw new ProviderError(this.id, `a shared volume (an NFS share) is 50-32768 GB, not ${o.sizeGb}`);
         const region = this.regionName(o.region);

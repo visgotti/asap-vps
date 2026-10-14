@@ -16,17 +16,17 @@ import type {
     ResolvedContainer, Server, ServerListOptions, ServerStatus, Volume, VolumeMount, WaitOptions,
 } from '../types';
 import {
-    ApiClient, cloudInitParts, containerBootScript, containerImageOf, Deadline, estimateServerCost, imageSpecOf, NoSuchImageError, parsePort, pollUntil, resolveContainer, restartWatch,
-    Sleep, sshdBootScript, waitOf,
+    ApiClient, cloudInitParts, containerBootScript, containerImageOf, Deadline, estimateServerCost, imageSpecOf, NoSuchImageError, parsePort, pollUntil,
+    refuseRetiredRegion, resolveContainer, restartWatch, Sleep, sshdBootScript, waitOf,
 } from './utils';
 
-/** What a createServer call rents, resolved from its `offer` (an offer object or an id). */
-export type ResolvedOffer<TRaw = unknown> = {
+/** What a createServer call rents, resolved from its `offer` (an offer object or an id), its places by the platform's own names (`TRegion`). */
+export type ResolvedOffer<TRaw = unknown, TRegion extends string = string> = {
     id: string,
-    /** The offer object, when the caller passed one. */
-    offer?: Offer<TRaw>,
+    /** The offer object, when the caller passed one: this provider's own. */
+    offer?: Offer<TRaw, TRegion>,
     /** The caller's region (in the platform's own name), else the offer's first region with stock. */
-    region?: string,
+    region?: TRegion,
 };
 
 /** A mount of createServer's `mounts`, read: the volume's id, the volume itself when the caller passed it, and the path asked for. */
@@ -122,17 +122,17 @@ export abstract class BaseProvider<T extends PlatformTypes = PlatformTypes, TApi
         });
     }
 
-    public abstract listOffers(query?: OfferQuery): Promise<Offer<T['offer']>[]>;
-    public abstract createServer(options: CreateServerOptions<T>): Promise<Server<T['server']>>;
-    public abstract getServer(id: string): Promise<Server<T['server']> | null>;
-    public abstract listServers(options?: ServerListOptions): Promise<Server<T['server']>[]>;
+    public abstract listOffers(query?: OfferQuery): Promise<Offer<T['offer'], T['regionName']>[]>;
+    public abstract createServer(options: CreateServerOptions<T>): Promise<Server<T['server'], T['regionName']>>;
+    public abstract getServer(id: string): Promise<Server<T['server'], T['regionName']> | null>;
+    public abstract listServers(options?: ServerListOptions): Promise<Server<T['server'], T['regionName']>[]>;
     public abstract deleteServer(id: string, o?: WaitOptions): Promise<void>;
 
     /**
      * Poll getServer until `done` accepts what it read (a server, or null once
      * it is gone). A failed read that may be transient is polled through.
      */
-    public async waitForServer(id: string, done: (s: Server<T['server']> | null) => boolean, o: WaitOptions = {}): Promise<Server<T['server']> | null> {
+    public async waitForServer(id: string, done: (s: Server<T['server'], T['regionName']> | null) => boolean, o: WaitOptions = {}): Promise<Server<T['server'], T['regionName']> | null> {
         return this.poll(() => this.getServer(id), done, {
             ...o,
             what: `server ${id}`,
@@ -147,7 +147,7 @@ export abstract class BaseProvider<T extends PlatformTypes = PlatformTypes, TApi
      * server this returns is one RemoteMachine.connect can take.
      * Throws when it errors, or disappears (NotFoundError) instead.
      */
-    public async waitUntilRunning(id: string, o: WaitOptions & { requireIp?: boolean } = {}): Promise<Server<T['server']>> {
+    public async waitUntilRunning(id: string, o: WaitOptions & { requireIp?: boolean } = {}): Promise<Server<T['server'], T['regionName']>> {
         const requireIp = o.requireIp ?? this.capabilities.compute.kind === 'vm';
         const s = await this.poll(() => this.getServer(id), (x) => !x || ['error', 'terminating', 'terminated'].includes(x.status)
             || (x.status === 'running' && (!requireIp || !!x.ip) && !this.comingUp(x)), {
@@ -168,7 +168,7 @@ export abstract class BaseProvider<T extends PlatformTypes = PlatformTypes, TApi
      * that names them later (it maps a container's ports only after the
      * container reads as running) says so here, and waitUntilRunning waits.
      */
-    protected comingUp(_server: Server<T['server']>): boolean {
+    protected comingUp(_server: Server<T['server'], T['regionName']>): boolean {
         return false;
     }
 
@@ -177,7 +177,7 @@ export abstract class BaseProvider<T extends PlatformTypes = PlatformTypes, TApi
      * every five seconds, unless `o` says. Throws when it is gone
      * (NotFoundError), or errors or is deleted instead of stopping.
      */
-    protected async waitUntilStopped(id: string, o: WaitOptions = {}): Promise<Server<T['server']>> {
+    protected async waitUntilStopped(id: string, o: WaitOptions = {}): Promise<Server<T['server'], T['regionName']>> {
         const s = await this.waitForServer(id, (x) => !x || ['stopped', 'error', 'terminating', 'terminated'].includes(x.status),
             waitOf(o, { timeoutMs: 10 * 60_000, intervalMs: 5000 }));
         if (!s) throw new NotFoundError(this.id, `server ${id} disappeared while it was stopping`);
@@ -194,7 +194,7 @@ export abstract class BaseProvider<T extends PlatformTypes = PlatformTypes, TApi
      * shows of a server that is rebooting (a Lambda instance reads as
      * unhealthy, a RunPod pod as stopped), which is waited through.
      */
-    protected async waitUntilRestarted(id: string, o: WaitOptions = {}, passing: readonly ServerStatus[] = []): Promise<Server<T['server']>> {
+    protected async waitUntilRestarted(id: string, o: WaitOptions = {}, passing: readonly ServerStatus[] = []): Promise<Server<T['server'], T['regionName']>> {
         const back = restartWatch(BaseProvider.settleReads(waitOf(o, { intervalMs: BaseProvider.POLL_INTERVAL_MS }).intervalMs));
         const failed = (['error', 'stopped', 'terminating', 'terminated'] as const).filter((x) => !passing.includes(x));
         const s = await this.waitForServer(id, (x) => !x || (failed as readonly ServerStatus[]).includes(x.status) || back(x.status === 'running'), o);
@@ -269,7 +269,7 @@ export abstract class BaseProvider<T extends PlatformTypes = PlatformTypes, TApi
      * (which must be this provider's), and the region: the caller's (a
      * REGION_TYPES member in the platform's name), else the offer's first with stock.
      */
-    protected resolveOffer(o: CreateServerOptions<T>): ResolvedOffer<T['offer']> {
+    protected resolveOffer(o: CreateServerOptions<T>): ResolvedOffer<T['offer'], T['regionName']> {
         const asked = o.region !== undefined ? this.regionName(o.region) : undefined;
         if (typeof o.offer === 'string') {
             if (!o.offer) throw new ProviderError(this.id, 'createServer needs an offer (an offer from listOffers, or its id)');
@@ -281,16 +281,19 @@ export abstract class BaseProvider<T extends PlatformTypes = PlatformTypes, TApi
         if (asked === undefined && !o.offer.regions.length) {
             throw new CapacityError(this.id, `offer ${o.offer.id} has no stock anywhere right now: pick an offer with regions, or ask for a region`);
         }
-        const region = asked ?? o.offer.regions[0];
-        return { id: o.offer.id, offer: o.offer, ...(region ? { region } : {}) };
+        // This provider's own offer (checked above): its regions are its own names for its places.
+        const offer = o.offer as Offer<T['offer'], T['regionName']>;
+        const region = asked ?? offer.regions[0];
+        return { id: offer.id, offer, ...(region ? { region } : {}) };
     }
 
-    /** A region as the platform names it: a REGION_TYPES member it maps, or the caller's own name. */
-    protected regionName(region: string): string {
-        if (!REGION_MEMBERS.has(region)) return region;
+    /** A region as the platform names it: a REGION_TYPES member it maps, or the caller's own name (one of its own, as its types take it). */
+    protected regionName(region: string): T['regionName'] {
+        refuseRetiredRegion(region);
+        if (!REGION_MEMBERS.has(region)) return region as T['regionName'];
         const mapped = this.enums.regions?.[region as REGION_TYPES];
         if (!mapped) throw new NotSupportedError(this.id, `region "${region}" (REGION_TYPES has no ${this.id} region by that name)`);
-        return mapped;
+        return mapped as T['regionName'];
     }
 
     /**

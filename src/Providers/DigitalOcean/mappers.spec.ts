@@ -17,11 +17,17 @@ describe('DigitalOcean places', () => {
         expect(['xyz1', '', undefined, 'NYC1', '1nyc'].map(countryOf)).toEqual([undefined, undefined, undefined, undefined, undefined]);
     });
 
-    it('Amsterdam is ams3, the datacenter there that takes new resources, as San Francisco is sfo3', () => {
-        expect(DIGITALOCEAN_ENUMS.regions).toEqual({
-            toronto: 'tor1', nyc: 'nyc1', nyc1: 'nyc1', nyc2: 'nyc2', nyc3: 'nyc3',
-            san_francisco: 'sfo3', san_francisco_1: 'sfo1', san_francisco_2: 'sfo2', san_francisco_3: 'sfo3', amsterdam: 'ams3', amsterdam_3: 'ams3',
+    it('a city is its first datacenter open to new resources (Amsterdam ams3, ams2 being legacy; San Francisco sfo2), and each open datacenter its own', () => {
+        expect(DIGITALOCEAN_ENUMS.regions).toMatchObject({
+            us_new_york: 'nyc1', us_new_york_1: 'nyc1', us_new_york_2: 'nyc2', us_new_york_3: 'nyc3',
+            us_san_francisco: 'sfo2', us_san_francisco_2: 'sfo2', us_san_francisco_3: 'sfo3',
+            canada_toronto: 'tor1', canada_toronto_1: 'tor1', netherlands_amsterdam: 'ams3', netherlands_amsterdam_3: 'ams3',
+            singapore: 'sgp1', uk_london_1: 'lon1', germany_frankfurt: 'fra1', india_bangalore_1: 'blr1', australia_sydney: 'syd1',
+            us_atlanta_1: 'atl1', us_richmond_1: 'ric1', us_kansas_city_1: 'mkc1', us_memphis: 'mem1',
         });
+        // 16 open datacenters in 13 cities; the two legacy ones have none.
+        expect(Object.keys(DIGITALOCEAN_ENUMS.regions)).toHaveLength(16 + 13);
+        expect(Object.values(DIGITALOCEAN_ENUMS.regions).filter((d) => d === 'ams2' || d === 'sfo1')).toEqual([]);
     });
 });
 

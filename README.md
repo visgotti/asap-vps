@@ -37,7 +37,7 @@ const key = await digitalOcean.addSSHKey(publicKey, "my_key"); // the same key a
 const server = await digitalOcean.createServer({
   name: "web-1",
   offer: "s-1vcpu-1gb",          // or an offer from listOffers({ kind: "cpu" })
-  region: REGION_TYPES.NYC_1,    // the library's enums, or the provider's own names ("nyc1")
+  region: REGION_TYPES.US_NEW_YORK_1,    // the library's enums, or the provider's own names ("nyc1")
   image: MACHINE_TYPES.UBUNTU_24,
   sshKeyIds: [key.id],
 });
@@ -257,10 +257,12 @@ await scaleway.listServers({ kind: "gpu" });
 | Option | What it does |
 |---|---|
 | `listOffers(query?)` | What can be rented now, cheapest first: GPUs and VRAM per GPU, price per hour, regions with stock. A query means the same on every provider. |
-| `countries` | Only offers with stock in those countries (`COUNTRY_TYPES`, or any ISO 3166-1 alpha-2 code). See [Countries](#countries). |
+| `kind` | `"gpu"`, `"cpu"` or `"any"` (the default): the library's `COMPUTE_KINDS`, the same on every provider, in `listOffers`, `listServers` and `listEndpointOffers`. Anything else doesn't compile, and is refused at run time (`bad kind "GPU"`), never read as a kind. |
+| `gpus` | Only these models, by the library's names for them (`GpuName`: `"L4"`, `"H100"`, `"RTX 4090"`, ...), which the editor offers. A model it has no name for goes by the provider's own. |
+| `countries` | Only offers with stock in those countries (`COUNTRY_TYPES`: every ISO 3166-1 alpha-2 code ISO gives a country). See [Countries](#countries). |
 | `minCudaVersion` | Only hosts whose driver runs that CUDA version (container providers, whose offers say `cudaVersion`). A VM runs its image's driver, so VM offers aren't filtered. |
 | `offer` | An offer from `listOffers`, or its id. `gpuCount` defaults to the offer's; only RunPod takes another. |
-| `region` | The provider's own name, or a `REGION_TYPES` member. A member a provider has no name for is refused. |
+| `region` | One of the library's regions the provider has (`REGION_TYPES`), or the provider's own name for a place (what an offer's `regions` lists). Any other is a compile error. See [Regions](#regions). |
 | `image` | The provider's own name, a `MACHINE_TYPES` member, or `{ os, cuda }`. See [Images by the library's names](#images-by-the-librarys-names). Default: the provider's GPU image, or plain Ubuntu. |
 | `sshKeyIds` | The account's keys that log in to the server. See [SSH keys](#ssh-keys). |
 | `ports` | A container's ports, each `<port>/<tcp\|udp\|http>`. See [Ports](#ports). |
@@ -279,9 +281,33 @@ Every provider names its places its own way (`tor1`, `fr-par-2`, `us-east-1`, `E
 - `listOffers({ countries: [COUNTRY_TYPES.US, COUNTRY_TYPES.CA] })` asks the same of all five providers.
 - Each offer returned has its `regions` narrowed to the ones in those countries, so it brings a region there to `createServer`.
 - Each offer carries `locations`: its regions with the country each is in. A server carries its `country`.
-- `COUNTRY_TYPES` lists the countries the providers have machines in. Any other ISO code is taken (Vast is a marketplace).
-- A value that is no ISO code is refused, not read as nowhere.
+- `COUNTRY_TYPES` is every ISO 3166-1 alpha-2 code ISO gives a country, 249 of them, each with its name on hover (`COUNTRY_TYPES.KR`: South Korea). The list is ISO's, read from two copies of it that agree; `npm run places:check` holds it to ISO's.
+- Nothing else passes: `countries: ["UK"]` doesn't compile (ISO gives no country `UK`: the United Kingdom's code is `GB`), and at run time it is refused, not read as nowhere. So is a name (`"Japan"`). A code in lower case is read at run time, for callers the compiler doesn't check.
 - The list is the places allowed: an empty one allows none (no offers). Only leaving `countries` out allows any.
+- A country is a question any provider can answer, so every provider takes the whole list. One with no place there lists nothing.
+
+### Regions
+
+`REGION_TYPES` names places the same way everywhere: the country, then the place in it as finely as the provider's own data says (a city, else a state, else nothing), then a number (`FRANCE_PARIS_2`, `CANADA_TORONTO_1`, `US_TEXAS_3`, `ROMANIA_1`). Each provider translates the members it has into its own names, and its `region` options take only those:
+
+| Provider | Its places | e.g. |
+|---|---|---|
+| DigitalOcean | its 16 open datacenters, each by its own member, and their 13 cities | `US_NEW_YORK_1` is `nyc1`; `US_NEW_YORK` is its first datacenter there, `nyc1` |
+| Scaleway | its 4 regions and their 10 zones | `FRANCE_PARIS_2` is `fr-par-2`; `FRANCE_PARIS` is the region `fr-par` (a server goes to its first zone with stock) |
+| RunPod | its 34 data centers, by US state, by Montreal, else by country | `US_TEXAS_3` is `US-TX-3`; `CANADA_MONTREAL_4` is `CA-MTL-4`; `ROMANIA_1` is `EU-RO-1` |
+| Lambda | its 18 regions, by city or state, else by country | `US_VIRGINIA_1` is `us-east-1`; `JAPAN_OSAKA_1` is `asia-northeast-1`; `GERMANY_1` is `europe-central-1` |
+| Vast | none: each offer is a machine, where its host is | say where by country, or by the offer's own `regions` |
+
+- The editor offers each provider its pick, and its own names (`"tor1"`, `"fr-par-2"`, `"US-TX-3"`, `"us-east-1"`).
+- `REGION_TYPES.FRANCE_PARIS_2`, `"france_paris_2"` and Scaleway's own `"fr-par-2"` are the same zone on Scaleway.
+- A region the provider doesn't have is a compile error: `digitalOcean.createServer({ ..., region: REGION_TYPES.FRANCE_PARIS })` doesn't build. So is a name of no place of its (`"nyc9"`, or Lambda's `"us-east-1"` on RunPod). A string read from a flag needs a check or a cast first.
+- A legacy DigitalOcean datacenter (`sfo1`, `ams2`), closed to new resources, has no member: it goes by its slug.
+- A name the regions had before 0.1.0 (`"toronto"`, `"paris_2"`) is refused at run time, naming the member it is now (`REGION_TYPES.CANADA_TORONTO`).
+- A place a provider's records report goes back in as it is: `offer.regions[0]`, `server.region` and `volume.region` are typed as that provider's own names.
+- On a union of providers (`AnyProvider`, what `providersFromEnv` returns), narrow to one first (`if (p.id === "scaleway")`). Code typed for any provider (`ICompute`) takes any region, and the provider refuses one it lacks (`NotSupportedError`) before anything is asked of the platform.
+- Each region is in one country (`REGION_COUNTRIES`), and a server rented there says that country.
+- Where a provider has no place the library names, say where by country (`listOffers({ countries })`), or by the region an offer lists.
+- Each provider's places are listed in its `places.ts` (`src/Providers/<Platform>/places.ts`), as its own API lists them, with where and when each was read. Its own names, its pick of `REGION_TYPES`, its countries and its translation table are all made from that list. `npm run places:check` compares the list with what the provider says now, so a place it opens, closes or renames is found. See [Tests](#tests).
 
 ### Images by the library's names
 
@@ -742,6 +768,7 @@ src/Providers/<Platform>/       one folder per platform:
     mappers.ts                    its records as asap-vps's (toServer, toOffer, ...), status words, billing, enum names
     types.ts                      its wire format, its params, and <Platform>Types (what records carry as `raw`)
     endpoints.ts                  every endpoint it calls, with its operation and reference page
+    places.ts                     its places as its own API lists them: what its region types and translation table are made from
 src/Providers/registry.ts       every provider by id, typed
 src/testing/                    fakes of each platform's REST API, the contract and lifecycle suites, live-run safety
 ```
@@ -752,9 +779,10 @@ Specs sit next to the code they test.
 
 1. Make a folder `src/Providers/<Platform>/` with the files above.
 2. Name its records in a `<Platform>Types` bundle: its server, offer, image, volume and create requests, the options it refuses, and what a volume size and a mount take there.
-3. Extend `BaseProvider<<Platform>Types, <Platform>Api>` and declare its capabilities as a `const` descriptor.
-4. `implements ProviderCapabilities<<Platform>Types, typeof CAPABILITIES>`: the compiler then asks for every method of every capability declared.
-5. Write a fake of its API in `src/testing/fakes`, and add it to `src/testing/subjects.ts` and `PROVIDERS`.
+3. List its places in `places.ts`, as its API lists them, each with its country and its `REGION_TYPES` members (adding members it needs). Its bundle's `region`, `regionName` and `country` come from that list (`RegionPick`), and so does its translation table (`regionTable`). Add a reader of the same listing to [scripts/places-check.ts](scripts/places-check.ts).
+4. Extend `BaseProvider<<Platform>Types, <Platform>Api>` and declare its capabilities as a `const` descriptor.
+5. `implements ProviderCapabilities<<Platform>Types, typeof CAPABILITIES>`: the compiler then asks for every method of every capability declared.
+6. Write a fake of its API in `src/testing/fakes`, and add it to `src/testing/subjects.ts` and `PROVIDERS`.
 
 The contract suite (`src/Providers/contract.spec.ts`) and the lifecycle suite then hold it to the same behavior as every other provider.
 
@@ -797,9 +825,11 @@ npm run docs:check     # type-check every block of every page; run each `run`; r
 | `npm run test:ssh` | Holds `RemoteMachine` to a real session: logins, commands, files, SFTP. It starts this machine's own `sshd` on 127.0.0.1 with a host key, a key list and a port of its own, then stops it. Costs nothing. |
 | `npm run api:spec` | Holds each provider's endpoint table to the live OpenAPI specs and reference pages ([scripts/api-spec-check.ts](scripts/api-spec-check.ts)). |
 | `npm run scaleway:spec` | Holds the Scaleway provider to Scaleway's OpenAPI specs: endpoints, enums, fields and reference pages (`-- --live` also reads the public catalog). |
+| `npm run places:check` | Holds each provider's `places.ts`, and `COUNTRY_TYPES`, to their sources now ([scripts/places-check.ts](scripts/places-check.ts)): DigitalOcean's, RunPod's and Lambda's own listings, Scaleway's specs, a new sample of Vast's offers, and ISO's list. Read-only, and it rents nothing. A place added, gone or changed fails; what the data leaves out is listed. A provider without its key is skipped (`-- runpod lambda` checks those only). |
 
 - CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs a type-check, the build and `test:coverage` on Node 18, 22 and 24 for every pull request. `master` takes only pull requests whose runs all passed.
 - CI runs on GitHub's runners, or on the self-hosted ones the repository variable `CI_RUNS_ON` names. A fork's pull request never runs on those.
+- [.github/workflows/places.yml](.github/workflows/places.yml) runs `places:check` every Monday, by hand, and on a pull request that changes what it compares. A failed scheduled run is mailed by GitHub, and the report is on the run's page.
 - The shell scripts the library sends to a machine (a container's SSH server, a user and its keys) are run for real in `npm test`, under `sh` and `dash`.
   - They run against stand-ins for the tools that would change a system ([sshd.spec.ts](src/Core/utils/sshd.spec.ts)).
 - Each provider's API client refuses a request its endpoint table (`endpoints.ts`) doesn't describe, before sending it, so every test that drives a provider holds it to the table.

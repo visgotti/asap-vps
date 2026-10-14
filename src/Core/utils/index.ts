@@ -8,6 +8,7 @@ export * from './gpus';
 export * from './http';
 export * from './images';
 export * from './offers';
+export * from './places';
 export * from './registry';
 export * from './ssh';
 export * from './sshd';

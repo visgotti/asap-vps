@@ -19,7 +19,7 @@ import {
 } from '../../testing/live';
 import type { CreateServerOptions, Offer, Server, Volume } from '../../types';
 import { RunPod } from './RunPod';
-import type { RunPodCpuOffer, RunPodGpuType, RunPodNetworkVolume, RunPodPod, RunPodTypes } from './types';
+import type { RunPodCpuOffer, RunPodGpuType, RunPodNetworkVolume, RunPodPod, RunPodRegionName, RunPodTypes } from './types';
 
 const requested = liveRequested('runpod');
 const { freeOnly, maxPricePerHour } = liveOptions();
@@ -34,18 +34,18 @@ const WAIT = { intervalMs: 5000, timeoutMs: 15 * 60_000 };
     let watchdog: { doneFile: string } | undefined;
     let refused = false;
     let volumeIds = new Set<string>();
-    let offer: Offer<RunPodGpuType | RunPodCpuOffer>;
-    let dc: string;
-    let volume: Volume<RunPodNetworkVolume>;
-    let writer: Server<RunPodPod>;
-    let reader: Server<RunPodPod>;
+    let offer: Offer<RunPodGpuType | RunPodCpuOffer, RunPodRegionName>;
+    let dc: RunPodRegionName;
+    let volume: Volume<RunPodNetworkVolume, RunPodRegionName>;
+    let writer: Server<RunPodPod, RunPodRegionName>;
+    let reader: Server<RunPodPod, RunPodRegionName>;
 
     /**
      * A pod in the volume's data center: the cheapest GPU type in stock there
      * first, then the next when RunPod has no machine free for it (stock is per
      * host: one pod can take the last GPU of a type).
      */
-    const podInDc = async (o: Omit<CreateServerOptions<RunPodTypes>, 'offer' | 'region'>): Promise<Server<RunPodPod>> => {
+    const podInDc = async (o: Omit<CreateServerOptions<RunPodTypes>, 'offer' | 'region'>): Promise<Server<RunPodPod, RunPodRegionName>> => {
         const candidates = (await p.listOffers({ kind: 'gpu', maxPricePerHour, minCudaVersion: TEST_IMAGE_CUDA })).filter((x) => x.regions.includes(dc));
         for (const candidate of candidates) {
             try {

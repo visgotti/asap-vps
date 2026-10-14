@@ -2,8 +2,20 @@
 // them (https://docs.digitalocean.com/reference/api/), and DigitalOceanTypes,
 // which types its records and create options by them.
 
+import type { RegionPick } from '../../Core/utils/places';
 import type { MountPath, VolumeSize } from '../../types';
 import type { DIGITALOCEAN_REFUSED } from './mappers';
+import type { DIGITALOCEAN_DATACENTERS } from './places';
+
+/** One of DigitalOcean's datacenters, as its reference data has them (places.ts). */
+type Datacenter = (typeof DIGITALOCEAN_DATACENTERS)[number];
+
+/**
+ * A DigitalOcean datacenter by its slug ('tor1', 'nyc3'), the legacy ams2 and
+ * sfo1 included: its own name for a place, as its records give it and its
+ * `region` options take it. The list is DIGITALOCEAN_DATACENTERS.
+ */
+export type DigitalOceanRegionName = Datacenter['slug'];
 
 /** The body of `POST /v2/droplets`: what CreateServerOptions.providerOptions adds fields to. */
 export type DigitalOceanCreateDropletParams = {
@@ -84,6 +96,12 @@ export type DigitalOceanTypes = {
     | { shared: true, providerOptions?: Partial<DigitalOceanCreateNfsParams> & Record<string, unknown> },
   /** A path for a shared volume (an NFS share); a block volume is mounted at its own mountPath. */
   mount: MountPath,
+  /** Its pick of the library's regions: its open datacenters' and their cities' (DIGITALOCEAN_ENUMS.regions). */
+  region: RegionPick<Datacenter>,
+  /** Its datacenters by their slugs. */
+  regionName: DigitalOceanRegionName,
+  /** The countries its datacenters are in. */
+  country: Datacenter['country'],
 }
 
 /** The GPUs of a GPU size or droplet. */

@@ -21,7 +21,7 @@ import {
 } from '../../testing/live';
 import type { Offer, Server, Volume } from '../../types';
 import { LambdaCloud } from './LambdaCloud';
-import type { LambdaFilesystem, LambdaInstance, LambdaInstanceTypes } from './types';
+import type { LambdaFilesystem, LambdaInstance, LambdaInstanceTypes, LambdaRegionName } from './types';
 
 const requested = liveRequested('lambda');
 const { freeOnly, maxPricePerHour } = liveOptions();
@@ -38,11 +38,11 @@ const SSH_RETRY = { maxRetries: 30, retryTimeout: 10_000 };
     let refused = false;
     let volumeIds = new Set<string>();
     let keyIds = new Set<string>();
-    let offer: Offer<LambdaInstanceTypes[string]>;
-    let region: string;
-    let fs: Volume<LambdaFilesystem>;
-    let writer: ProvisionResult<Server<LambdaInstance>>;
-    let reader: ProvisionResult<Server<LambdaInstance>>;
+    let offer: Offer<LambdaInstanceTypes[string], LambdaRegionName>;
+    let region: LambdaRegionName;
+    let fs: Volume<LambdaFilesystem, LambdaRegionName>;
+    let writer: ProvisionResult<Server<LambdaInstance, LambdaRegionName>>;
+    let reader: ProvisionResult<Server<LambdaInstance, LambdaRegionName>>;
 
     /** A server mounting the filesystem, provisioned over SSH (the provisioner's own key), running `commands` as root. */
     const provision = (name: string, path: string | undefined, commands: string[]) => new ServerProvisioner(p).provision({
@@ -50,7 +50,7 @@ const SSH_RETRY = { maxRetries: 30, retryTimeout: 10_000 };
         sshKeyName: name,
         wait: WAIT,
         sshRetry: SSH_RETRY,
-    }, (pipeline) => void pipeline.addStep(new RunCommandStep(commands, 'filesystem'))) as Promise<ProvisionResult<Server<LambdaInstance>>>;
+    }, (pipeline) => void pipeline.addStep(new RunCommandStep(commands, 'filesystem'))) as Promise<ProvisionResult<Server<LambdaInstance, LambdaRegionName>>>;
     const output = (r: ProvisionResult) => r.setupResults.map((x) => `${x.output ?? ''}${x.message ?? ''}`).join('\n');
 
     beforeAll(async () => {

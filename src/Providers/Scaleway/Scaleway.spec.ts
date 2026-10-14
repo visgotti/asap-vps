@@ -17,11 +17,11 @@ import { CapacityError, NotFoundError, NotSupportedError, ProviderError, QuotaEr
 import { FAKE_SCALEWAY_PROJECT, fakeScaleway, FakeScalewayOptions } from '../../testing/fakes/scaleway';
 import { SERVER_TYPES } from '../../testing/fakes/scalewayCatalog';
 import { followingRedirects, json, testPublicKey, waitingClock } from '../../testing/fakes/util';
-import type { Offer } from '../../types';
+import type { Offer, RegionChoice } from '../../types';
 import { fileSystemMounts, MOUNT_TAG, mountedVolumeIds, toVolume } from './mappers';
 import { CUDA_TYPES, MACHINE_TYPES, REGION_TYPES } from '../../constants';
 import { Scaleway } from './Scaleway';
-import type { ScalewayBlockVolume, ScalewayParams, ScalewayServer, ScalewayZone } from './types';
+import type { ScalewayBlockVolume, ScalewayParams, ScalewayServer, ScalewayTypes, ScalewayZone } from './types';
 
 const noSleep = async () => {};
 const fast = { intervalMs: 0, timeoutMs: 5000 };
@@ -211,8 +211,8 @@ describe('Scaleway createServer', () => {
 
     it('an image by the library\'s names is the label that boots the type rented: `{ os, cuda }` the GPU OS image, on a GPU type; an Ubuntu alone the plain one, on a type without GPUs', async () => {
         const { p, fake } = make();
-        const gpu = { name: 'gpu', offer: 'L4-1-24G', region: 'pl-waw-2' };
-        const cpu = { name: 'cpu', offer: 'DEV1-S', region: 'fr-par-1' };
+        const gpu = { name: 'gpu', offer: 'L4-1-24G', region: 'pl-waw-2' as const };
+        const cpu = { name: 'cpu', offer: 'DEV1-S', region: 'fr-par-1' as const };
         await p.createServer({ ...gpu, image: { os: MACHINE_TYPES.UBUNTU_24, cuda: CUDA_TYPES.CUDA_12_8 } });
         await p.createServer({ ...gpu, image: { os: 'ubuntu22', cuda: '12.8' } });
         await p.createServer({ ...cpu, image: { os: 'ubuntu24' } });
@@ -222,8 +222,8 @@ describe('Scaleway createServer', () => {
 
     it('the pair Scaleway cannot boot is refused before anything is created, with the one it can: a plain Ubuntu on a GPU type, a GPU OS image on a type without GPUs', async () => {
         const { p, fake } = make();
-        const gpu = { name: 'gpu', offer: 'L4-1-24G', region: 'pl-waw-2' };
-        const cpu = { name: 'cpu', offer: 'DEV1-S', region: 'fr-par-1' };
+        const gpu = { name: 'gpu', offer: 'L4-1-24G', region: 'pl-waw-2' as const };
+        const cpu = { name: 'cpu', offer: 'DEV1-S', region: 'fr-par-1' as const };
         const servers = fake.state.servers.size;
         for (const image of [{ os: 'ubuntu24' }, MACHINE_TYPES.UBUNTU_24] as const) {
             await expect(p.createServer({ ...gpu, image })).rejects.toMatchObject({
@@ -291,12 +291,24 @@ describe('Scaleway createServer', () => {
     it('needs a zone (the offer\'s first with stock, or the one given), one that exists, and one of its own zones', async () => {
         const { p, fake } = make({}, { zones: 'fr-par-2,pl-waw-2' });
         await expect(p.createServer({ name: 'x', offer: 'L4-1-24G' })).rejects.toThrow(/needs a zone/);
+        // @ts-expect-error there is no zone fr-par-7: Scaleway's types know its zones
         await expect(p.createServer({ name: 'x', offer: 'L4-1-24G', region: 'fr-par-7' })).rejects.toThrow(/unknown Scaleway zone "fr-par-7" \(zones: fr-par-2, pl-waw-2\)$/);
         // A server in a zone this provider does not list would not be listed, deleted by a teardown, or found by a sweep.
         await expect(p.createServer({ name: 'x', offer: 'DEV1-S', region: 'nl-ams-1' })).rejects.toThrow(/not one of this provider's zones \(fr-par-2, pl-waw-2\)/);
         expect(creates(fake)).toHaveLength(0);
         const [offer] = await p.listOffers({ kind: 'gpu' });
         expect((await p.createServer({ name: 'ok', offer })).region).toBe('pl-waw-2');
+        // A region stands for a zone of it: the offer's first there with stock, else this provider's first there; one with none of its zones is refused.
+        expect((await p.createServer({ name: 'warsaw', offer, region: REGION_TYPES.POLAND_WARSAW })).region).toBe('pl-waw-2');
+        expect((await p.createServer({ name: 'paris', offer: 'DEV1-S', region: 'fr-par' })).region).toBe('fr-par-2');
+        const made = creates(fake).length;
+        await expect(p.createServer({ name: 'amsterdam', offer: 'DEV1-S', region: REGION_TYPES.NETHERLANDS_AMSTERDAM })).rejects.toThrow('scaleway: region nl-ams has none of this provider\'s zones (fr-par-2, pl-waw-2)');
+        // An image is copied where it is asked, a region read first, before the image is: one Scaleway has none of is refused before anything is read.
+        const asked = fake.calls.length;
+        await expect(p.copyImage('fr-par-2/00000000-0000-4000-8000-000000000001', [REGION_TYPES.NETHERLANDS_AMSTERDAM], fast)).rejects.toThrow('scaleway: region nl-ams has none of this provider\'s zones (fr-par-2, pl-waw-2)');
+        // @ts-expect-error Scaleway has no New York
+        await expect(p.copyImage('fr-par-2/00000000-0000-4000-8000-000000000001', [REGION_TYPES.US_NEW_YORK_1], fast)).rejects.toThrow(NotSupportedError);
+        expect([fake.calls.length, creates(fake).length]).toEqual([asked, made]);
         expect((await p.createServer({ name: 'ok2', offer, region: 'fr-par-2' }).catch((e) => e))).toBeInstanceOf(CapacityError);
     });
 
@@ -1118,7 +1130,7 @@ describe('Scaleway configuration', () => {
 describe('Scaleway volumes (Block Storage)', () => {
     const UNKNOWN = '00000000-0000-4000-8000-00000000beef';
     /** A volume in Warsaw 2, where the cheapest GPU (the L4) is in stock. */
-    const volume = (p: Scaleway, name = 'models', zone = 'pl-waw-2') => p.createVolume({ name, region: zone, sizeGb: 20 });
+    const volume = (p: Scaleway, name = 'models', zone: RegionChoice<ScalewayTypes> = 'pl-waw-2') => p.createVolume({ name, region: zone, sizeGb: 20 });
     const blockVolume = (fake: Fake, zonedId: string) => fake.state.volumes.get(zonedId.split('/')[1]);
 
     it('is made empty, 5000 IOPS, by whole GB, waited for until available; read by zoned id or bare id; listed in every zone', async () => {
@@ -1141,6 +1153,7 @@ describe('Scaleway volumes (Block Storage)', () => {
 
     it('a volume made needs a zone of this provider, a size from 1 GB, and the Project; one that vanishes or fails while it is made says so', async () => {
         const { fake, p } = make();
+        // @ts-expect-error 'mars-1' is no Scaleway zone: its types know them all
         await expect(p.createVolume({ name: 'v', region: 'mars-1', sizeGb: 20 })).rejects.toThrow(/unknown Scaleway zone/);
         await expect(p.createVolume({ name: 'v', region: 'pl-waw-2', sizeGb: 0.5 })).rejects.toThrow(/at least 1 GB/);
         await expect(make({}, { projectId: undefined }).p.createVolume({ name: 'v', region: 'pl-waw-2', sizeGb: 20 })).rejects.toMatchObject({
@@ -1283,7 +1296,7 @@ describe('Scaleway volumes (Block Storage)', () => {
 
 describe('Scaleway volumes attached to a server that runs (volumeAttach)', () => {
     const UNKNOWN = '00000000-0000-4000-8000-00000000beef';
-    const volume = (p: Scaleway, name = 'models', zone = 'pl-waw-2') => p.createVolume({ name, region: zone, sizeGb: 20 });
+    const volume = (p: Scaleway, name = 'models', zone: RegionChoice<ScalewayTypes> = 'pl-waw-2') => p.createVolume({ name, region: zone, sizeGb: 20 });
     const attaches = (fake: Fake) => fake.calls.filter((c) => c.method === 'POST' && /\/attach-volume$/.test(c.path));
 
     it('attaches it as the next disk, tags the server so its deletion and images leave it, and waits until it is in use', async () => {
@@ -1436,7 +1449,7 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
         expect(body()?.path).toBe('/containers/v1/regions/pl-waw/containers');
         // A region outside the provider's zones: its endpoints would not be listed there.
         await expect(p.createEndpoint({ name: 'ef', container: WHOAMI, region: 'fr-par-2', ...fast })).rejects.toThrow(/region fr-par is outside this provider's zones \(nl-ams-2, pl-waw-1\)/);
-        await p.createEndpoint({ name: 'ed', container: { ...WHOAMI, env: { PORT: '8080' } }, port: 8080, region: REGION_TYPES.AMSTERDAM, ...fast });
+        await p.createEndpoint({ name: 'ed', container: { ...WHOAMI, env: { PORT: '8080' } }, port: 8080, region: REGION_TYPES.NETHERLANDS_AMSTERDAM, ...fast });
         expect(body()).toMatchObject({ path: '/containers/v1/regions/nl-ams/containers', body: { port: 8080, environment_variables: { PORT: '8080' } } });
         // Listed from the regions of the provider's zones.
         expect((await p.listEndpoints()).map((e) => e.region).sort()).toEqual(['nl-ams', 'nl-ams', 'pl-waw', 'pl-waw']);
@@ -1478,6 +1491,7 @@ describe('Scaleway serverless: Serverless Containers (CPU), one namespace and on
             [{ name: 'x1', container: WHOAMI, maxWorkers: 0 }, /\(not 0 and 0\)$/],
             [{ name: 'x1', container: WHOAMI, maxWorkers: 1.5 }, /\(not 0 and 1\.5\)$/],
             [{ name: 'x1', container: WHOAMI, offer: '2vcpu' }, /bad container size "2vcpu"/],
+            // @ts-expect-error 'us-east' is no Scaleway region: its types know them all
             [{ name: 'x1', container: WHOAMI, region: 'us-east' }, /"us-east" is no Scaleway region \(fr-par, nl-ams, pl-waw, it-mil\) nor zone$/],
         ];
         for (const [o, why] of refused) await expect(p.createEndpoint({ ...o, ...fast })).rejects.toThrow(why);
@@ -1738,7 +1752,7 @@ describe('Scaleway shared volumes: File Storage filesystems, attached to Instanc
     it('refuses before anything is made: a type that attaches none, another region, one not available, one that is not there, a relative path', async () => {
         const { fake, p } = make();
         const share = await shareOf(p);
-        const o = { name: 'x', offer: GPU_FS, region: 'fr-par-2' };
+        const o = { name: 'x', offer: GPU_FS, region: 'fr-par-2' as const };
         await expect(p.createServer({ ...o, offer: 'DEV1-S', mounts: [{ volume: share }] }))
             .rejects.toThrow(/^scaleway: 1 filesystems on DEV1-S \(it attaches 0: types with max_file_systems, e\.g\. POP2, L4, L40S, H100\) is not supported$/);
         await expect(p.createServer({ ...o, region: 'pl-waw-2', mounts: [{ volume: share }] })).rejects.toThrow(/filesystem models is in fr-par: an Instance in pl-waw-2 cannot attach it/);

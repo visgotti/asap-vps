@@ -1,6 +1,7 @@
-import { COUNTRY_TYPES, CUDA_TYPES, MACHINE_TYPES, PLATFORM, PlatformFamily, REGION_TYPES } from "./constants";
+import { COMPUTE_KINDS, COUNTRY_TYPES, CUDA_TYPES, GPU_VENDORS, MACHINE_TYPES, PLATFORM, PlatformFamily, REGION_TYPES } from "./constants";
 import type { NodeSSH } from 'node-ssh';
 import type { Sleep } from './Core/utils/async';
+import type { GpuName } from './Core/utils/gpus';
 import type { FetchImpl } from './Core/utils/http';
 
 // ── SSH ──────────────────────────────────────────────────────────────────
@@ -160,7 +161,58 @@ export interface PlatformTypes {
     volumeKind: Partial<VolumeKind>;
     /** What a mount takes besides the volume: MountPath where the platform mounts at a path of your choosing, `{}` where it picks the place. */
     mount: MountPath;
+    /**
+     * Its pick of the library's regions: the REGION_TYPES members it has a
+     * place for, which are the ones its translation table (EnumTranslations.regions)
+     * turns into its own names, and the only ones its `region` options take:
+     * a member it has not is a compile error. `never` where it has none. The
+     * default is every member: code typed for any provider (ICompute) takes
+     * them all, and a provider refuses at run time (NotSupportedError) one it
+     * does not have.
+     */
+    region: REGION_TYPES;
+    /**
+     * Its own names for its places: what its records say (an offer's
+     * `regions`, a server's `region`), and what its `region` options take
+     * besides its pick of the library's. A list where its places are known
+     * (Scaleway's zones), else a pattern of them (DigitalOcean's `tor1`,
+     * RunPod's `US-TX-3`): never one a name of the library's matches, so a
+     * library region it has not cannot pass for one of its own (the suite
+     * holds every provider to that). Any string by default.
+     */
+    regionName: string;
+    /**
+     * Its pick of the library's countries: the COUNTRY_TYPES members it has
+     * places in, as its reference data has them (its places.ts). Every one by
+     * default, and on a marketplace (Vast), whose machines can be anywhere. It
+     * says where a platform is; a query's `countries` is a question, and takes
+     * any country on every platform.
+     */
+    country: COUNTRY_TYPES;
 }
+
+/** A member of one of the library's enums, or the string it stands for: `REGION_TYPES.FRANCE_PARIS` or `'france_paris'`. */
+type Named<E extends string> = E | `${E}`;
+
+/**
+ * Where, as a platform's `region` options take it: a region of the library's
+ * that the platform has (a REGION_TYPES member or its value, translated into
+ * the platform's own name), or the platform's own name for a place (what an
+ * offer's `regions` lists, a server's `region` says). Nothing else: a library
+ * region the platform does not have is a compile error, and so is a name of no
+ * place of its (a string read from a flag is checked first, or asked through
+ * code typed for any provider). Code typed for any provider takes every
+ * library region and any string, and a platform refuses at run time
+ * (NotSupportedError) a library region it does not have, before anything is made.
+ */
+export type RegionChoice<T extends PlatformTypes = PlatformTypes> = Named<T['region']> | OwnRegionName<T>;
+
+/** A platform's own names for its places, as an option takes them; for code typed for any provider, any string. */
+type OwnRegionName<T extends PlatformTypes> = string extends T['regionName'] ? AnyString : T['regionName'];
+
+/** Any string, which an editor still offers the library's names beside (plain `string` would swallow them; this must stay its own alias). */
+type AnyString = string & {};
+
 
 // ── compute: offers, servers, images ─────────────────────────────────────
 // The shapes every compute provider (ICompute) maps its platform's API onto,
@@ -168,10 +220,15 @@ export interface PlatformTypes {
 // same way on every provider, whatever they rent: a VPS is a server whose
 // offer has no GPU.
 
-export type GpuVendor = 'nvidia' | 'amd';
+/** Who makes a machine's GPUs: one of GPU_VENDORS. */
+export type GpuVendor = (typeof GPU_VENDORS)[number];
 
-/** Which offers or servers: those with GPUs, those without, or both (the default). */
-export type ComputeKind = 'gpu' | 'cpu' | 'any';
+/**
+ * Which offers or servers: those with GPUs, those without, or both (the
+ * default). One of COMPUTE_KINDS, the same on every provider; anything else is
+ * a compile error, and refused at run time where the compiler did not see it.
+ */
+export type ComputeKind = (typeof COMPUTE_KINDS)[number];
 
 /**
  * How a provider bills a server's time, from its docs: the time is counted in
@@ -201,8 +258,12 @@ export type CostEstimate = {
     billedSeconds: number,
 };
 
-/** Something you can rent: a machine type (its GPUs, if any), its price, and where it can be created now. */
-export type Offer<TRaw = unknown> = {
+/**
+ * Something you can rent: a machine type (its GPUs, if any), its price, and
+ * where it can be created now. `TRegion`: the platform's own names for its
+ * places (PlatformTypes.regionName), which its `region` options take back.
+ */
+export type Offer<TRaw = unknown, TRegion extends string = string> = {
     /** The provider's `id`. */
     provider: string,
     /**
@@ -223,9 +284,9 @@ export type Offer<TRaw = unknown> = {
     /** How a server of this offer is billed by time. */
     billing?: Billing,
     /** Where it can be created right now, by the provider's own names for its places (what `region` takes); [] = no stock anywhere. */
-    regions: string[],
+    regions: TRegion[],
     /** `regions`, each with the country it is in where the provider says: what OfferQuery.countries narrows by, the same on every provider. */
-    locations?: Location[],
+    locations?: Array<Location<TRegion>>,
     interruptible?: boolean,
     vcpus?: number,
     memoryGb?: number,
@@ -248,20 +309,29 @@ export type OfferQuery = {
      */
     kind?: ComputeKind,
     vendor?: GpuVendor,
-    /** Canonical model names to keep, e.g. ['L4', 'L40S']. */
-    gpus?: string[],
+    /**
+     * Canonical model names to keep, e.g. ['L4', 'L40S']: the names asap-vps
+     * has (GpuName), the same on every provider. A model it has no name for
+     * goes by the provider's own, as its offers' `gpu` says.
+     */
+    gpus?: Array<GpuName | (string & {})>,
     minVramGb?: number,
     /** Exactly this many GPUs. */
     gpuCount?: number,
     maxPricePerHour?: number,
     /**
-     * Only offers with stock in one of these countries (ISO 3166-1 alpha-2:
-     * COUNTRY_TYPES, or any other code), their `regions` narrowed to the ones
-     * there: the same on every provider, whatever it calls its places. An
-     * offer in stock nowhere is in no country. The list is the places allowed:
+     * Only offers with stock in one of these countries, their `regions`
+     * narrowed to the ones there: the same on every provider, whatever it
+     * calls its places. A country is its ISO 3166-1 alpha-2 code, and
+     * COUNTRY_TYPES has every code ISO gives a country: nothing else passes
+     * ('UK' is no country's: the United Kingdom's is GB). An offer in stock
+     * nowhere is in no country. The list is the places allowed:
      * an empty one allows none (no offer), and only leaving it out allows any.
+     * A question, fair to ask of any provider: one with no place in a country
+     * lists nothing, and that is no error (PlatformTypes.country says where
+     * each has places).
      */
-    countries?: Array<COUNTRY_TYPES | `${COUNTRY_TYPES}` | (string & {})>,
+    countries?: Array<Named<COUNTRY_TYPES>>,
     /** Also return offers with no stock right now (default false). */
     includeUnavailable?: boolean,
     /** Also return interruptible (spot / bid) offers (default false). */
@@ -287,9 +357,10 @@ export type ServerListOptions = {
  * a data center; what `region` takes), and the country it is in (ISO 3166-1
  * alpha-2: 'US', 'FR'), where the provider's name or record says.
  */
-export type Location = {
-    region: string,
-    country?: string,
+export type Location<TRegion extends string = string> = {
+    region: TRegion,
+    /** The country it is in, where the provider says: one ISO 3166-1 gives a code (COUNTRY_TYPES). */
+    country?: Named<COUNTRY_TYPES>,
 };
 
 export type ServerStatus = 'pending' | 'running' | 'stopping' | 'stopped' | 'terminating' | 'terminated' | 'error' | 'unknown';
@@ -305,8 +376,8 @@ export type ServerPort = {
     protocol: PortProtocol | (string & {}),
 };
 
-/** A server; its addresses are named as in CreatedServerData. */
-export type Server<TRaw = unknown> = {
+/** A server; its addresses are named as in CreatedServerData, its place by the platform's own name for it (`TRegion`). */
+export type Server<TRaw = unknown, TRegion extends string = string> = {
     /** The provider's `id`. */
     provider: string,
     id: string,
@@ -318,9 +389,9 @@ export type Server<TRaw = unknown> = {
     /** Canonical GPU model name; undefined for a server without GPUs. */
     gpu?: string,
     gpuCount?: number,
-    region?: string,
-    /** The country `region` is in (ISO 3166-1 alpha-2), where the provider says. */
-    country?: string,
+    region?: TRegion,
+    /** The country `region` is in, where the provider says: one ISO 3166-1 gives a code (COUNTRY_TYPES). */
+    country?: Named<COUNTRY_TYPES>,
     ip?: string,
     ipv6?: string,
     privateIp?: string,
@@ -355,7 +426,7 @@ export type Server<TRaw = unknown> = {
 export type ServerMount = { volumeId: string, path?: string };
 
 /** What every platform's createServer takes: what to rent, where, and what it boots. */
-export type CreateServerBase = {
+export type CreateServerBase<T extends PlatformTypes = PlatformTypes> = {
     name: string,
     /**
      * What to rent: an offer from this provider's listOffers(), whose region, GPU
@@ -364,10 +435,11 @@ export type CreateServerBase = {
     offer: Offer<any> | string,
     /**
      * A region / data center from the offer's `regions`, or a REGION_TYPES
-     * member the provider maps onto one of its own. Default: the offer's first
-     * region with stock (an id string carries none: VM providers then need this).
+     * member the provider maps onto one of its own (RegionChoice). Default: the
+     * offer's first region with stock (an id string carries none: VM providers
+     * then need this).
      */
-    region?: string | REGION_TYPES,
+    region?: RegionChoice<T>,
     /**
      * GPUs per server. Default: the offer's own count. Only a provider whose offers
      * let the count vary (RunPod) takes another; elsewhere it must equal the offer's.
@@ -455,7 +527,7 @@ type Refused<T extends PlatformTypes> = Extract<T['refused'], RefusableOption>;
  * this one honors (one it refuses is not in its type), and fields of its own
  * create request (`providerOptions`).
  */
-export type CreateServerOptions<T extends PlatformTypes = PlatformTypes> = CreateServerBase & Omit<CreateServerExtras<T>, Refused<T>> & {
+export type CreateServerOptions<T extends PlatformTypes = PlatformTypes> = CreateServerBase<T> & Omit<CreateServerExtras<T>, Refused<T>> & {
     /**
      * Fields merged into the platform's create request, as its API names them:
      * typed by the platform's request body (autocompleted per provider), and open
@@ -539,7 +611,7 @@ export type MountPath = {
 export type ImageStatus = 'pending' | 'available' | 'error' | 'unknown';
 
 /** A bootable image of this account's own: pass its `id` as CreateServerOptions.image. */
-export type ServerImage<TRaw = unknown> = {
+export type ServerImage<TRaw = unknown, TRegion extends string = string> = {
     /** The provider's `id`. */
     provider: string,
     id: string,
@@ -548,7 +620,7 @@ export type ServerImage<TRaw = unknown> = {
     /** The platform's own status word(s). */
     providerStatus: string,
     /** Where createServer can boot it; [] = anywhere (a global image). */
-    regions: string[],
+    regions: TRegion[],
     sizeGb?: number,
     /** Epoch ms. */
     createdAt?: number,
@@ -568,7 +640,7 @@ export type ImportImageOptions<T extends PlatformTypes = PlatformTypes> = {
     /** Where the file is: an http(s) URL anyone can read (no login), ending in the file's extension. */
     url: string,
     /** Where it boots: one region (IImageCopy adds more where the platform has it). */
-    region: string | REGION_TYPES,
+    region: RegionChoice<T>,
     /** Fields merged into the platform's import request, as its API names them (DigitalOcean: distribution, description, tags). */
     providerOptions?: Partial<T['imageImportBody']> & Record<string, unknown>,
 } & WaitOptions;
@@ -584,7 +656,7 @@ export type EndpointStatus = 'deploying' | 'ready' | 'deleting' | 'error' | 'unk
  * it is idle) to `maxWorkers`, each billed while it runs. The image serves
  * plain HTTP on `port`: no platform SDK in it.
  */
-export type Endpoint<TRaw = unknown> = {
+export type Endpoint<TRaw = unknown, TRegion extends string = string> = {
     /** The provider's `id`. */
     provider: string,
     id: string,
@@ -600,7 +672,7 @@ export type Endpoint<TRaw = unknown> = {
     /** What each worker runs on: an offer of listEndpointOffers. */
     offerId?: string,
     /** Where its workers run, where the platform pins them. */
-    region?: string,
+    region?: TRegion,
     minWorkers: number,
     maxWorkers: number,
     /** Seconds an idle worker is kept before it is stopped, where the platform says. */
@@ -623,7 +695,7 @@ export type CreateEndpointOptions<T extends PlatformTypes = PlatformTypes> = {
     /** What each worker runs on: an offer of listEndpointOffers, or its id. Default: the cheapest in stock. */
     offer?: Offer<T['endpointOffer']> | string,
     /** Where its workers run (a region, a data center), where the platform pins them. */
-    region?: string | REGION_TYPES,
+    region?: RegionChoice<T>,
     /** Workers kept running when idle: default 0, none, and nothing billed. */
     minWorkers?: number,
     /** The most workers at once: default 1. */
@@ -656,13 +728,13 @@ export type VolumeStatus = 'pending' | 'available' | 'attached' | 'deleting' | '
  * and data stay between servers. A server mounts it when it is created
  * (CreateServerOptions.mounts).
  */
-export type Volume<TRaw = unknown> = {
+export type Volume<TRaw = unknown, TRegion extends string = string> = {
     /** The provider's `id`. */
     provider: string,
     id: string,
     name: string,
     /** Where it is: only a server in this region (zone, data center) can mount it. */
-    region: string,
+    region: TRegion,
     /** A filesystem many servers mount at once (true), or a block device one server holds at a time. */
     shared: boolean,
     /** GB; undefined where it grows as it fills (Lambda's filesystems). */
@@ -688,7 +760,7 @@ export type Volume<TRaw = unknown> = {
 export type CreateVolumeOptions<T extends PlatformTypes = PlatformTypes> = {
     name: string,
     /** Where the servers that mount it will be: a region of an offer's `regions`, or a REGION_TYPES member the provider maps onto one of its own. */
-    region: string | REGION_TYPES,
+    region: RegionChoice<T>,
     /** Fields merged into the platform's volume create request, as its API names them. */
     providerOptions?: Partial<T['volumeBody']> & Record<string, unknown>,
 } & T['volumeSize'] & T['volumeKind'] & WaitOptions;

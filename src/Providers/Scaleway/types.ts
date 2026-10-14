@@ -17,8 +17,11 @@
 // Sizes are bytes. A GPU's memory and an Instance's RAM are binary (24 GiB:
 // 25769803776), volume sizes decimal (a 10 GB volume: 10000000000).
 
+import type { COUNTRY_TYPES } from '../../constants';
 import type { MountPath, ProviderParams, VolumeSize } from '../../types';
+import type { RegionPick } from '../../Core/utils/places';
 import type { SCALEWAY_REFUSED } from './mappers';
+import type { SCALEWAY_PLACES } from './places';
 
 // ── configuration ─────────────────────────────────────────────────────────
 
@@ -69,6 +72,12 @@ export type ScalewayZone = typeof SCALEWAY_ZONES[number];
 
 export const SCALEWAY_REGIONS = ['fr-par', 'nl-ams', 'pl-waw', 'it-mil'] as const;
 export type ScalewayRegion = typeof SCALEWAY_REGIONS[number];
+
+/** Scaleway's own names for its places: a zone (servers, images, block volumes) or a region (filesystems, endpoints). */
+export type ScalewayRegionName = ScalewayZone | ScalewayRegion;
+
+/** The countries Scaleway's regions are in, as its reference data has them (SCALEWAY_PLACES): its pick of COUNTRY_TYPES. */
+export type ScalewayCountry = (typeof SCALEWAY_PLACES)[number]['country'];
 
 // ── Instance API v1: enums ────────────────────────────────────────────────
 
@@ -588,6 +597,12 @@ export type ScalewayTypes = {
         | { shared: true, providerOptions?: Partial<ScalewayCreateFileSystemBody> & Record<string, unknown> },
     /** A path for a shared volume (a filesystem); a block volume is a disk the server mounts itself. */
     mount: MountPath,
+    /** Its pick of the library's regions: its regions' and zones' (SCALEWAY_ENUMS.regions: Paris, Amsterdam, Warsaw, Milan, and their zones). */
+    region: RegionPick<(typeof SCALEWAY_PLACES)[number]>,
+    /** Its own names for its places: a zone (servers, images, block volumes), or a region (filesystems, endpoints). */
+    regionName: ScalewayRegionName,
+    /** The countries its regions are in. */
+    country: ScalewayCountry,
 };
 
 // ── Serverless Containers API v1 (https://www.scaleway.com/en/developers/api/serverless-containers/v1) ──

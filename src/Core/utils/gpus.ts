@@ -6,7 +6,7 @@ import type { GpuVendor } from '../../types';
 
 export type GpuModel = { name: string, vendor: GpuVendor, vramGb: number, arch: string };
 
-const MODELS: Array<GpuModel & { re: RegExp }> = [
+const MODELS = [
     { name: 'RTX 2000 Ada', vendor: 'nvidia', vramGb: 16, arch: 'sm89', re: /rtx[\s_-]*2000[\s_-]*(sff[\s_-]*)?ada/i },
     { name: 'RTX 4000 Ada', vendor: 'nvidia', vramGb: 20, arch: 'sm89', re: /rtx[\s_-]*4000[\s_-]*(sff[\s_-]*)?ada/i },
     { name: 'RTX 6000 Ada', vendor: 'nvidia', vramGb: 48, arch: 'sm89', re: /rtx[\s_-]*6000[\s_-]*ada/i },
@@ -41,7 +41,10 @@ const MODELS: Array<GpuModel & { re: RegExp }> = [
     { name: 'MI325X', vendor: 'amd', vramGb: 256, arch: 'gfx942', re: /mi[\s_-]*325[\s_-]*x/i },
     { name: 'MI350X', vendor: 'amd', vramGb: 288, arch: 'gfx950', re: /mi[\s_-]*350[\s_-]*x/i },
     { name: 'MI355X', vendor: 'amd', vramGb: 288, arch: 'gfx950', re: /mi[\s_-]*355[\s_-]*x/i },
-];
+] as const satisfies ReadonlyArray<GpuModel & { re: RegExp }>;
+
+/** The models asap-vps has one name for: what an offer's `gpu` reads as for them, and what OfferQuery.gpus offers. */
+export type GpuName = (typeof MODELS)[number]['name'];
 
 export function canonicalGpu(raw: string | null | undefined): GpuModel | null {
     const s = String(raw ?? '').trim();

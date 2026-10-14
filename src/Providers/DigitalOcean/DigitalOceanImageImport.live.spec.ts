@@ -19,7 +19,7 @@ import {
 } from '../../testing/live';
 import type { Offer, Server, ServerImage } from '../../types';
 import { DigitalOcean } from './DigitalOcean';
-import type { DigitalOceanDropletData, DigitalOceanImageData, DigitalOceanSizeData } from './types';
+import type { DigitalOceanDropletData, DigitalOceanImageData, DigitalOceanRegionName, DigitalOceanSizeData } from './types';
 
 const requested = liveRequested('digitalocean-cpu');
 const { freeOnly, maxPricePerHour } = liveOptions();
@@ -35,9 +35,9 @@ const WAIT = { intervalMs: 5000, timeoutMs: 15 * 60_000 };
     let watchdog: { doneFile: string } | undefined;
     let refused = false;
     let keyIds = new Set<string>();
-    let offer: Offer<DigitalOceanSizeData>;
-    let image: ServerImage<DigitalOceanImageData>;
-    let booted: ProvisionResult<Server<DigitalOceanDropletData>>;
+    let offer: Offer<DigitalOceanSizeData, DigitalOceanRegionName>;
+    let image: ServerImage<DigitalOceanImageData, DigitalOceanRegionName>;
+    let booted: ProvisionResult<Server<DigitalOceanDropletData, DigitalOceanRegionName>>;
 
     beforeAll(async () => {
         loadCredentials();
@@ -94,7 +94,7 @@ const WAIT = { intervalMs: 5000, timeoutMs: 15 * 60_000 };
         }, (pipeline) => void pipeline.addStep(new RunCommandStep([
             '. /etc/os-release && echo "os=$ID $VERSION_ID"',
             'cloud-init status --wait >/dev/null 2>&1; cloud-init status',
-        ], 'imported'))) as ProvisionResult<Server<DigitalOceanDropletData>>;
+        ], 'imported'))) as ProvisionResult<Server<DigitalOceanDropletData, DigitalOceanRegionName>>;
         const out = booted.setupResults.map((r) => r.output ?? '').join('\n');
         expect(out).toContain('os=ubuntu 24.04');
         expect(out).toMatch(/status: done/);

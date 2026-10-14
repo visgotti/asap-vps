@@ -3,11 +3,12 @@
 // machine) as a volume, an account key as a key, its billing, and what of a
 // query Vast's own search can filter. Pure functions of the raw records, typed by VastTypes.
 
-import { canonicalGpu, cudaVersion, gpuName, gpuVendor, located, parseSSHPublicKey, sshKeyFingerprint } from '../../Core/utils';
+import type { COUNTRY_TYPES } from '../../constants';
+import { asCountry, canonicalGpu, cudaVersion, gpuName, gpuVendor, located, parseSSHPublicKey, sshKeyFingerprint } from '../../Core/utils';
 import type {
     Billing, InitializedSSHKeyData, Offer, OfferQuery, RefusableOption, Server, ServerImage, ServerMount, ServerStatus, SSHEndpoint, Volume, VolumeStatus,
 } from '../../types';
-import type { VastImage, VastInstance, VastOffer, VastSnapshotRepository, VastSSHKeyData, VastVolume } from './types';
+import type { VastImage, VastInstance, VastOffer, VastRegionName, VastSnapshotRepository, VastSSHKeyData, VastVolume } from './types';
 
 export const VAST_ID = 'vast';
 
@@ -22,16 +23,16 @@ export const VAST_REFUSED = ['tags', 'volume'] as const satisfies readonly Refus
 /** A machine as a region (`machine:<id>`): where a volume is, and the place of an offer finer than its geolocation. */
 export const MACHINE_REGION = 'machine:';
 
-export function machineRegion(machineId: number): string {
+export function machineRegion(machineId: number): `machine:${number}` {
     return `${MACHINE_REGION}${machineId}`;
 }
 
-/** The machine a region names (`machine:<id>`), else undefined. */
-/** The country a machine is in: the code its location ends with ('Texas, US', 'Japan, JP'); undefined where Vast gives none. */
-export function countryOf(geolocation: string | null | undefined): string | undefined {
-    return /(?:^|, )([A-Z]{2})$/.exec(geolocation ?? '')?.[1];
+/** The country a machine is in: the code its location ends with ('Texas, US', 'Japan, JP'); undefined where Vast gives none, or a code ISO gives no country. */
+export function countryOf(geolocation: string | null | undefined): COUNTRY_TYPES | undefined {
+    return asCountry(/(?:^|, )([A-Z]{2})$/.exec(geolocation ?? '')?.[1]);
 }
 
+/** The machine a region names (`machine:<id>`), else undefined. */
 export function machineOf(region: string): number | undefined {
     const m = /^machine:(\d+)$/.exec(region.trim());
     return m ? Number(m[1]) : undefined;
@@ -57,7 +58,7 @@ export const VAST_BILLING: Billing = Object.freeze({ incrementSeconds: 1, minimu
 export const RELAUNCH_GRACE_MS = 10 * 60_000;
 
 /** An ask as an offer; an interruptible one's id carries the bid to send (`<ask>:bid:<price>`). */
-export function toOffer(a: VastOffer, interruptible: boolean): Offer<VastOffer> {
+export function toOffer(a: VastOffer, interruptible: boolean): Offer<VastOffer, VastRegionName> {
     const raw = String(a.gpu_name ?? '').replace(/_/g, ' ');
     const canon = canonicalGpu(raw);
     // Vast reports USABLE memory: within 10% below the model's size is that model's size.
@@ -77,7 +78,7 @@ export function toOffer(a: VastOffer, interruptible: boolean): Offer<VastOffer> 
         pricePerHour: bid ?? Number(a.dph_total),
         billing: VAST_BILLING,
         // Where it is, and the machine it is (where a volume of it is: `machine:<id>`).
-        ...located(a.rentable === false ? [] : [String(a.geolocation ?? 'unknown'), ...(a.machine_id !== undefined ? [machineRegion(a.machine_id)] : [])], () => countryOf(a.geolocation)),
+        ...located<VastRegionName>(a.rentable === false ? [] : [String(a.geolocation ?? 'unknown') as VastRegionName, ...(a.machine_id !== undefined ? [machineRegion(a.machine_id)] : [])], () => countryOf(a.geolocation)),
         interruptible,
         vcpus: a.cpu_cores_effective,
         memoryGb: a.cpu_ram ? Math.round(a.cpu_ram / 1024) : undefined,
@@ -133,7 +134,7 @@ export function askedPorts(i: VastInstance): Array<{ privatePort: number, protoc
     });
 }
 
-export function toServer(i: VastInstance, relaunchedAt?: number): Server<VastInstance> {
+export function toServer(i: VastInstance, relaunchedAt?: number): Server<VastInstance, VastRegionName> {
     const status = instanceStatus(i, relaunchedAt);
     const ip = i.public_ipaddr ? String(i.public_ipaddr).trim() : undefined;
     const ports = Object.entries(i.ports ?? {}).flatMap(([key, maps]) => {
@@ -150,7 +151,7 @@ export function toServer(i: VastInstance, relaunchedAt?: number): Server<VastIns
         providerStatus: `${i.actual_status ?? 'none'}/${i.cur_state ?? '?'}${i.status_msg ? `: ${String(i.status_msg).slice(0, 120)}` : ''}`,
         gpu: i.gpu_name ? canonicalGpu(i.gpu_name.replace(/_/g, ' '))?.name ?? i.gpu_name : undefined,
         gpuCount: i.num_gpus ?? undefined,
-        region: i.geolocation ?? undefined,
+        region: (i.geolocation ?? undefined) as VastRegionName | undefined,
         ...(countryOf(i.geolocation) ? { country: countryOf(i.geolocation) } : {}),
         ip,
         ...(ports.length ? { ports } : {}),
@@ -186,7 +187,7 @@ export function instanceMounts(i: VastInstance): ServerMount[] {
 }
 
 /** A volume as a volume: its region its machine; attached while an instance mounts it. */
-export function toVolume(v: VastVolume): Volume<VastVolume> {
+export function toVolume(v: VastVolume): Volume<VastVolume, VastRegionName> {
     const serverIds = (v.instances ?? []).map((x) => (typeof x === 'object' ? x?.id : x)).filter((x): x is number => typeof x === 'number').map(String);
     return {
         provider: VAST_ID,
@@ -211,7 +212,7 @@ export const SNAPSHOT_TAG = /^instance_(\d+)_at_/;
 export const IMAGE_TAG = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 
 /** A snapshot, a tag of the snapshot repository, as an image (with its manifest's digest and size, where it was read). It boots anywhere. */
-export function toImage(r: VastSnapshotRepository, tag: string, manifest?: { digest: string, json: { layers?: Array<{ size?: number }> } }): ServerImage<VastImage> {
+export function toImage(r: VastSnapshotRepository, tag: string, manifest?: { digest: string, json: { layers?: Array<{ size?: number }> } }): ServerImage<VastImage, VastRegionName> {
     const reference = `${r.server}/${r.repository}:${tag}`;
     const size = manifest ? (manifest.json.layers ?? []).reduce((sum, l) => sum + Number(l.size ?? 0), 0) : undefined;
     return {

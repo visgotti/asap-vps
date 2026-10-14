@@ -58,7 +58,7 @@ describe('the published package', () => {
         expect(compiled('tsconfig.types.json')).toEqual(compiled('tsconfig.build.json'));
         const dts = declarationOf('tsconfig.types.json', 'src/capabilities.ts');
         expect(docComments(dts)).toBe(docComments(readFileSync(join(root, 'src/capabilities.ts'), 'utf8')));
-        expect(dts).toContain("    /** null when the provider has no such server. */\n    getServer(id: string): Promise<Server<T['server']> | null>;");
+        expect(dts).toContain("    /** null when the provider has no such server. */\n    getServer(id: string): Promise<Server<T['server'], T['regionName']> | null>;");
         expect(readFileSync(join(root, 'site/scripts/build-types.mjs'), 'utf8')).toContain("'-p', 'tsconfig.types.json', '--outDir', DTS,");
     });
 

@@ -10,6 +10,7 @@ import { CapacityError, NotFoundError, NotSupportedError, ProviderError, QuotaEr
 import { fakeDigitalOcean } from '../../testing/fakes/digitalocean';
 import { testPublicKey } from '../../testing/fakes/util';
 import { DigitalOcean } from './DigitalOcean';
+import type { DigitalOceanTypes } from './types';
 
 const noSleep = async () => {};
 const fast = { intervalMs: 0, timeoutMs: 5000 };
@@ -20,7 +21,7 @@ function made(o: Parameters<typeof fakeDigitalOcean>[0] = {}) {
     return { fake, vps };
 }
 
-const droplet = { name: 'web-1', offer: 's-8vcpu-16gb', region: 'nyc1', image: MACHINE_TYPES.UBUNTU_22 };
+const droplet = { name: 'web-1', offer: 's-8vcpu-16gb', region: 'nyc1' as const, image: MACHINE_TYPES.UBUNTU_22 };
 
 describe('DigitalOcean as a VPS host', () => {
     it('offers its plain sizes (every page) as machines without GPUs, and lists the account keys (SHA256 fingerprints)', async () => {
@@ -47,7 +48,7 @@ describe('DigitalOcean as a VPS host', () => {
         const { fake, vps } = made({ bootReads: 3 });
         const key = await vps.addSSHKey(testPublicKey(), 'deploy');
         const before = fake.liveServers();
-        const created = await vps.createServer({ ...droplet, region: REGION_TYPES.NYC_1, sshKeyIds: [key.id] });
+        const created = await vps.createServer({ ...droplet, region: REGION_TYPES.US_NEW_YORK_1, sshKeyIds: [key.id] });
         expect(created.status).toBe('pending');
         const running = await vps.waitUntilRunning(created.id, fast);
         expect(running).toMatchObject({ id: created.id, ip: expect.stringMatching(/^203\.0\.113\./), privateIp: '10.10.0.2', gpu: undefined });
@@ -62,13 +63,15 @@ describe('DigitalOcean as a VPS host', () => {
     it('maps the DigitalOcean members of REGION_TYPES and MACHINE_TYPES, and refuses the others before anything is created', async () => {
         const { fake, vps } = made();
         // The regions the fake has this size in.
-        const regions: Array<[REGION_TYPES, string]> = [[REGION_TYPES.TORONTO, 'tor1'], [REGION_TYPES.NYC, 'nyc1'], [REGION_TYPES.NYC_1, 'nyc1']];
+        const regions: Array<[DigitalOceanTypes['region'], string]> = [[REGION_TYPES.CANADA_TORONTO, 'tor1'], [REGION_TYPES.US_NEW_YORK, 'nyc1'], [REGION_TYPES.US_NEW_YORK_1, 'nyc1']];
         for (const [region, slug] of regions) {
             await vps.deleteServer((await vps.createServer({ ...droplet, region, image: MACHINE_TYPES.UBUNTU_24 })).id);
             expect(fake.calls.filter((c) => c.method === 'POST' && c.path === '/v2/droplets').pop()?.body).toMatchObject({ region: slug, image: 'ubuntu-24-04-x64' });
         }
         const before = fake.liveServers();
-        await expect(vps.createServer({ ...droplet, region: REGION_TYPES.PARIS })).rejects.toThrow(NotSupportedError);
+        // A compile error on DigitalOcean's own type, and refused at run time where the compiler did not see it.
+        // @ts-expect-error DigitalOcean has no Paris
+        await expect(vps.createServer({ ...droplet, region: REGION_TYPES.FRANCE_PARIS })).rejects.toThrow(NotSupportedError);
         expect(fake.liveServers()).toBe(before);
     });
 

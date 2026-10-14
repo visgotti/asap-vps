@@ -21,7 +21,7 @@ import {
 import { AuditedScaleway, describeScalewayAudit } from '../../testing/scalewayAudit';
 import type { Offer, Server, Volume } from '../../types';
 import { Scaleway } from './Scaleway';
-import type { ScalewayFileSystem, ScalewayOfferRaw, ScalewayServer } from './types';
+import type { ScalewayFileSystem, ScalewayOfferRaw, ScalewayRegionName, ScalewayServer } from './types';
 
 const requested = liveRequested('scaleway-vps');
 const { freeOnly } = liveOptions();
@@ -40,17 +40,17 @@ let host: AuditedScaleway | undefined;
     let refused = false;
     let volumeIds = new Set<string>();
     let keyIds = new Set<string>();
-    let offer: Offer<ScalewayOfferRaw>;
-    let zone: string;
-    let share: Volume<ScalewayFileSystem>;
-    const servers: Array<ProvisionResult<Server<ScalewayServer>>> = [];
+    let offer: Offer<ScalewayOfferRaw, ScalewayRegionName>;
+    let zone: ScalewayRegionName;
+    let share: Volume<ScalewayFileSystem, ScalewayRegionName>;
+    const servers: Array<ProvisionResult<Server<ScalewayServer, ScalewayRegionName>>> = [];
     const p = () => host!;
     const provision = (name: string, commands: string[]) => new ServerProvisioner(p()).provision({
         serverOptions: { name, offer, region: zone, mounts: [{ volume: share, path: PATH }] },
         sshKeyName: name,
         wait: WAIT,
         sshRetry: { maxRetries: 30, retryTimeout: 10_000 },
-    }, (pipeline) => void pipeline.addStep(new RunCommandStep(commands, 'share'))) as Promise<ProvisionResult<Server<ScalewayServer>>>;
+    }, (pipeline) => void pipeline.addStep(new RunCommandStep(commands, 'share'))) as Promise<ProvisionResult<Server<ScalewayServer, ScalewayRegionName>>>;
     /** Until cloud-init is done and the filesystem is mounted: its filesystem type, or a failure on stderr. */
     const mounted = `cloud-init status --wait >/dev/null 2>&1 || true; for i in $(seq 1 60); do findmnt -n ${PATH} >/dev/null && break; sleep 2; done; `
         + `findmnt -n -o FSTYPE ${PATH} || { echo "nothing is mounted at ${PATH}: $(tail -5 /var/log/cloud-init-output.log)" >&2; exit 1; }`;

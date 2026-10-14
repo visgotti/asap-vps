@@ -17,6 +17,9 @@ import { CapacityError, NotFoundError, NotSupportedError, ProviderError, QuotaEr
 import { fakeDigitalOcean } from '../../testing/fakes/digitalocean';
 import { json } from '../../testing/fakes/util';
 import { DigitalOcean } from './DigitalOcean';
+import { DIGITALOCEAN_ENUMS } from './mappers';
+import type { RegionChoice } from '../../types';
+import type { DigitalOceanTypes } from './types';
 
 const noSleep = async () => {};
 const fast = { intervalMs: 0, timeoutMs: 5000 };
@@ -127,13 +130,14 @@ describe('DigitalOcean API facts', () => {
     };
     const running = async (p: DigitalOcean, id: string) => p.waitUntilRunning(id, { intervalMs: 0, timeoutMs: 2000 });
 
-    it('San Francisco is sfo3, the datacenter that takes new droplets; the legacy sfo1 only by its own name', async () => {
+    it('San Francisco is sfo2, its first datacenter open to new resources; the legacy sfo1 has no region of the library\'s, and goes by its own name', async () => {
         const { p, fake } = make();
-        fake.state.sizes.find((x) => x.slug === 's-8vcpu-16gb')!.regions.push('sfo3', 'sfo1');
-        const regions = async (region: REGION_TYPES) => (await p.createServer({ name: `in-${region}`.replace(/_/g, '-'), offer: 's-8vcpu-16gb', region })).region;
-        expect(await regions(REGION_TYPES.SAN_FRANCISCO)).toBe('sfo3');
-        expect(await regions(REGION_TYPES.SAN_FRANCISCO_3)).toBe('sfo3');
-        expect(await regions(REGION_TYPES.SAN_FRANCISCO_1)).toBe('sfo1');
+        fake.state.sizes.find((x) => x.slug === 's-8vcpu-16gb')!.regions.push('sfo2', 'sfo3', 'sfo1');
+        const regions = async (region: RegionChoice<DigitalOceanTypes>) => (await p.createServer({ name: `in-${region}`.replace(/_/g, '-'), offer: 's-8vcpu-16gb', region })).region;
+        expect(await regions(REGION_TYPES.US_SAN_FRANCISCO)).toBe('sfo2');
+        expect(await regions(REGION_TYPES.US_SAN_FRANCISCO_3)).toBe('sfo3');
+        expect(await regions('sfo1')).toBe('sfo1');
+        expect(Object.values(DIGITALOCEAN_ENUMS.regions).filter((d) => d === 'sfo1' || d === 'ams2')).toEqual([]);
     });
 
     it('a droplet names its GPU as its offer does, a model asap-vps does not know included', async () => {
@@ -509,11 +513,17 @@ describe('DigitalOcean images (droplet snapshots)', () => {
         await p.copyImage(img.id, ['tor1'], fast);
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path === `/v2/images/${img.id}/actions`)).toHaveLength(1);
         // A region by the library's own name is sent as DigitalOcean's slug; one it is in already (Toronto) is no transfer.
-        const more = await p.copyImage(img.id, [REGION_TYPES.NYC_3, REGION_TYPES.TORONTO], fast);
+        const more = await p.copyImage(img.id, [REGION_TYPES.US_NEW_YORK_3, REGION_TYPES.CANADA_TORONTO], fast);
         expect([...more.regions].sort()).toEqual(['nyc2', 'nyc3', 'tor1']);
         expect(fake.calls.filter((c) => c.method === 'POST' && c.path === `/v2/images/${img.id}/actions`).map((c) => c.body.region)).toEqual(['nyc2', 'nyc3']);
-        // A name DigitalOcean has no region by is its refusal, not a copy to nowhere.
+        // A name DigitalOcean has no region by is its refusal, not a copy to nowhere (and no datacenter's name to its types).
+        // @ts-expect-error 'mars1' is no DigitalOcean datacenter
         await expect(p.copyImage(img.id, ['mars1'], fast)).rejects.toThrow(/mars1 is not a valid region/);
+        // A region of the library's DigitalOcean has none of is refused before the image is read, as it is for one that is not there.
+        const asked = fake.calls.length;
+        // @ts-expect-error DigitalOcean has no Paris
+        await expect(p.copyImage('999999', [REGION_TYPES.FRANCE_PARIS], fast)).rejects.toThrow('digitalocean: region "france_paris" (REGION_TYPES has no digitalocean region by that name) is not supported');
+        expect(fake.calls).toHaveLength(asked);
     });
 
     it('lists every private image of the account, the ones that are not the caller\'s included', async () => {
@@ -611,7 +621,7 @@ describe('DigitalOcean droplet actions: one at a time, its create the first', ()
         const fake = fakeDigitalOcean(o);
         return { fake, p: new DigitalOcean({ apiKey: 'do-test', fetchImpl: fake.fetchImpl, sleep: noSleep }) };
     };
-    const server = { offer: 'gpu-4000adax1-20gb', region: 'tor1' };
+    const server = { offer: 'gpu-4000adax1-20gb', region: 'tor1' as const };
 
     it('an action asked for while the droplet is being created waits for the create to end (DigitalOcean refuses it meanwhile, and starts nothing)', async () => {
         const { fake, p } = make({ bootReads: 3 });
@@ -672,7 +682,7 @@ describe('DigitalOcean image import (a custom image from a URL)', () => {
 
     it('imports the file, waits until DigitalOcean has it, and boots a droplet from it in its region', async () => {
         const { fake, p } = make();
-        const img = await p.importImage({ name: 'noble-min', url: URL_OK, region: REGION_TYPES.TORONTO, providerOptions: { distribution: 'Ubuntu' }, ...fast });
+        const img = await p.importImage({ name: 'noble-min', url: URL_OK, region: REGION_TYPES.CANADA_TORONTO, providerOptions: { distribution: 'Ubuntu' }, ...fast });
         expect(fake.calls.find((c) => c.method === 'POST' && c.path === '/v2/images')?.body).toEqual({ name: 'noble-min', url: URL_OK, region: 'tor1', distribution: 'Ubuntu' });
         expect(img).toMatchObject({ provider: 'digitalocean', name: 'noble-min', status: 'available', providerStatus: 'available', regions: ['tor1'], sizeGb: 2.36 });
         expect(img.raw).toMatchObject({ type: 'custom', distribution: 'Ubuntu' });
@@ -886,7 +896,7 @@ describe('DigitalOcean Block Storage volumes', () => {
             return r;
         }) as typeof fetch;
         const p = new DigitalOcean({ apiKey: 'do-test', fetchImpl: wrapped, sleep: noSleep });
-        const o = { offer: 'gpu-4000adax1-20gb', region: 'tor1' };
+        const o = { offer: 'gpu-4000adax1-20gb', region: 'tor1' as const };
 
         const kept = await p.createServer({ name: 'kept', ...o });
         mode = 'kept';
@@ -1006,7 +1016,7 @@ describe('DigitalOcean Block Storage volumes', () => {
         const { fake, p } = make();
         const vol = await p.createVolume({ name: 'models', region: 'tor1', sizeGb: 10 });
         const far = await p.createVolume({ name: 'far', region: 'nyc1', sizeGb: 10 });
-        const o = { name: 'gpu-1', offer: 'gpu-4000adax1-20gb', region: 'tor1' };
+        const o = { name: 'gpu-1', offer: 'gpu-4000adax1-20gb', region: 'tor1' as const };
         // Not in its type even through a cast; code typed for any provider (ICompute) may still pass it.
         const generic: ICompute = p;
         await expect(generic.createServer({ ...o, mounts: [{ volume: vol, path: '/models' }] })).rejects.toThrow(NotSupportedError);
@@ -1068,7 +1078,7 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
         const block = await p.createVolume({ name: 'scratch', region: 'nyc2', sizeGb: 10 });
         const share = await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 50, shared: true });
         const far = await p.createVolume({ name: 'far', region: 'atl1', sizeGb: 50, shared: true });
-        const o = { name: 'x', offer: 'gpu-6000adax1-48gb', region: 'nyc2' };
+        const o = { name: 'x', offer: 'gpu-6000adax1-48gb', region: 'nyc2' as const };
         await expect(p.createServer({ ...o, mounts: [{ volume: block, path: '/data' }] })).rejects.toThrow(/a mount path for a Block Storage volume/);
         await expect(p.createServer({ ...o, mounts: [{ volume: far.id }] })).rejects.toThrow(/share far is in atl1: a droplet in nyc2 cannot mount it/);
         await expect(p.createServer({ ...o, mounts: [{ volume: share.id, path: 'data' }] })).rejects.toThrow(/mount path "data" is not absolute/);
@@ -1102,7 +1112,7 @@ describe('DigitalOcean shared volumes: Network File Storage shares, mounted over
         fake.state.vpcs.push({ id: second, name: 'second-nyc2', region: 'nyc2', default: false });
         const models = await p.createVolume({ name: 'models', region: 'nyc2', sizeGb: 50, shared: true, providerOptions: { vpc_ids: [vpc, second] } });
         const data = await p.createVolume({ name: 'data', region: 'nyc2', sizeGb: 50, shared: true, providerOptions: { vpc_ids: [vpc, second] } });
-        const o = { offer: 'gpu-6000adax1-48gb', region: 'nyc2', mounts: [{ volume: models.id }, { volume: data.id }] };
+        const o = { offer: 'gpu-6000adax1-48gb', region: 'nyc2' as const, mounts: [{ volume: models.id }, { volume: data.id }] };
         await p.createServer({ ...o, name: 'x' });
         await p.createServer({ ...o, name: 'y', providerOptions: { vpc_uuid: second } });
         expect(creates(fake).map((c) => c.vpc_uuid)).toEqual([vpc, second]);

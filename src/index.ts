@@ -75,6 +75,7 @@ export {
     authorizeKeysScript,
     canonicalGpu,
     compareCudaVersions,
+    computeKind,
     CONTAINER_KEEP_ALIVE,
     containerBootScript,
     containerImageOf,
@@ -113,4 +114,4 @@ export {
     VM_CONTAINER_NAME,
     withUserData,
 } from './Core/utils';
-export type { ApiEndpoint, FetchImpl, GpuModel, HttpMethod, HttpResult, ImageRef, Manifest, ParsedSSHPublicKey, RemoteUser, RequestInfo, RequestOptions, Sleep } from './Core/utils';
+export type { ApiEndpoint, FetchImpl, GpuModel, GpuName, HttpMethod, HttpResult, ImageRef, Manifest, ParsedSSHPublicKey, RemoteUser, RequestInfo, RequestOptions, Sleep } from './Core/utils';

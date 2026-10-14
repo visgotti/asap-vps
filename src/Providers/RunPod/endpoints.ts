@@ -19,6 +19,8 @@ export const RUNPOD_ENDPOINTS = {
         docs: `${DOCS}/catalog/list-gpu-types`,
     },
     /** Stock with include=AVAILABILITY, for the product and vCPU count asked. */
+    /** Every data center, with its name and its part of the world: what RUNPOD_DATA_CENTERS is held to (npm run places:check). */
+    listDataCenters: { operationId: 'listDataCenters', method: 'GET', path: '/v2/catalog/datacenters', docs: `${DOCS}/catalog/list-data-centers` },
     listCpuTypes: { operationId: 'listCpuTypes', method: 'GET', path: '/v2/catalog/cpus', query: ['include', 'product', 'vcpuCount'], docs: `${DOCS}/catalog/list-cpu-types` },
 
     // ── Pods ──
