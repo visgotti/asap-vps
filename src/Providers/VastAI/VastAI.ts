@@ -16,13 +16,13 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { BaseProvider, ResolvedMount } from '../../Core/BaseProvider';
 import {
-    compareCudaVersions, countryCodes, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey,
-    pickSSHKeys, RegistryClient, registryOf, timeLeft, waitOf,
+    compareCudaVersions, computeKind, countryCodes, cudaVersion, deleteRegistryImage, filterOffers, findSSHKey, http, isKind, parseImageRef, parseSSHPublicKey,
+    pickSSHKeys, readOfferQuery, RegistryClient, registryOf, timeLeft, waitOf,
 } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
 import type {
-    CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, LogOptions, Offer, OfferQuery, RegistryAuth, ResolvedContainer, Server, ServerImage, ServerListOptions, Volume,
-    WaitOptions,
+    CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, LogOptions, Offer, OfferQuery, RegionChoice, RegistryAuth, ResolvedContainer, Server, ServerImage,
+    ServerListOptions, Volume, WaitOptions,
 } from '../../types';
 import { VastApi } from './api';
 import {
@@ -30,7 +30,7 @@ import {
     VAST_ID, VAST_MOUNT_PATH, VAST_REFUSED, VOLUME_NAME,
 } from './mappers';
 import type {
-    VastAIParams, VastImage, VastInstance, VastOffer, VastSnapshotRepository, VastSSHKeyData, VastTypes, VastVolume, VastVolumeInfo, VastVolumeOffer,
+    VastAIParams, VastImage, VastInstance, VastOffer, VastRegionName, VastSnapshotRepository, VastSSHKeyData, VastTypes, VastVolume, VastVolumeInfo, VastVolumeOffer,
 } from './types';
 
 /** What Vast can do, and how. */
@@ -81,11 +81,10 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
     }
 
     /** Each offer is one machine; its only region is where that machine is. */
-    public async listOffers(query: OfferQuery = {}): Promise<Offer<VastOffer>[]> {
-        // Every ask is a GPU machine: a question about machines without them has no answer here.
-        if (query.kind === 'cpu' || query.gpuCount === 0) return [];
-        // No country allowed is no offer: there is nothing to search for (a code that is none is refused all the same).
-        if (query.countries !== undefined && countryCodes(query.countries).size === 0) return [];
+    public async listOffers(query: OfferQuery = {}): Promise<Offer<VastOffer, VastRegionName>[]> {
+        // Every ask is a GPU machine: a question about machines without them, or no country allowed, has no answer here.
+        const read = readOfferQuery(query);
+        if (read.matchesNone || read.kind === 'cpu' || query.gpuCount === 0) return [];
         const offers = (await this.search('ondemand', query)).map((a) => toOffer(a, false));
         if (query.includeInterruptible) offers.push(...(await this.search('bid', query)).map((a) => toOffer(a, true)));
         return filterOffers(offers, query);
@@ -106,7 +105,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
      * instance (refused before anything is rented), at the mount's path
      * (default /data).
      */
-    public async createServer(o: CreateServerOptions<VastTypes>): Promise<Server<VastInstance>> {
+    public async createServer(o: CreateServerOptions<VastTypes>): Promise<Server<VastInstance, VastRegionName>> {
         this.rejectOptions(o, VAST_REFUSED);
         // The offer is one machine: its GPUs are fixed, and its place is where it is (a region asked for must be one of its).
         const resolved = this.resolveOffer(o);
@@ -173,7 +172,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
      * (askedPorts) has its public one, and the server waitUntilRunning returns
      * is one that says where it is reached, whichever way Vast reports it.
      */
-    protected override comingUp(server: Server<VastInstance>): boolean {
+    protected override comingUp(server: Server<VastInstance, VastRegionName>): boolean {
         const mapped = new Set((server.ports ?? []).map((p) => `${p.privatePort}/${p.protocol}`));
         return askedPorts(server.raw).some((p) => !mapped.has(`${p.privatePort}/${p.protocol}`));
     }
@@ -183,7 +182,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
      * the single read, and the volumes it mounts, which only the list has
      * (observed 2026-10-06). One the list does not have yet is read alone.
      */
-    public async getServer(id: string): Promise<Server<VastInstance> | null> {
+    public async getServer(id: string): Promise<Server<VastInstance, VastRegionName> | null> {
         if (!/^\d+$/.test(id)) return null;
         const listed = await this.api.call<{ instances?: VastInstance[] }>('GET', `/api/v1/instances/?select_filters=${encodeURIComponent(JSON.stringify({ id: { eq: Number(id) } }))}`);
         const found = (listed?.instances ?? []).find((i) => String(i.id) === id);
@@ -193,14 +192,15 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
     }
 
     /** The account's instances (every rental is a GPU machine). */
-    public async listServers(options: ServerListOptions = {}): Promise<Server<VastInstance>[]> {
-        const out: Server<VastInstance>[] = [];
+    public async listServers(options: ServerListOptions = {}): Promise<Server<VastInstance, VastRegionName>[]> {
+        const kind = computeKind(options.kind);
+        const out: Server<VastInstance, VastRegionName>[] = [];
         let token = '';
         // Keyset pages of at most 25.
         for (let page = 0; page < 400; page++) {
             const body = await this.api.call<{ instances?: VastInstance[], next_token?: string | null }>(
                 'GET', `/api/v1/instances/?limit=25${token ? `&after_token=${encodeURIComponent(token)}` : ''}`);
-            out.push(...(body.instances ?? []).filter((i) => isKind(i.num_gpus ?? 1, options.kind)).map((i) => this.toServer(i)));
+            out.push(...(body.instances ?? []).filter((i) => isKind(i.num_gpus ?? 1, kind)).map((i) => this.toServer(i)));
             if (!body.next_token) return out;
             token = body.next_token;
         }
@@ -260,7 +260,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
     }
 
     /** The instance, or the error that says Vast has none by that id. */
-    private async need(id: string): Promise<Server<VastInstance>> {
+    private async need(id: string): Promise<Server<VastInstance, VastRegionName>> {
         const s = await this.getServer(id);
         if (!s) throw new NotFoundError(this.id, `no instance ${id}`);
         return s;
@@ -286,7 +286,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
      * again, or deleted.
      */
     public override async deleteServerAndWait(id: string, o: WaitOptions = {}): Promise<boolean> {
-        const held = (await this.listVolumes().catch((): Volume<VastVolume>[] => [])).filter((v) => v.serverIds?.includes(id)).map((v) => v.id);
+        const held = (await this.listVolumes().catch((): Volume<VastVolume, VastRegionName>[] => [])).filter((v) => v.serverIds?.includes(id)).map((v) => v.id);
         const left = timeLeft(o);
         if (!(await super.deleteServerAndWait(id, left()))) return false;
         if (held.length) {
@@ -304,9 +304,11 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
      * The account's reliability and verification floors do not apply: the
      * machine is chosen already.
      */
-    public async offersOn(region: string, query: OfferQuery = {}): Promise<Offer<VastOffer>[]> {
+    public async offersOn(region: RegionChoice<VastTypes>, query: OfferQuery = {}): Promise<Offer<VastOffer, VastRegionName>[]> {
         const machine = machineOf(region);
         if (machine === undefined) throw new ProviderError(this.id, `region "${region}" names no machine (machine:<id>)`);
+        const read = readOfferQuery(query);
+        if (read.matchesNone || read.kind === 'cpu' || query.gpuCount === 0) return [];
         const search = async (type: 'ondemand' | 'bid') => ((await this.api.call<{ offers?: VastOffer[] }>('POST', '/api/v0/bundles/', {
             machine_id: { eq: machine }, rentable: { eq: true }, type, order: [['dph_total', 'asc']], limit: VastAI.PAGE,
         }, true))?.offers ?? []).map((a) => toOffer(a, type === 'bid'));
@@ -320,7 +322,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
      * name given to it, or, where it has none (a snapshot taken elsewhere), the
      * tag Vast gave it. [] where no `snapshots` repository is given.
      */
-    public async listImages(): Promise<ServerImage<VastImage>[]> {
+    public async listImages(): Promise<ServerImage<VastImage, VastRegionName>[]> {
         const r = this.snapshots;
         if (!r) return [];
         const { registry, repository } = this.snapshotRegistry(r);
@@ -337,7 +339,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
     }
 
     /** The image its reference (`<server>/<repository>:<tag>`, its id) names, read from the snapshot repository: null when it has no such tag, or it is another repository's. */
-    public async getImage(id: string): Promise<ServerImage<VastImage> | null> {
+    public async getImage(id: string): Promise<ServerImage<VastImage, VastRegionName> | null> {
         const r = this.snapshots;
         const tag = this.tagOf(id);
         if (!r || tag === undefined) return null;
@@ -357,7 +359,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
      * boots on any machine (createServer's `image`, pulled with the snapshot
      * login). A name the repository has already is refused.
      */
-    public async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<VastImage>> {
+    public async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<VastImage, VastRegionName>> {
         const r = this.snapshots;
         if (!r) throw new ProviderError(this.id, 'Vast keeps no images: createImage pushes a snapshot to a registry of yours, so pass `snapshots` (its server, repository and a login that can push)');
         if (!IMAGE_TAG.test(o.name)) throw new ProviderError(this.id, `image name "${o.name}": it is the image's tag (letters, digits, _ . -, at most 128, not starting with . or -)`);
@@ -397,13 +399,13 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
     // ── volumes ──────────────────────────────────────────────────────────
 
     /** The account's volumes: Vast's local ones, each on one machine (network volumes, withdrawn in July 2026, are left out). */
-    public async listVolumes(): Promise<Volume<VastVolume>[]> {
+    public async listVolumes(): Promise<Volume<VastVolume, VastRegionName>[]> {
         const body = await this.api.call<{ volumes?: VastVolume[] }>('GET', '/api/v0/volumes?owner=me&type=all_volume');
         return (body?.volumes ?? []).filter((v) => (v.type ?? 'machine') === 'machine').map(toVolume);
     }
 
     /** Vast reads one volume only in the list. */
-    public async getVolume(id: string): Promise<Volume<VastVolume> | null> {
+    public async getVolume(id: string): Promise<Volume<VastVolume, VastRegionName> | null> {
         return (await this.listVolumes()).find((v) => v.id === String(id)) ?? null;
     }
 
@@ -416,7 +418,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
      * (`raw.storage_total_cost`, USD per hour) until deleteVolume, and goes when
      * its host's listing ends (`raw.end_date`).
      */
-    public async createVolume(o: CreateVolumeOptions<VastTypes>): Promise<Volume<VastVolume>> {
+    public async createVolume(o: CreateVolumeOptions<VastTypes>): Promise<Volume<VastVolume, VastRegionName>> {
         if (!VOLUME_NAME.test(o.name)) throw new ProviderError(this.id, `volume name "${o.name}": Vast takes letters, digits and underscores only, at most 64`);
         if (!Number.isInteger(o.sizeGb) || o.sizeGb < 1) throw new ProviderError(this.id, `a volume is whole GB, 1 GB or more, not ${o.sizeGb} GB`);
         const machine = machineOf(this.regionName(o.region));
@@ -477,7 +479,7 @@ export class VastAI extends BaseProvider<VastTypes, VastApi> implements Provider
 
     // ── helpers ──────────────────────────────────────────────────────────
 
-    private toServer(i: VastInstance): Server<VastInstance> {
+    private toServer(i: VastInstance): Server<VastInstance, VastRegionName> {
         return toServer(i, this.relaunched.get(String(i.id)));
     }
 

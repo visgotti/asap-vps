@@ -1,0 +1,71 @@
+# The providers' places against the library's reference data of them
+# (src/Providers/<Platform>/places.ts), and the countries against ISO's list:
+# `npm run places:check` (scripts/places-check.ts). It only reads: it rents,
+# makes and costs nothing. A place a provider opened, closed or renamed fails
+# the run, and the report says what to change; what the data leaves out, and
+# where Vast's market moved, it says without failing. The report is on the
+# run's page too.
+#
+# It runs every Monday, by hand (Actions > "Places" > Run workflow, or
+# `gh workflow run places.yml`), and on a pull request of this repository that
+# changes what it compares, so a change to a place is held to its provider
+# before it lands. A pull request from a fork runs nothing here: it would be
+# given no keys, and its code could read what the runner holds.
+#
+# A scheduled run that fails is mailed to whoever last changed the schedule
+# (GitHub's own notice). GitHub turns a schedule off after 60 days without
+# activity in a public repository: Actions > "Places" > Enable workflow.
+#
+# The keys are the live suites' (live.yml), the ones the check reads and no
+# other: Scaleway's list (its Go SDK's, on GitHub) and ISO's need none. Like
+# ci.yml, the job runs on GitHub's runners or on the self-hosted ones the
+# variable CI_RUNS_ON names.
+name: Places
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/Providers/*/places.ts'
+      - 'src/Providers/VastAI/mappers.ts'
+      - 'src/Core/utils/places.ts'
+      - 'src/constants.ts'
+      - 'scripts/places-check.ts'
+      - '.github/workflows/places.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: places-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: places:check
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ${{ vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      DIGITAL_OCEAN_API_KEY: ${{ secrets.DIGITAL_OCEAN_API_KEY }}
+      LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
+      RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Every place against what its source says now
+        shell: bash
+        run: npm run -s places:check 2>&1 | tee "$RUNNER_TEMP/places.txt"
+      - name: The report, on the run's page
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          [ -f "$RUNNER_TEMP/places.txt" ] || exit 0
+          { echo '```'; cat "$RUNNER_TEMP/places.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

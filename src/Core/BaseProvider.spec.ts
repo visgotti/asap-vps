@@ -19,7 +19,7 @@ class ScriptedProvider extends BaseProvider {
     readonly id = 'scripted';
     readonly capabilities = SCRIPTED_CAPABILITIES;
     protected readonly enums: EnumTranslations = {
-        regions: { [REGION_TYPES.PARIS]: 'par-1' }, machines: { [MACHINE_TYPES.UBUNTU_24]: 'noble' }, cudaMachines: { [MACHINE_TYPES.UBUNTU_24]: 'noble-gpu' },
+        regions: { [REGION_TYPES.FRANCE_PARIS]: 'par-1' }, machines: { [MACHINE_TYPES.UBUNTU_24]: 'noble' }, cudaMachines: { [MACHINE_TYPES.UBUNTU_24]: 'noble-gpu' },
     };
     deletes = 0;
     reads = 0;
@@ -245,16 +245,16 @@ describe('BaseProvider', () => {
 
     it('reads the library\'s region and OS enums in the platform\'s names; a member it has no name for is refused; its own names pass as they are', async () => {
         const p = new ScriptedProvider([]);
-        await p.createServer({ name: 'n', offer: 'o', region: REGION_TYPES.PARIS, image: MACHINE_TYPES.UBUNTU_24 });
+        await p.createServer({ name: 'n', offer: 'o', region: REGION_TYPES.FRANCE_PARIS, image: MACHINE_TYPES.UBUNTU_24 });
         expect(p.created).toEqual({ region: 'par-1', image: 'noble' });
         await p.createServer({ name: 'n', offer: 'o', region: 'par-9', image: 'my-image' });
         expect(p.created).toEqual({ region: 'par-9', image: 'my-image' });
-        await expect(p.createServer({ name: 'n', offer: 'o', region: REGION_TYPES.NYC })).rejects.toThrow(NotSupportedError);
+        await expect(p.createServer({ name: 'n', offer: 'o', region: REGION_TYPES.US_NEW_YORK })).rejects.toThrow(NotSupportedError);
         await expect(p.createServer({ name: 'n', offer: 'o', image: MACHINE_TYPES.UBUNTU_20 })).rejects.toThrow(/MACHINE_TYPES has no scripted image/);
         // An offer's own region is the platform's already: never read as an enum.
-        const offer: Offer = { provider: 'scripted', id: 'o', gpu: 'L4', vendor: 'nvidia', gpuCount: 1, vramGb: 24, pricePerHour: 1, regions: [REGION_TYPES.NYC], raw: {} };
+        const offer: Offer = { provider: 'scripted', id: 'o', gpu: 'L4', vendor: 'nvidia', gpuCount: 1, vramGb: 24, pricePerHour: 1, regions: [REGION_TYPES.US_NEW_YORK], raw: {} };
         await p.createServer({ name: 'n', offer });
-        expect(p.created?.region).toBe(REGION_TYPES.NYC);
+        expect(p.created?.region).toBe(REGION_TYPES.US_NEW_YORK);
         await expect(p.createServer({ name: 'n', offer: { ...offer, provider: 'other' } })).rejects.toThrow(/is other's, not scripted's/);
     });
 
@@ -492,8 +492,8 @@ describe('BaseProvider', () => {
         const p = new Unmapped([]);
         await expect(p.createServer({ name: 'n', offer: 'o', image: MACHINE_TYPES.UBUNTU_24 }))
             .rejects.toMatchObject({ name: 'NotSupportedError', message: `scripted: image "${MACHINE_TYPES.UBUNTU_24}" (MACHINE_TYPES has no scripted image by that name) is not supported` });
-        await expect(p.createServer({ name: 'n', offer: 'o', region: REGION_TYPES.PARIS }))
-            .rejects.toMatchObject({ name: 'NotSupportedError', message: `scripted: region "${REGION_TYPES.PARIS}" (REGION_TYPES has no scripted region by that name) is not supported` });
+        await expect(p.createServer({ name: 'n', offer: 'o', region: REGION_TYPES.FRANCE_PARIS }))
+            .rejects.toMatchObject({ name: 'NotSupportedError', message: `scripted: region "${REGION_TYPES.FRANCE_PARIS}" (REGION_TYPES has no scripted region by that name) is not supported` });
     });
 
     it('a GPU count may be given only as the offer\'s own: an offer id whose count is unknown, or another count, is refused', () => {

@@ -9,13 +9,13 @@ import { CAPABILITY_METHODS, CapabilityName, requireCapability, supports } from 
 import { RemoteMachine } from '../Core/RemoteMachine';
 import { SSHService } from '../Core/SSHService';
 import { canonicalGpu, sshKeyFingerprint } from '../Core/utils';
-import { CUDA_TYPES, MACHINE_TYPES } from '../constants';
+import { COUNTRY_TYPES, CUDA_TYPES, MACHINE_TYPES, REGION_COUNTRIES, REGION_TYPES } from '../constants';
 import { AuthError, CapacityError, NotSupportedError, ProviderError } from '../errors';
 import { testPublicKey } from '../testing/fakes/util';
 import { CONTRACT_SUBJECTS } from '../testing/subjects';
 import type { VolumeKindTraits } from '../capabilities';
-import type { ContainerSpec, CreateServerOptions, Offer, OfferQuery } from '../types';
-import type { AnyProvider } from './registry';
+import type { ComputeKind, ContainerSpec, CreateServerOptions, GpuVendor, Offer, OfferQuery } from '../types';
+import type { ContractProvider } from '../testing/subjects';
 
 const fast = { intervalMs: 0, timeoutMs: 5000 };
 /** The contract rents GPUs: what each provider is first of all asked for. */
@@ -295,20 +295,88 @@ describe.each(CONTRACT_SUBJECTS)('contract: $name', (subject) => {
     it('a question by country means the same everywhere: the offers with stock there, their regions narrowed to it, and a server rented from one is in it', async () => {
         const { provider } = subject.make();
         const all = await provider.listOffers(GPU);
-        // Every place of every offer says its country, in the provider's own way of naming places.
-        expect(all.flatMap((o) => o.locations ?? []).filter((l) => !/^[A-Z]{2}$/.test(l.country ?? ''))).toEqual([]);
+        // Every place of every offer says its country, in the provider's own way of naming places: one ISO gives a code.
+        expect(all.flatMap((o) => o.locations ?? []).filter((l) => !Object.values<string>(COUNTRY_TYPES).includes(l.country ?? ''))).toEqual([]);
         for (const o of all) expect(o.locations?.map((l) => l.region)).toEqual(o.regions);
         const country = all[0].locations![0].country!;
-        const there = await provider.listOffers({ ...GPU, countries: [country.toLowerCase()] });
+        // In lower case, as a caller the compiler does not check (JavaScript, a flag) may write it.
+        const there = await provider.listOffers({ ...GPU, countries: [country.toLowerCase() as COUNTRY_TYPES] });
         expect(there.length).toBeGreaterThan(0);
         expect(there.flatMap((o) => o.locations!.map((l) => l.country))).toEqual(there.flatMap((o) => o.regions.map(() => country)));
         expect(there.map((o) => o.id)).toEqual(all.filter((o) => o.locations!.some((l) => l.country === country)).map((o) => o.id));
         // Nowhere it has machines: nothing, and no error. A country that is no code is refused.
         expect(await provider.listOffers({ ...GPU, countries: ['AQ'] })).toEqual([]);
+        // @ts-expect-error: a name, not a code
         await expect(provider.listOffers({ ...GPU, countries: ['Antarctica'] })).rejects.toThrow('asap-vps: bad country "Antarctica": use an ISO 3166-1 alpha-2 code, e.g. US');
+        // @ts-expect-error: ISO gives no country 'UK' (the United Kingdom's is GB)
+        await expect(provider.listOffers({ ...GPU, countries: ['UK'] })).rejects.toThrow('asap-vps: bad country "UK": ISO 3166-1 gives no country that code (COUNTRY_TYPES has every one it does)');
         const s = await provider.createServer({ name: 'gpu-contract-country', offer: there[0], ...(await subject.extra(provider)) } as CreateServerOptions);
         expect((await provider.waitUntilRunning(s.id, fast)).country).toBe(country);
         expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
+    });
+
+    it('a query that is not well formed is refused whatever else it asks: a part of it that alone lists nothing hides no other that is none', async () => {
+        const { provider } = subject.make();
+        const country = { name: 'ProviderError', message: 'asap-vps: bad country "Antarctica": use an ISO 3166-1 alpha-2 code, e.g. US' };
+        const cuda = { name: 'ProviderError', message: 'asap-vps: bad CUDA version "latest": use major.minor, e.g. 12.8' };
+        // Machines without GPUs, which a provider that rents none has nothing to look up for: the rest is read all the same.
+        await expect(provider.listOffers({ kind: 'cpu', countries: ['Antarctica' as COUNTRY_TYPES] })).rejects.toMatchObject(country);
+        await expect(provider.listOffers({ gpuCount: 0, countries: ['Antarctica' as COUNTRY_TYPES] })).rejects.toMatchObject(country);
+        await expect(provider.listOffers({ kind: 'cpu', minCudaVersion: 'latest' })).rejects.toMatchObject(cuda);
+        // No country allowed, which lists nothing anywhere.
+        await expect(provider.listOffers({ countries: [], minCudaVersion: 'latest' })).rejects.toMatchObject(cuda);
+    });
+
+    it('a region by the library\'s names is the same call everywhere: one the provider has is the place its table names, in the country the library says; one it has not is refused before anything is asked', async () => {
+        const { provider, fake } = subject.make();
+        const [offer] = await provider.listOffers(GPU);
+        const extra = await subject.extra(provider);
+        const mine = Object.entries(subject.regions) as Array<[REGION_TYPES, string]>;
+        const others = Object.values(REGION_TYPES).filter((r) => !(r in subject.regions));
+        // Every member is one or the other: none is passed through as a name of the platform's own.
+        expect(mine.length + others.length).toBe(Object.values(REGION_TYPES).length);
+        // A volume as the platform makes them by default, sized where it sizes them: a place to ask for that needs no stock.
+        const volumes = supports(provider, 'volumes') ? provider : undefined;
+        const traits: VolumeKindTraits | undefined = volumes && (volumes.capabilities.volumes.block ?? volumes.capabilities.volumes.shared);
+        const volume = (region: string) => ({
+            name: subject.volumeName?.('gpu-contract-region') ?? 'gpu-contract-region', region, ...(traits?.size === 'fixed' ? { sizeGb: Math.max(10, traits.minGb ?? 0) } : {}),
+        });
+        const [servers, asked] = [fake.liveServers(), fake.calls.length];
+        for (const region of others) {
+            const refusal = { name: 'NotSupportedError', message: `${provider.id}: region "${region}" (REGION_TYPES has no ${provider.id} region by that name) is not supported` };
+            await expect(provider.createServer({ name: 'gpu-contract-region', offer: offer.id, region, ...extra } as CreateServerOptions)).rejects.toMatchObject(refusal);
+            if (volumes) await expect(volumes.createVolume(volume(region))).rejects.toMatchObject(refusal);
+        }
+        // A name the library's regions had before 0.1.0 is refused, naming the region it is now, not sent as one of the platform's own.
+        await expect(provider.createServer({ name: 'gpu-contract-region', offer: offer.id, region: 'toronto', ...extra } as CreateServerOptions))
+            .rejects.toMatchObject({ name: 'ProviderError', message: 'asap-vps: region "toronto" is REGION_TYPES.CANADA_TORONTO ("canada_toronto") since 0.1.0' });
+        if (volumes) await expect(volumes.createVolume(volume('paris_2'))).rejects.toThrow('asap-vps: region "paris_2" is REGION_TYPES.FRANCE_PARIS_2 ("france_paris_2") since 0.1.0');
+        expect(fake.calls).toHaveLength(asked);
+        // One it has: the platform is asked for the place its table names (Scaleway: a zone of a region it names), where it may
+        // have no room or make no such volume: that is the platform's answer to the place asked, no refusal of the name.
+        for (const [region, own] of volumes ? mine : []) {
+            const at = subject.placedIn?.(own) ?? own;
+            const made = await volumes!.createVolume(volume(region)).catch((e) => {
+                if (e instanceof ProviderError && !(e instanceof NotSupportedError)) return null;
+                throw e;
+            });
+            expect([region, subject.volumeAskedIn!(fake)]).toEqual([region, at]);
+            if (!made) continue;
+            expect([region, made.region]).toEqual([region, at]);
+            await volumes!.deleteVolume(made.id);
+        }
+        // And a server rented there is where the library says the place is: in the provider's place for it (a region's zone with
+        // stock, on Scaleway), in the library's country for it.
+        const placed = (own: string) => subject.placedIn?.(own, offer.regions) ?? own;
+        const inStock = mine.filter(([, own]) => offer.regions.includes(placed(own)));
+        expect(inStock.length > 0).toBe(mine.length > 0);
+        for (const [region, own] of inStock) {
+            const s = await provider.createServer({ name: 'gpu-contract-region', offer, region, ...extra } as CreateServerOptions);
+            const running = await provider.waitUntilRunning(s.id, fast);
+            expect([region, running.region, running.country]).toEqual([region, placed(own), REGION_COUNTRIES[region]]);
+            expect(await provider.deleteServerAndWait(s.id, fast)).toBe(true);
+        }
+        expect(fake.liveServers()).toBe(servers);
     });
 
     it('an image by the library\'s names is the same call everywhere: Ubuntu 24.04 ready for CUDA boots on its GPU offer, and a combination no image exists for is not supported', async () => {
@@ -390,6 +458,40 @@ describe('machines without GPUs: offered where the platform rents them, and aske
             expect(any.map((o) => o.id).sort()).toEqual([...cpu, ...gpu].map((o) => o.id).sort());
             // A GPU filter is a question about GPUs: no machine without them answers it.
             expect((await provider.listOffers({ vendor: 'nvidia', includeUnavailable: true })).every((o) => o.gpuCount > 0)).toBe(true);
+        });
+
+        it(`${subject.name}: a kind is one of the library's three, and 'any' is none given; anything else is refused by every list that takes one, never read as a kind`, async () => {
+            const { provider, fake } = subject.make();
+            const ids = (xs: Array<{ id: string }>) => xs.map((x) => x.id).sort();
+            const [offers, servers] = [ids(await provider.listOffers({ includeUnavailable: true })), ids(await provider.listServers())];
+            expect(offers.length).toBeGreaterThan(0);
+            expect(ids(await provider.listOffers({ kind: 'any', includeUnavailable: true }))).toEqual(offers);
+            expect(ids(await provider.listOffers({ kind: undefined, includeUnavailable: true }))).toEqual(offers);
+            expect(ids(await provider.listServers({ kind: 'any' }))).toEqual(servers);
+            expect(ids(await provider.listServers({ kind: undefined }))).toEqual(servers);
+            // A kind the compiler did not see (a flag, a config value, JavaScript): another case, a typo, a platform's own word, null.
+            // Nothing is asked of the platform first: the refusal does not depend on its catalog, its stock, the account's servers or its key.
+            const before = fake.calls.length;
+            for (const [bad, shown] of [['GPU', '"GPU"'], ['cpuu', '"cpuu"'], ['vps', '"vps"'], [null, 'null']] as const) {
+                const kind = bad as unknown as ComputeKind;
+                const refusal = { name: 'ProviderError', message: `asap-vps: bad kind ${shown}: use one of gpu, cpu, any` };
+                // Whatever else the query says, a part that alone would list nothing included.
+                for (const q of [{}, { includeUnavailable: true }, { gpuCount: 0 }, { countries: [] }, { maxPricePerHour: 0 }, { minCudaVersion: 'latest' }] as OfferQuery[]) {
+                    await expect(provider.listOffers({ ...q, kind })).rejects.toMatchObject(refusal);
+                    if (supports(provider, 'serverless')) await expect(provider.listEndpointOffers({ ...q, kind })).rejects.toMatchObject(refusal);
+                }
+                await expect(provider.listServers({ kind })).rejects.toMatchObject(refusal);
+            }
+            // A vendor is one of the library's two, read as strictly: one the compiler did not see is refused, not read as a vendor no offer has.
+            for (const [bad, shown] of [['NVIDIA', '"NVIDIA"'], ['intel', '"intel"'], [0, '0']] as const) {
+                const refusal = { name: 'ProviderError', message: `asap-vps: bad vendor ${shown}: use one of nvidia, amd` };
+                await expect(provider.listOffers({ vendor: bad as unknown as GpuVendor })).rejects.toMatchObject(refusal);
+                if (supports(provider, 'serverless')) await expect(provider.listEndpointOffers({ vendor: bad as unknown as GpuVendor })).rejects.toMatchObject(refusal);
+            }
+            expect(fake.calls).toHaveLength(before);
+            // No country allowed is no offer, with nothing asked either.
+            expect(await provider.listOffers({ countries: [] })).toEqual([]);
+            expect(fake.calls).toHaveLength(before);
         });
     }
 
@@ -521,7 +623,7 @@ describe('volumes where the platform has them, each kind it makes', () => {
             const label = `${subject.name}${both ? ` (${kind})` : ''}`;
             /** What createVolume takes for this kind: a size where it is sized when made (10 GB, or its least), and the kind where the platform makes both. */
             /** Where its servers go: the subject's place for the kind, else the cheapest GPU offer, in its first region. */
-            const place = async (provider: AnyProvider) => {
+            const place = async (provider: ContractProvider) => {
                 const placed = await subject.volumePlace?.(provider, kind);
                 if (placed) return placed;
                 const [offer] = await provider.listOffers(GPU);
@@ -661,7 +763,7 @@ describe('container: one image to run, the same option on every platform', () =>
     const spec: ContainerSpec = { image: 'ghcr.io/acme/app:1', env: { MODE: 'serve' }, command: ['serve', '--port', '8000'], ports: ['8000/tcp'] };
     const auth = { username: 'puller', password: 'ghp_pullOnly0', server: 'ghcr.io' };
     /** What createServer needs beyond the container (a container platform's own image and the rest go: the container says them). */
-    const needs = async (subject: (typeof CONTRACT_SUBJECTS)[number], provider: AnyProvider) => {
+    const needs = async (subject: (typeof CONTRACT_SUBJECTS)[number], provider: ContractProvider) => {
         const { image: _i, env: _e, command: _c, ports: _p, registryAuth: _r, ...rest } = await subject.extra(provider);
         return rest;
     };

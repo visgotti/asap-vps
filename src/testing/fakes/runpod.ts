@@ -20,6 +20,7 @@
 // reasons are in errors[]; a create that cannot be placed is a 400 with only a
 // human-readable detail.
 
+import { RUNPOD_DATA_CENTERS } from '../../Providers/RunPod/places';
 import { echoed, fakeBootId, FakeApi, json, readRequest, scriptKeys, startsSshd } from './util';
 
 /** What the fake records of a GPU type in one data center: its stock in each context (absent: none there), its hosts' CUDA. */
@@ -160,7 +161,10 @@ export function fakeRunPod(o: {
         ...echoed(pod.cmd, pod.env).map((line) => ({ source: 'container' as const, line })),
     ];
     /** The data centers the catalog knows: where a network volume can be made. */
-    const dataCenters = () => new Set(state.gpus.flatMap((g) => g.dataCenters.map((d) => d.id)));
+    // RunPod's data centers (its reference data), and any one the GPU stock names besides.
+    const dataCenters = () => new Set([...RUNPOD_DATA_CENTERS.map((d) => d.id as string), ...state.gpus.flatMap((g) => g.dataCenters.map((d) => d.id))]);
+    /** The network volume tiers a data center makes, as RunPod's catalog says: none, none there. */
+    const volumeTypes = (dc: string) => (RUNPOD_DATA_CENTERS.find((d) => d.id === dc)?.networkVolumeTypes ?? ['STANDARD', 'HIGH_PERFORMANCE']) as readonly string[];
     const livePods = () => [...state.pods.values()].filter((x) => x.status !== 'TERMINATED');
     /**
      * One page of a list the spec paginates (listPods, listEndpoints), of rows
@@ -513,6 +517,7 @@ export function fakeRunPod(o: {
                 if (body?.type !== undefined && !['STANDARD', 'HIGH_PERFORMANCE'].includes(body.type)) bad.push('$.type: must be one of STANDARD, HIGH_PERFORMANCE');
                 if (bad.length) return invalid(bad);
                 if (!dataCenters().has(body.dataCenter)) return problem(400, `invalid data center "${body.dataCenter}"`);
+                if (!volumeTypes(body.dataCenter).includes(body.type ?? 'STANDARD')) return problem(400, `data center ${body.dataCenter} makes no ${body.type ?? 'STANDARD'} network volume`);
                 const id = `vol_${state.nextId++}`;
                 const v = { id, name: body.name, size: body.size, dataCenter: body.dataCenter, type: body.type ?? 'STANDARD' };
                 state.volumes.set(id, v);

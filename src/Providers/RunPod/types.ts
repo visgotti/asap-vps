@@ -3,8 +3,10 @@
 // network volumes 2026-10-06), and RunPodTypes, which types its records and
 // create options by them.
 
+import type { RegionPick } from '../../Core/utils/places';
 import type { MountPath, ProviderParams, VolumeSize } from '../../types';
 import type { RUNPOD_REFUSED } from './mappers';
+import type { RUNPOD_DATA_CENTERS } from './places';
 
 export type RunPodParams = ProviderParams & {
     /** Which cloud offers are read and pods are placed on (default SECURE). */
@@ -12,6 +14,12 @@ export type RunPodParams = ProviderParams & {
 };
 
 export type RunPodCloud = 'SECURE' | 'COMMUNITY';
+
+/** One of RunPod's data centers, as its reference data has them (places.ts). */
+type DataCenter = (typeof RUNPOD_DATA_CENTERS)[number];
+
+/** A RunPod data center by its id ('US-TX-3', 'EUR-IS-1'): its own name for a place, as its records give it and its `region` options take it. The list is RUNPOD_DATA_CENTERS. */
+export type RunPodRegionName = DataCenter['id'];
 export type RunPodAvailability = 'NONE' | 'LOW' | 'MEDIUM' | 'HIGH';
 
 export type RunPodGpuType = {
@@ -169,6 +177,12 @@ export type RunPodTypes = {
     volumeSize: VolumeSize,
     volumeKind: {},
     mount: MountPath,
+    /** Its pick of the library's regions: its data centers' and their states', cities' or countries' (RUNPOD_ENUMS.regions). */
+    region: RegionPick<DataCenter>,
+    /** Its data centers by their ids. */
+    regionName: RunPodRegionName,
+    /** The countries its data centers are in. */
+    country: DataCenter['country'],
 };
 
 // ── serverless (REST v2 /v2/serverless, api.runpod.io/v2/openapi.json, read 2026-10-06) ──

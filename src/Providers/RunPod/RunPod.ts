@@ -11,7 +11,7 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { BaseProvider } from '../../Core/BaseProvider';
-import { asksForGpu, cudaVersion, filterOffers, findSSHKey, isKind, parsePort, parseSSHPublicKey, pickSSHKeys, registryAuthName, registryOf, waitOf } from '../../Core/utils';
+import { asksForGpu, computeKind, cudaVersion, filterOffers, findSSHKey, isKind, parsePort, parseSSHPublicKey, pickSSHKeys, readOfferQuery, registryAuthName, registryOf, waitOf } from '../../Core/utils';
 import { CapacityError, falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError, TransportError } from '../../errors';
 import type {
     CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, InitializedSSHKeyData, LogOptions, Offer, OfferQuery, RegistryAuth,
@@ -19,12 +19,11 @@ import type {
 } from '../../types';
 import { RunPodApi } from './api';
 import {
-    parseCpuOfferId, RUNPOD_BILLING, RUNPOD_ID, RUNPOD_MOUNT_PATH, RUNPOD_REFUSED, RUNPOD_SERVERLESS_HOST, sseLogLines, toCpuOffer, toEndpoint, toOffer, toServer,
-    toServerlessCpuOffer, toServerlessGpuOffer, toSSHKey, toVolume, vcpuCounts,
+    parseCpuOfferId, RUNPOD_BILLING, RUNPOD_ENUMS, RUNPOD_ID, RUNPOD_MOUNT_PATH, RUNPOD_REFUSED, RUNPOD_SERVERLESS_HOST, sseLogLines, toCpuOffer, toEndpoint, toOffer, toServer, toServerlessCpuOffer, toServerlessGpuOffer, toSSHKey, toVolume, vcpuCounts,
 } from './mappers';
 import type {
     RunPodCloud, RunPodCpuOffer, RunPodCpuType, RunPodCreateEndpointBody, RunPodEndpoint, RunPodGpuType, RunPodMounts, RunPodNetworkVolume, RunPodParams, RunPodPod,
-    RunPodRegistry, RunPodTypes,
+    RunPodRegionName, RunPodRegistry, RunPodTypes,
 } from './types';
 
 /** What RunPod can do, and how. */
@@ -46,6 +45,7 @@ type Caps = typeof RUNPOD_CAPABILITIES;
 
 export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements ProviderCapabilities<RunPodTypes, Caps> {
     static readonly capabilities: Caps = RUNPOD_CAPABILITIES;
+    protected readonly enums = RUNPOD_ENUMS;
     readonly id = RUNPOD_ID;
     readonly capabilities: Caps = RUNPOD_CAPABILITIES;
     readonly cloud: RunPodCloud;
@@ -79,9 +79,10 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
      * machine without GPUs, on the secure cloud); regions are data centers with
      * stock. `minCudaVersion` scopes the GPU stock to hosts that run it.
      */
-    public async listOffers(query: OfferQuery = {}): Promise<Offer<RunPodGpuType | RunPodCpuOffer>[]> {
+    public async listOffers(query: OfferQuery = {}): Promise<Offer<RunPodGpuType | RunPodCpuOffer, RunPodRegionName>[]> {
+        if (readOfferQuery(query).matchesNone) return [];
         const [gpus, cpus] = await Promise.all([this.gpuOffers(query), this.cpuOffers(query)]);
-        return filterOffers<Offer<RunPodGpuType | RunPodCpuOffer>>([...gpus, ...cpus], query);
+        return filterOffers<Offer<RunPodGpuType | RunPodCpuOffer, RunPodRegionName>>([...gpus, ...cpus], query);
     }
 
     /**
@@ -111,7 +112,7 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
      * account once (named `asap-vps:<user>@<host>:<hash>`, reused by every pod
      * with the same login) and the pod pulls `image` with it.
      */
-    public async createServer(o: CreateServerOptions<RunPodTypes>): Promise<Server<RunPodPod>> {
+    public async createServer(o: CreateServerOptions<RunPodTypes>): Promise<Server<RunPodPod, RunPodRegionName>> {
         this.rejectOptions(o, RUNPOD_REFUSED);
         const { id: offerId, offer, region: offered } = this.resolveOffer(o);
         // A CPU flavor at a vCPU count, or a GPU type.
@@ -180,19 +181,20 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
         return rent(dataCenters[dataCenters.length - 1]);
     }
 
-    public async getServer(id: string): Promise<Server<RunPodPod> | null> {
+    public async getServer(id: string): Promise<Server<RunPodPod, RunPodRegionName> | null> {
         const pod = await this.api.getPod(id);
         return pod ? toServer(pod) : null;
     }
 
     /** The account's pods, GPU and CPU alike unless `kind` says which. */
-    public async listServers(options: ServerListOptions = {}): Promise<Server<RunPodPod>[]> {
-        const out: Server<RunPodPod>[] = [];
+    public async listServers(options: ServerListOptions = {}): Promise<Server<RunPodPod, RunPodRegionName>[]> {
+        const kind = computeKind(options.kind);
+        const out: Server<RunPodPod, RunPodRegionName>[] = [];
         let cursor = '';
         for (let page = 0; page < 200; page++) {
             const body = await this.api.call<{ pods: RunPodPod[], pagination?: { nextCursor?: string | null, hasNextPage?: boolean } }>(
                 'GET', `/v2/pods?limit=1000${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
-            out.push(...(body.pods ?? []).filter((p) => isKind(p.gpu?.count, options.kind)).map(toServer));
+            out.push(...(body.pods ?? []).filter((p) => isKind(p.gpu?.count, kind)).map(toServer));
             if (!body.pagination?.hasNextPage || !body.pagination.nextCursor) return out;
             cursor = body.pagination.nextCursor;
         }
@@ -221,7 +223,7 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
      * expose has its public one, and a pod made to be logged in to (22/tcp
      * among them) its endpoint, there is nowhere to reach it yet.
      */
-    protected override comingUp(server: Server<RunPodPod>): boolean {
+    protected override comingUp(server: Server<RunPodPod, RunPodRegionName>): boolean {
         // What it was made to expose, read as the library reads a port ('8888/HTTP' and '8888/http' are one, a bare '22' is
         // tcp): RunPod's spec makes it any string. One that is no port names nothing to wait for.
         const asked = (server.raw.ports ?? []).flatMap((x) => {
@@ -277,12 +279,12 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
     // ── volumes ──────────────────────────────────────────────────────────
 
     /** The account's network volumes, in every data center. */
-    public async listVolumes(): Promise<Volume<RunPodNetworkVolume>[]> {
+    public async listVolumes(): Promise<Volume<RunPodNetworkVolume, RunPodRegionName>[]> {
         const { networkVolumes } = await this.api.call<{ networkVolumes?: RunPodNetworkVolume[] }>('GET', '/v2/network-volumes');
         return (networkVolumes ?? []).map(toVolume);
     }
 
-    public async getVolume(id: string): Promise<Volume<RunPodNetworkVolume> | null> {
+    public async getVolume(id: string): Promise<Volume<RunPodNetworkVolume, RunPodRegionName> | null> {
         const v = await this.api.getNetworkVolume(id);
         return v ? toVolume(v) : null;
     }
@@ -291,7 +293,7 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
      * A network volume of `sizeGb` (10-4096 GB; it can grow later, never shrink)
      * in a data center (`region`), mountable at once. It bills until deleteVolume.
      */
-    public async createVolume(o: CreateVolumeOptions<RunPodTypes>): Promise<Volume<RunPodNetworkVolume>> {
+    public async createVolume(o: CreateVolumeOptions<RunPodTypes>): Promise<Volume<RunPodNetworkVolume, RunPodRegionName>> {
         const size = Math.ceil(o.sizeGb);
         const { min, max } = RunPod.VOLUME_GB;
         if (!(size >= min && size <= max)) throw new ProviderError(this.id, `a network volume is ${min}-${max} GB, not ${o.sizeGb}`);
@@ -312,17 +314,18 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
      * flavor at each vCPU count from 2, billed per second while a worker runs;
      * cheapest first, in stock unless the query says otherwise.
      */
-    public async listEndpointOffers(query: OfferQuery = {}): Promise<Offer<RunPodGpuType | RunPodCpuOffer>[]> {
+    public async listEndpointOffers(query: OfferQuery = {}): Promise<Offer<RunPodGpuType | RunPodCpuOffer, RunPodRegionName>[]> {
+        if (readOfferQuery(query).matchesNone) return [];
         const [gpus, cpus] = await Promise.all([
             query.kind === 'cpu' ? [] : this.serverlessGpus().then((g) => g.map(toServerlessGpuOffer)),
             asksForGpu(query) ? [] : this.serverlessCpuOffers(),
         ]);
-        return filterOffers([...gpus, ...cpus].filter((o): o is Offer<RunPodGpuType> | Offer<RunPodCpuOffer> => o !== null), query);
+        return filterOffers([...gpus, ...cpus].filter((o): o is Offer<RunPodGpuType, RunPodRegionName> | Offer<RunPodCpuOffer, RunPodRegionName> => o !== null), query);
     }
 
     /** The account's endpoints, load-balancing and queue ones alike. */
-    public async listEndpoints(): Promise<Endpoint<RunPodEndpoint>[]> {
-        const out: Endpoint<RunPodEndpoint>[] = [];
+    public async listEndpoints(): Promise<Endpoint<RunPodEndpoint, RunPodRegionName>[]> {
+        const out: Endpoint<RunPodEndpoint, RunPodRegionName>[] = [];
         let cursor = '';
         for (let page = 0; page < 200; page++) {
             const body = await this.api.call<{ endpoints: RunPodEndpoint[], pagination?: { nextCursor?: string | null, hasNextPage?: boolean } }>(
@@ -334,7 +337,7 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
         throw new ProviderError(this.id, 'the endpoint list has more than 200 pages');
     }
 
-    public async getEndpoint(id: string): Promise<Endpoint<RunPodEndpoint> | null> {
+    public async getEndpoint(id: string): Promise<Endpoint<RunPodEndpoint, RunPodRegionName> | null> {
         const e = await nullIfNotFound(this.api.call<RunPodEndpoint>('GET', `/v2/serverless/${encodeURIComponent(id)}`));
         return e ? toEndpoint(e) : null;
     }
@@ -349,7 +352,7 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
      * CPU offer is a flavor at a power-of-two vCPU count from 2. RunPod gives
      * an endpoint no status: it takes requests once it is made.
      */
-    public async createEndpoint(o: CreateEndpointOptions<RunPodTypes>): Promise<Endpoint<RunPodEndpoint>> {
+    public async createEndpoint(o: CreateEndpointOptions<RunPodTypes>): Promise<Endpoint<RunPodEndpoint, RunPodRegionName>> {
         const c = o.container;
         const image = this.containerImageName(c?.image);
         if (!image) throw new ProviderError(this.id, 'an endpoint needs an image');
@@ -365,11 +368,12 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
         }
         const idle = o.idleTimeoutSeconds;
         if (idle !== undefined && !(Number.isInteger(idle) && idle >= 1 && idle <= 3600)) throw new ProviderError(this.id, `idleTimeoutSeconds is 1-3600, not ${idle}`);
+        // Where, read before the catalog is: a region of the library's RunPod has no data center for is refused before anything is asked.
+        const region = o.region !== undefined ? this.regionName(o.region) : undefined;
+        if (c.registryAuth && o.providerOptions?.registry !== undefined) throw new ProviderError(this.id, 'pass registryAuth or providerOptions.registry, not both');
         // Its workers go where the driver runs the CUDA asked for (minCudaVersion, else the image's own, as a pod's does).
         const cuda = this.minCudaOf({ minCudaVersion: o.minCudaVersion, container: c });
         const compute = await this.endpointCompute(o.offer, cuda !== undefined ? cudaVersion(cuda) : undefined);
-        if (c.registryAuth && o.providerOptions?.registry !== undefined) throw new ProviderError(this.id, 'pass registryAuth or providerOptions.registry, not both');
-        const region = o.region !== undefined ? this.regionName(o.region) : undefined;
         // Stored last, as for a pod: a create that is refused leaves no login on the account.
         const registry = c.registryAuth ? await this.registryId(c.registryAuth, image) : undefined;
         const body: RunPodCreateEndpointBody = {
@@ -481,12 +485,12 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
     }
 
     /** The CPU flavors as serverless offers: one per vCPU count from 2, with the stock for that count. */
-    private async serverlessCpuOffers(): Promise<Offer<RunPodCpuOffer>[]> {
+    private async serverlessCpuOffers(): Promise<Offer<RunPodCpuOffer, RunPodRegionName>[]> {
         const read = (count: number) => this.api.call<{ cpus: RunPodCpuType[] }>('GET', `/v2/catalog/cpus?include=AVAILABILITY&product=SERVERLESS&vcpuCount=${count}`);
         const counts = [...new Set(((await this.api.call<{ cpus: RunPodCpuType[] }>('GET', '/v2/catalog/cpus')).cpus ?? []).flatMap(vcpuCounts))].filter((n) => n >= 2).sort((a, b) => a - b);
         const perCount = await Promise.all(counts.map(async (n) => ({ n, cpus: (await read(n)).cpus ?? [] })));
         return perCount.flatMap(({ n, cpus }) => cpus.filter((c) => vcpuCounts(c).includes(n)).map((c) => toServerlessCpuOffer(c, n)))
-            .filter((x): x is Offer<RunPodCpuOffer> => x !== null);
+            .filter((x): x is Offer<RunPodCpuOffer, RunPodRegionName> => x !== null);
     }
 
     /** What an endpoint's workers run on, as its create takes it: a GPU type pinned within its pool, or a CPU flavor; the cheapest in stock when no offer is named. */
@@ -512,13 +516,13 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
     }
 
     /** The GPU types as offers: none for a question about machines without GPUs. */
-    private async gpuOffers(query: OfferQuery): Promise<Offer<RunPodGpuType>[]> {
+    private async gpuOffers(query: OfferQuery): Promise<Offer<RunPodGpuType, RunPodRegionName>[]> {
         const count = query.gpuCount ?? 1;
         if (count < 1 || query.kind === 'cpu') return [];
         const minCuda = query.minCudaVersion !== undefined ? cudaVersion(query.minCudaVersion) : undefined;
         const { gpus } = await this.api.call<{ gpus: RunPodGpuType[] }>('GET',
             `/v2/catalog/gpus?include=AVAILABILITY&product=POD&cloud=${this.cloud}&count=${count}${minCuda ? `&minCudaVersion=${minCuda}` : ''}`);
-        return (gpus ?? []).map((g) => toOffer(g, count, this.cloud)).filter((o): o is Offer<RunPodGpuType> => o !== null);
+        return (gpus ?? []).map((g) => toOffer(g, count, this.cloud)).filter((o): o is Offer<RunPodGpuType, RunPodRegionName> => o !== null);
     }
 
     /**
@@ -526,13 +530,13 @@ export class RunPod extends BaseProvider<RunPodTypes, RunPodApi> implements Prov
      * stock for that count (the catalog reads stock per count): none for a
      * question about GPUs.
      */
-    private async cpuOffers(query: OfferQuery): Promise<Offer<RunPodCpuOffer>[]> {
+    private async cpuOffers(query: OfferQuery): Promise<Offer<RunPodCpuOffer, RunPodRegionName>[]> {
         if (asksForGpu(query)) return [];
         const read = (count: number) => this.api.call<{ cpus: RunPodCpuType[] }>('GET', `/v2/catalog/cpus?include=AVAILABILITY&product=POD&vcpuCount=${count}`);
         const counts = [...new Set(((await this.api.call<{ cpus: RunPodCpuType[] }>('GET', '/v2/catalog/cpus')).cpus ?? []).flatMap(vcpuCounts))].sort((a, b) => a - b);
         const perCount = await Promise.all(counts.map(async (n) => ({ n, cpus: (await read(n)).cpus ?? [] })));
         return perCount.flatMap(({ n, cpus }) => cpus.filter((c) => vcpuCounts(c).includes(n)).map((c) => toCpuOffer(c, n)))
-            .filter((x): x is Offer<RunPodCpuOffer> => x !== null);
+            .filter((x): x is Offer<RunPodCpuOffer, RunPodRegionName> => x !== null);
     }
 
     /**

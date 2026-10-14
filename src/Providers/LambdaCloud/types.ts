@@ -3,8 +3,16 @@
 // filesystems 2026-10-06), and LambdaTypes, which types its records and create
 // options by them.
 
+import type { RegionPick } from '../../Core/utils/places';
 import type { MountPath } from '../../types';
 import type { LAMBDA_REFUSED } from './mappers';
+import type { LAMBDA_REGIONS } from './places';
+
+/** One of Lambda's regions, as its reference data has them (places.ts). */
+type Region = (typeof LAMBDA_REGIONS)[number];
+
+/** A Lambda region by its name ('us-east-1', 'europe-central-1'): its own name for a place, as its records give it and its `region` options take it. The list is LAMBDA_REGIONS. */
+export type LambdaRegionName = Region['name'];
 
 export type LambdaInstanceType = {
     name: string,
@@ -110,4 +118,10 @@ export type LambdaTypes = {
     volumeSize: {},
     volumeKind: {},
     mount: MountPath,
+    /** Its pick of the library's regions: its regions' and their cities', states' or countries' (LAMBDA_ENUMS.regions). */
+    region: RegionPick<Region>,
+    /** Its regions by their names. */
+    regionName: LambdaRegionName,
+    /** The countries its regions are in. */
+    country: Region['country'],
 };

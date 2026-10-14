@@ -3,9 +3,12 @@
 // account's key list as a key, its status words, its billing, and its log
 // stream's events as lines. Pure functions of the raw records, typed by RunPodTypes.
 
-import { canonicalGpu, compareCudaVersions, cudaVersion, gpuName, located, parseSSHPublicKey, sshKeyFingerprint } from '../../Core/utils';
+import type { EnumTranslations } from '../../Core/BaseProvider';
+import type { COUNTRY_TYPES } from '../../constants';
+import { asCountry, canonicalGpu, compareCudaVersions, cudaVersion, gpuName, located, parseSSHPublicKey, regionTable, sshKeyFingerprint } from '../../Core/utils';
 import type { Billing, Endpoint, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerStatus, Volume } from '../../types';
-import type { RunPodCloud, RunPodCpuOffer, RunPodCpuType, RunPodEndpoint, RunPodGpuType, RunPodNetworkVolume, RunPodPod, RunPodPodStatus } from './types';
+import { RUNPOD_DATA_CENTERS } from './places';
+import type { RunPodCloud, RunPodCpuOffer, RunPodCpuType, RunPodEndpoint, RunPodGpuType, RunPodNetworkVolume, RunPodPod, RunPodPodStatus, RunPodRegionName } from './types';
 
 export const RUNPOD_ID = 'runpod';
 
@@ -15,17 +18,27 @@ export const RUNPOD_REFUSED = ['userData', 'tags'] as const satisfies readonly R
 /** Where a pod mounts a network volume unless a mount says otherwise: where RunPod's own pods do. */
 export const RUNPOD_MOUNT_PATH = '/workspace';
 
+/** The library's regions by RunPod's names: its data centers' (RUNPOD_DATA_CENTERS), each by its own, and a state, city or country by its first data center there. */
+export const RUNPOD_ENUMS = Object.freeze({
+    regions: regionTable(RUNPOD_DATA_CENTERS, (d) => d.id),
+} as const satisfies EnumTranslations);
+
+const DATA_CENTER_COUNTRIES = new Map<string, COUNTRY_TYPES>(RUNPOD_DATA_CENTERS.map((d) => [d.id, d.country]));
+
 /**
- * The country a data center is in, from its id: the United States' and
- * Canada's begin with the country ('US-TX-3', 'CA-MTL-1'), the others with
- * their part of the world and then the country ('EU-RO-1', 'EUR-IS-2',
- * 'AP-JP-1', 'OC-AU-1'), as the catalog listed them on 2026-10-12. undefined
- * for an id of another shape.
+ * The country a data center is in: as its reference data has it, else from its
+ * id, whose shape says it (a data center the list does not have yet): the
+ * United States' and Canada's begin with the country ('US-TX-3', 'CA-MTL-1'),
+ * the others with their part of the world and then the country ('EU-RO-1',
+ * 'EUR-IS-2', 'AP-JP-1', 'OC-AU-1'). undefined for an id of another shape,
+ * or of a code ISO gives no country ('EU-UK-1').
  */
-export function countryOf(dataCenter: string | null | undefined): string | undefined {
+export function countryOf(dataCenter: string | null | undefined): COUNTRY_TYPES | undefined {
+    const known = DATA_CENTER_COUNTRIES.get(dataCenter ?? '');
+    if (known) return known;
     const [first, second] = (dataCenter ?? '').split('-');
-    if (first === 'US' || first === 'CA') return first;
-    return /^(EU|EUR|AP|OC)$/.test(first) && /^[A-Z]{2}$/.test(second ?? '') ? second : undefined;
+    if (first === 'US' || first === 'CA') return asCountry(first);
+    return /^(EU|EUR|AP|OC)$/.test(first) ? asCountry(second) : undefined;
 }
 
 export const POD_STATUS: Readonly<Record<RunPodPodStatus, ServerStatus>> = {
@@ -57,7 +70,7 @@ export function runPodGpuName(id: string): string {
  * A GPU type as an offer of `count` GPUs on `cloud`; null when that cloud does
  * not sell it (the catalog's own flag: a price alone is not), or has no price for it.
  */
-export function toOffer(g: RunPodGpuType, count: number, cloud: RunPodCloud): Offer<RunPodGpuType> | null {
+export function toOffer(g: RunPodGpuType, count: number, cloud: RunPodCloud): Offer<RunPodGpuType, RunPodRegionName> | null {
     if (!(cloud === 'COMMUNITY' ? g.community : g.secure)) return null;
     const price = cloud === 'COMMUNITY' ? g.price?.community : g.price?.secure;
     if (!(Number(price) > 0)) return null;
@@ -72,7 +85,7 @@ export function toOffer(g: RunPodGpuType, count: number, cloud: RunPodCloud): Of
         vramGb: Number(g.memory ?? canonicalGpu(g.id)?.vramGb ?? 0),
         pricePerHour: Number(price) * count,
         billing: RUNPOD_BILLING,
-        ...located((g.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id), countryOf),
+        ...located((g.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id as RunPodRegionName), countryOf),
         ...(cuda ? { cudaVersion: cuda } : {}),
         raw: g,
     };
@@ -101,7 +114,7 @@ export function vcpuCounts(cpu: Pick<RunPodCpuType, 'vcpu'>): number[] {
  * priced per vCPU on the secure cloud; null when it has no price. Its regions
  * are the data centers with stock of it at that count.
  */
-export function toCpuOffer(cpu: RunPodCpuType, vcpuCount: number): Offer<RunPodCpuOffer> | null {
+export function toCpuOffer(cpu: RunPodCpuType, vcpuCount: number): Offer<RunPodCpuOffer, RunPodRegionName> | null {
     if (!(Number(cpu.price?.securePerVcpu) > 0)) return null;
     return {
         provider: RUNPOD_ID,
@@ -112,14 +125,14 @@ export function toCpuOffer(cpu: RunPodCpuType, vcpuCount: number): Offer<RunPodC
         vramGb: 0,
         pricePerHour: Number(cpu.price.securePerVcpu) * vcpuCount,
         billing: RUNPOD_BILLING,
-        ...located((cpu.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id), countryOf),
+        ...located((cpu.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id as RunPodRegionName), countryOf),
         vcpus: vcpuCount,
         memoryGb: Number(cpu.ramGbPerVcpu) * vcpuCount,
         raw: { cpu, vcpuCount },
     };
 }
 
-export function toServer(p: RunPodPod): Server<RunPodPod> {
+export function toServer(p: RunPodPod): Server<RunPodPod, RunPodRegionName> {
     const ports = (p.runtime?.ports ?? []).map((x) => ({
         privatePort: x.private,
         ...(x.public != null ? { publicPort: x.public } : {}),
@@ -136,7 +149,7 @@ export function toServer(p: RunPodPod): Server<RunPodPod> {
         offerId: p.gpu?.id ?? (p.cpu ? cpuOfferId(p.cpu.id, p.cpu.vcpuCount) : undefined),
         gpu: p.gpu ? runPodGpuName(p.gpu.id) : undefined,
         gpuCount: p.gpu?.count,
-        region: p.dataCenterId ?? undefined,
+        region: (p.dataCenterId ?? undefined) as RunPodRegionName | undefined,
         ...(countryOf(p.dataCenterId) ? { country: countryOf(p.dataCenterId) } : {}),
         // The host's public address: sshd's direct endpoint, else a mapped tcp port.
         // An http port's ip is RunPod's proxy network, not the host.
@@ -159,12 +172,12 @@ export function toServer(p: RunPodPod): Server<RunPodPod> {
  * A network volume as a volume. RunPod reports no state for one, nor what
  * mounts it: one that is listed can be mounted, by any number of pods in its data center.
  */
-export function toVolume(v: RunPodNetworkVolume): Volume<RunPodNetworkVolume> {
+export function toVolume(v: RunPodNetworkVolume): Volume<RunPodNetworkVolume, RunPodRegionName> {
     return {
         provider: RUNPOD_ID,
         id: v.id,
         name: v.name,
-        region: v.dataCenter,
+        region: v.dataCenter as RunPodRegionName,
         sizeGb: v.size,
         shared: true,
         status: 'available',
@@ -220,7 +233,7 @@ export const RUNPOD_SERVERLESS_HOST = 'api.runpod.ai';
  * the pool's flex price (per second while a worker runs); null for a type in
  * no pool, or with no serverless price. Its regions: the data centers with stock.
  */
-export function toServerlessGpuOffer(g: RunPodGpuType): Offer<RunPodGpuType> | null {
+export function toServerlessGpuOffer(g: RunPodGpuType): Offer<RunPodGpuType, RunPodRegionName> | null {
     const price = Number(g.price?.serverless);
     if (!g.pool || !(price > 0)) return null;
     return {
@@ -232,20 +245,20 @@ export function toServerlessGpuOffer(g: RunPodGpuType): Offer<RunPodGpuType> | n
         vramGb: Number(g.memory ?? canonicalGpu(g.id)?.vramGb ?? 0),
         pricePerHour: price,
         billing: RUNPOD_BILLING,
-        ...located((g.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id), countryOf),
+        ...located((g.dataCenters ?? []).filter((d) => IN_STOCK.has(d.availability)).map((d) => d.id as RunPodRegionName), countryOf),
         raw: g,
     };
 }
 
 /** A CPU flavor at `vcpuCount` (2 or more) as an endpoint offer, at its serverless price; null when it has none. */
-export function toServerlessCpuOffer(cpu: RunPodCpuType, vcpuCount: number): Offer<RunPodCpuOffer> | null {
+export function toServerlessCpuOffer(cpu: RunPodCpuType, vcpuCount: number): Offer<RunPodCpuOffer, RunPodRegionName> | null {
     if (vcpuCount < 2 || !(Number(cpu.price?.serverlessPerVcpu) > 0)) return null;
     const offer = toCpuOffer({ ...cpu, price: { ...cpu.price, securePerVcpu: cpu.price.serverlessPerVcpu } }, vcpuCount);
     return offer && { ...offer, raw: { cpu, vcpuCount } };
 }
 
 /** A serverless endpoint as asap-vps reports it. RunPod gives an endpoint no status: one that exists takes requests. */
-export function toEndpoint(e: RunPodEndpoint): Endpoint<RunPodEndpoint> {
+export function toEndpoint(e: RunPodEndpoint): Endpoint<RunPodEndpoint, RunPodRegionName> {
     const urls = e.requestUrls;
     const base = urls && 'base' in urls ? urls.base : `https://${e.type === 'LOAD_BALANCER' ? `${e.id}.${RUNPOD_SERVERLESS_HOST}` : `${RUNPOD_SERVERLESS_HOST}/v2/${e.id}`}`;
     const port = Number(e.env?.PORT ?? /^(\d+)\/http$/.exec(e.ports?.[0] ?? '')?.[1] ?? 80);
@@ -260,7 +273,7 @@ export function toEndpoint(e: RunPodEndpoint): Endpoint<RunPodEndpoint> {
         image: e.image ?? '',
         port,
         ...(cpu ? { offerId: cpuOfferId(cpu.id, cpu.vcpuCount) } : {}),
-        ...(e.dataCenterIds?.length === 1 ? { region: e.dataCenterIds[0] } : {}),
+        ...(e.dataCenterIds?.length === 1 ? { region: e.dataCenterIds[0] as RunPodRegionName } : {}),
         minWorkers: e.workers?.min ?? 0,
         maxWorkers: e.workers?.max ?? 0,
         ...(e.workers?.idleTimeout !== undefined ? { idleTimeoutSeconds: e.workers.idleTimeout } : {}),

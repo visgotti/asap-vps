@@ -5,11 +5,12 @@
 // containers that crash or go silent never reach running, and each offer is one
 // machine, whose driver's CUDA version is read before it is rented.
 
-import { CUDA_TYPES, MACHINE_TYPES } from '../../constants';
+import { COUNTRY_TYPES, CUDA_TYPES, MACHINE_TYPES } from '../../constants';
 import { RegistryClient, sshdBootScript } from '../../Core/utils';
 import { CapacityError, isRetriable, NotFoundError, NotSupportedError, ProviderError } from '../../errors';
 import { json, testPublicKey, waitingClock } from '../../testing/fakes/util';
 import { FAKE_SNAPSHOTS, fakeVast } from '../../testing/fakes/vast';
+import type { ComputeKind } from '../../types';
 import { VastAI } from './VastAI';
 
 const noSleep = async () => {};
@@ -256,9 +257,10 @@ describe('Vast.ai API facts', () => {
         const before = searches(fake).length;
         // The page of the cheapest holds none of them.
         expect((await p.listOffers()).some((o) => ['3900', '3901', '3902'].includes(o.id))).toBe(false);
-        const japan = await p.listOffers({ countries: ['jp'] });
+        // In lower case too, as a caller the compiler does not check may write a code.
+        const japan = await p.listOffers({ countries: ['jp' as COUNTRY_TYPES] });
         expect(japan.map((o) => [o.id, o.pricePerHour, o.regions])).toEqual([['3901', 0.8, ['Osaka, JP', 'machine:4901']], ['3900', 0.9, ['Tokyo, JP', 'machine:4900']]]);
-        expect((await p.listOffers({ countries: ['BR', 'jp', 'BR'] })).map((o) => o.id)).toEqual(['3902', '3901', '3900']);
+        expect((await p.listOffers({ countries: ['BR', 'jp' as COUNTRY_TYPES, 'BR'] })).map((o) => o.id)).toEqual(['3902', '3901', '3900']);
         // What the search was asked: nothing of countries where none was named, the codes as ISO writes them (each once) where some were.
         expect(searches(fake).slice(before).map((c) => c.body.geolocation)).toEqual([undefined, { in: ['JP'] }, { in: ['BR', 'JP'] }]);
         // An interruptible search is asked the same.
@@ -271,8 +273,23 @@ describe('Vast.ai API facts', () => {
         const { p, fake } = make();
         const before = fake.calls.length;
         expect(await p.listOffers({ countries: [] })).toEqual([]);
+        // @ts-expect-error: a name, not a code
         await expect(p.listOffers({ countries: ['Japan'] })).rejects.toMatchObject({ name: 'ProviderError', message: 'asap-vps: bad country "Japan": use an ISO 3166-1 alpha-2 code, e.g. US' });
-        await expect(p.listOffers({ countries: [] as string[], kind: 'gpu', gpus: ['RTX 4090'] })).resolves.toEqual([]);
+        await expect(p.listOffers({ countries: [] as COUNTRY_TYPES[], kind: 'gpu', gpus: ['RTX 4090'] })).resolves.toEqual([]);
+        expect(fake.calls).toHaveLength(before);
+    });
+
+    it('a question about machines without GPUs is no offer and no search; a query that is not well formed is refused all the same, a kind that is none before Vast is asked anything', async () => {
+        const { p, fake } = make();
+        const before = fake.calls.length;
+        expect([await p.listOffers({ kind: 'cpu' }), await p.listOffers({ gpuCount: 0 }), await p.listOffers({ kind: 'cpu', countries: ['JP'], minCudaVersion: '12.8' })]).toEqual([[], [], []]);
+        const kind = { name: 'ProviderError', message: 'asap-vps: bad kind "GPU": use one of gpu, cpu, any' };
+        await expect(p.listOffers({ kind: 'GPU' as ComputeKind })).rejects.toMatchObject(kind);
+        await expect(p.listOffers({ kind: 'GPU' as ComputeKind, gpus: ['RTX 4090'], maxPricePerHour: 1 })).rejects.toMatchObject(kind);
+        // What lists nothing here hides no part of the query that is none.
+        await expect(p.listOffers({ kind: 'cpu', countries: ['Japan' as COUNTRY_TYPES] })).rejects.toMatchObject({ name: 'ProviderError', message: 'asap-vps: bad country "Japan": use an ISO 3166-1 alpha-2 code, e.g. US' });
+        await expect(p.listOffers({ gpuCount: 0, minCudaVersion: 'latest' })).rejects.toMatchObject({ name: 'ProviderError', message: 'asap-vps: bad CUDA version "latest": use major.minor, e.g. 12.8' });
+        await expect(p.listOffers({ countries: [], minCudaVersion: 'latest' })).rejects.toMatchObject({ name: 'ProviderError', message: 'asap-vps: bad CUDA version "latest": use major.minor, e.g. 12.8' });
         expect(fake.calls).toHaveLength(before);
     });
 
@@ -297,6 +314,20 @@ describe('Vast.ai API facts', () => {
         }) });
         const e = await p.createServer({ name: 'x', offer: '101', image: 'img' }).catch((x) => x);
         expect([e.constructor.name, e.status, e.code, isRetriable(e)]).toEqual(['ProviderError', 429, 'rate_limited', true]);
+        expect(sent).toBe(4);
+    });
+
+    it('a daily search quota spent (seen 2026-10-14) is a QuotaError, which nothing retries: only the HTTP layer\'s few tries of any 429 are spent on it', async () => {
+        const fake = fakeVast();
+        let sent = 0;
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (method, path) => {
+            if (method !== 'POST' || path !== '/api/v0/bundles/') return undefined;
+            sent++;
+            return json(429, { success: false, msg: 'Daily search row quota exhausted' });
+        }) });
+        const e = await p.listOffers().catch((x) => x);
+        expect([e.constructor.name, e.status, e.message, isRetriable(e)]).toEqual(['QuotaError', 429, 'vast: POST /api/v0/bundles/ -> 429 Daily search row quota exhausted', false]);
+        // The first search's tries, as for any 429 (http reads no body before it tries again); then no other search.
         expect(sent).toBe(4);
     });
 
@@ -773,6 +804,10 @@ describe('Vast volumes: storage on one machine, mounted by an instance rented th
         expect((await p.offersOn('machine:14', { includeInterruptible: true })).map((o) => o.id)).toEqual(['104:bid:0.05', '104']);
         expect(await p.offersOn('machine:999')).toEqual([]);
         await expect(p.offersOn('Ohio, US')).rejects.toThrow(/names no machine/);
+        // The query means what it means in listOffers: a kind that is none is refused, not read as one.
+        expect((await p.offersOn('machine:14', { kind: 'gpu' })).map((o) => o.id)).toEqual(['104']);
+        expect(await p.offersOn('machine:14', { kind: 'cpu' })).toEqual([]);
+        await expect(p.offersOn('machine:14', { kind: 'GPU' as ComputeKind })).rejects.toMatchObject({ name: 'ProviderError', message: 'asap-vps: bad kind "GPU": use one of gpu, cpu, any' });
     });
 
     it('createVolume rents the machine\'s storage, named as Vast takes names; read, listed (a withdrawn network volume is not), deleted, idempotently', async () => {

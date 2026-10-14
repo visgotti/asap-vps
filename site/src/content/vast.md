@@ -48,7 +48,7 @@ const vast = new VastAI(process.env.VAST_API_KEY!);
 const [offer] = await vast.listOffers();
 
 try {
-  await vast.createServer({ name: "x", offer, region: "Mars", image: "ubuntu:24.04" });
+  await vast.createServer({ name: "x", offer, region: "machine:999999", image: "ubuntu:24.04" }); // another machine than the offer's
 } catch (e) {
   console.log((e as Error).message);
 }

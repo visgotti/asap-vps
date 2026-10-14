@@ -22,7 +22,7 @@ import {
 } from '../../testing/live';
 import type { Offer, Server, Volume } from '../../types';
 import { DigitalOcean } from './DigitalOcean';
-import type { DigitalOceanDropletData, DigitalOceanSizeData, DigitalOceanVolumeData } from './types';
+import type { DigitalOceanDropletData, DigitalOceanRegionName, DigitalOceanSizeData, DigitalOceanVolumeData } from './types';
 
 const requested = liveRequested('digitalocean-cpu');
 const { freeOnly, maxPricePerHour } = liveOptions();
@@ -39,10 +39,10 @@ const SSH_RETRY = { maxRetries: 30, retryTimeout: 10_000 };
     let refused = false;
     let volumeIds = new Set<string>();
     let keyIds = new Set<string>();
-    let offer: Offer<DigitalOceanSizeData>;
-    let region: string;
-    let vol: Volume<DigitalOceanVolumeData>;
-    let first: ProvisionResult<Server<DigitalOceanDropletData>>;
+    let offer: Offer<DigitalOceanSizeData, DigitalOceanRegionName>;
+    let region: DigitalOceanRegionName;
+    let vol: Volume<DigitalOceanVolumeData, DigitalOceanRegionName>;
+    let first: ProvisionResult<Server<DigitalOceanDropletData, DigitalOceanRegionName>>;
     /** Where DigitalOcean mounts the volume (its mountPath). */
     const at = () => vol.mountPath!;
     /**
@@ -56,7 +56,7 @@ const SSH_RETRY = { maxRetries: 30, retryTimeout: 10_000 };
         sshKeyName: name,
         wait: WAIT,
         sshRetry: SSH_RETRY,
-    }, (pipeline) => void pipeline.addStep(new RunCommandStep(commands, 'volume'))) as Promise<ProvisionResult<Server<DigitalOceanDropletData>>>;
+    }, (pipeline) => void pipeline.addStep(new RunCommandStep(commands, 'volume'))) as Promise<ProvisionResult<Server<DigitalOceanDropletData, DigitalOceanRegionName>>>;
     const output = (r: ProvisionResult) => r.setupResults.map((x) => `${x.output ?? ''}${x.message ?? ''}`).join('\n');
 
     beforeAll(async () => {

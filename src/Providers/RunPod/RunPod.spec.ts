@@ -1217,9 +1217,13 @@ describe('RunPod network volumes and registry logins', () => {
         await expect(p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 4097 })).rejects.toThrow(/10-4096 GB/);
         // The bounds themselves are sizes RunPod takes.
         expect((await p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 4096 })).sizeGb).toBe(4096);
+        // @ts-expect-error XX-NOWHERE-1 is no data center of RunPod's
         await expect(p.createVolume({ name: 'v', region: 'XX-NOWHERE-1', sizeGb: 10 })).rejects.toThrow(ProviderError);
-        const fast = await p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 100, providerOptions: { type: 'HIGH_PERFORMANCE' } });
-        expect(fast.raw).toMatchObject({ size: 100, type: 'HIGH_PERFORMANCE', dataCenter: 'US-TX-3' });
+        // The tier is the data center's to make: CA-MTL-4 makes both, US-TX-3 standard ones only (RunPod's catalog, RUNPOD_DATA_CENTERS).
+        const fast = await p.createVolume({ name: 'v', region: 'CA-MTL-4', sizeGb: 100, providerOptions: { type: 'HIGH_PERFORMANCE' } });
+        expect(fast.raw).toMatchObject({ size: 100, type: 'HIGH_PERFORMANCE', dataCenter: 'CA-MTL-4' });
+        await expect(p.createVolume({ name: 'v', region: 'US-TX-3', sizeGb: 100, providerOptions: { type: 'HIGH_PERFORMANCE' } }))
+            .rejects.toThrow('runpod: POST /v2/network-volumes -> 400 data center US-TX-3 makes no HIGH_PERFORMANCE network volume');
         expect(last(fake.calls.filter((c) => c.path === '/v2/network-volumes'))?.body).toEqual({ name: 'v', size: 100, dataCenter: 'US-TX-3', type: 'HIGH_PERFORMANCE' });
     });
 
@@ -1247,7 +1251,11 @@ describe('RunPod network volumes and registry logins', () => {
         await expect(p.createServer({ name: 'a', offer, ...login, minCudaVersion: 'twelve' })).rejects.toThrow(/bad CUDA version/);
         await expect(p.createServer({ name: 'a', offer, ...login, sshKeyIds: ['no-such-key'] })).rejects.toBeInstanceOf(ProviderError);
         await expect(p.createServer({ name: 'a', offer, ...login, sshKeyIds: ['k'], env: { PUBLIC_KEY: 'ssh-ed25519 AAAA mine' } })).rejects.toThrow(/sshKeyIds or env.PUBLIC_KEY/);
-        await expect(p.createEndpoint({ name: 'e', container: login, region: REGION_TYPES.TORONTO })).rejects.toBeInstanceOf(NotSupportedError);
+        // A region RunPod has no data center for is refused before the catalog is read, and so before any login is stored.
+        const asked = fake.calls.length;
+        // @ts-expect-error RunPod has no Toronto
+        await expect(p.createEndpoint({ name: 'e', container: login, region: REGION_TYPES.CANADA_TORONTO })).rejects.toBeInstanceOf(NotSupportedError);
+        expect(fake.calls).toHaveLength(asked);
         expect(fake.state.registries.size).toBe(0);
         expect(podBodies(fake)).toEqual([]);
     });

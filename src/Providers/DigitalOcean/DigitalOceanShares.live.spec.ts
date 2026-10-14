@@ -20,7 +20,7 @@ import {
 import { DO_NFS_REGIONS as NFS_REGIONS } from '../../testing/fakes/digitalocean';
 import type { Offer, Server, Volume } from '../../types';
 import { DigitalOcean } from './DigitalOcean';
-import type { DigitalOceanDropletData, DigitalOceanNfsShare, DigitalOceanSizeData } from './types';
+import type { DigitalOceanDropletData, DigitalOceanRegionName, DigitalOceanNfsShare, DigitalOceanSizeData } from './types';
 
 const requested = liveRequested('digitalocean-cpu');
 const { freeOnly, maxPricePerHour } = liveOptions();
@@ -37,16 +37,16 @@ const PATH = '/mnt/shared';
     let refused = false;
     let volumeIds = new Set<string>();
     let keyIds = new Set<string>();
-    let offer: Offer<DigitalOceanSizeData>;
-    let region: string;
-    let share: Volume<DigitalOceanNfsShare>;
-    const droplets: Array<ProvisionResult<Server<DigitalOceanDropletData>>> = [];
+    let offer: Offer<DigitalOceanSizeData, DigitalOceanRegionName>;
+    let region: DigitalOceanRegionName;
+    let share: Volume<DigitalOceanNfsShare, DigitalOceanRegionName>;
+    const droplets: Array<ProvisionResult<Server<DigitalOceanDropletData, DigitalOceanRegionName>>> = [];
     const provision = (name: string, commands: string[]) => new ServerProvisioner(p).provision({
         serverOptions: { name, offer, region, mounts: [{ volume: share, path: PATH }] },
         sshKeyName: name,
         wait: WAIT,
         sshRetry: { maxRetries: 30, retryTimeout: 10_000 },
-    }, (pipeline) => void pipeline.addStep(new RunCommandStep(commands, 'share'))) as Promise<ProvisionResult<Server<DigitalOceanDropletData>>>;
+    }, (pipeline) => void pipeline.addStep(new RunCommandStep(commands, 'share'))) as Promise<ProvisionResult<Server<DigitalOceanDropletData, DigitalOceanRegionName>>>;
     /** Until cloud-init is done and the share is mounted: its filesystem type, or a failure on stderr. */
     const mounted = `cloud-init status --wait >/dev/null 2>&1 || true; for i in $(seq 1 60); do findmnt -n ${PATH} >/dev/null && break; sleep 2; done; `
         + `findmnt -n -o FSTYPE ${PATH} || { echo "nothing is mounted at ${PATH}: $(tail -5 /var/log/cloud-init-output.log)" >&2; exit 1; }`;

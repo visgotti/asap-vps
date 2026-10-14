@@ -3,13 +3,19 @@
 // src/Providers/<Platform>, a fake in ./fakes, and one entry here; the contract
 // then holds it to the same scenario, for each capability it declares.
 
+import type { REGION_TYPES } from '../constants';
 import { DigitalOcean } from '../Providers/DigitalOcean/DigitalOcean';
+import { DIGITALOCEAN_ENUMS } from '../Providers/DigitalOcean/mappers';
+import { LAMBDA_ENUMS } from '../Providers/LambdaCloud/mappers';
+import { RUNPOD_ENUMS } from '../Providers/RunPod/mappers';
 import { LambdaCloud } from '../Providers/LambdaCloud/LambdaCloud';
-import type { AnyProvider } from '../Providers/registry';
+import type { BaseProvider } from '../Core/BaseProvider';
 import { RunPod } from '../Providers/RunPod/RunPod';
+import { SCALEWAY_ENUMS } from '../Providers/Scaleway/mappers';
 import { Scaleway } from '../Providers/Scaleway/Scaleway';
 import { VastAI } from '../Providers/VastAI/VastAI';
 import type { ContainerSpec, CreateServerOptions, Offer, RegistryAuth } from '../types';
+import { SCALEWAY_REGIONS, SCALEWAY_ZONES } from '../Providers/Scaleway/types';
 import type { ScalewayOfferRaw } from '../Providers/Scaleway/types';
 import { fakeDigitalOcean } from './fakes/digitalocean';
 import { fakeLambda } from './fakes/lambda';
@@ -21,11 +27,20 @@ import { FAKE_SNAPSHOTS, fakeVast } from './fakes/vast';
 /** The body of the last request `fake` was sent for `method` `path` (a pattern). */
 const lastBody = (fake: FakeApi, method: string, path: RegExp) => [...fake.calls].reverse().find((c) => c.method === method && path.test(c.path))?.body;
 
+/**
+ * A provider as the contract asks it: as code typed for any provider does
+ * (the base class, its capabilities by `supports`), so every provider is asked
+ * the same, in the library's words or its own, and refuses at run time what
+ * it has not (a region of the library's it has no place for). What each
+ * provider's own types take is typing.spec.ts's.
+ */
+export type ContractProvider = BaseProvider;
+
 export type ContractSubject = {
     name: string,
-    make(o?: { apiKey?: string }): { provider: AnyProvider, fake: FakeApi },
-    /** What createServer needs on this provider beyond a name, an offer and a region. */
-    extra(provider: AnyProvider): Promise<Partial<CreateServerOptions>>,
+    make(o?: { apiKey?: string }): { provider: ContractProvider, fake: FakeApi },
+    /** What createServer needs on this provider beyond a name, an offer and a region (never a region: a test names its own). */
+    extra(provider: ContractProvider): Promise<Partial<Omit<CreateServerOptions, 'region'>>>,
     /**
      * Its cheapest GPU offer in stock, field by field as listOffers gives it
      * (raw aside), each value checked against the fake's catalog record: what
@@ -36,6 +51,12 @@ export type ContractSubject = {
     sshUser?: string,
     /** A region to try an out-of-stock offer in. */
     anyRegion: string,
+    /** Its pick of the library's regions, by its own names for them (its translation table); none where it has no place the library names. */
+    regions: Readonly<Partial<Record<REGION_TYPES, string>>>,
+    /** The place the platform was last asked to make a volume in (providers with a pick of the library's regions): where a create went, whether or not the platform had room there. */
+    volumeAskedIn?: (fake: FakeApi) => string | undefined,
+    /** Where the platform is asked for a place of its own a table names, given the zones an offer has stock in (default: that place itself): Scaleway puts a region's resources in a zone of it. */
+    placedIn?: (own: string, stock?: readonly string[]) => string,
     /** An id no server has. */
     unknownId: string,
     /** An option this provider must refuse rather than drop. */
@@ -49,7 +70,7 @@ export type ContractSubject = {
     /** For a kind made in one region only (elsewhere gives none): another region to ask for, and how the provider refuses it. */
     oneRegion?: Partial<Record<'block' | 'shared', { other: string, refusal: RegExp }>>,
     /** Where the servers that mount a volume of `kind` go, where the cheapest GPU offer is no place for it (default: that offer, in its first region). */
-    volumePlace?: (provider: AnyProvider, kind: 'block' | 'shared') => Promise<{ offer: Offer, region: string } | undefined>,
+    volumePlace?: (provider: ContractProvider, kind: 'block' | 'shared') => Promise<{ offer: Offer, region: string } | undefined>,
     /** A volume's name as the platform takes it, where it takes fewer characters than a test name has (default: as it is). */
     volumeName?: (name: string) => string,
     /** The registry login the platform was given with its last server create (container providers): what it will pull with. */
@@ -76,13 +97,15 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         },
         extra: async () => ({ userData: '#!/bin/bash\ntrue\n', tags: ['gpu-contract'] }),
         anyRegion: 'tor1',
+        regions: DIGITALOCEAN_ENUMS.regions,
+        volumeAskedIn: (fake) => lastBody(fake, 'POST', /^\/v2\/volumes$/)?.region,
         unknownId: '424242',
         refused: { env: { MODE: 'probe' } },
         // Network File Storage is in a few regions only (none of them the cheapest GPU's): NYC2 and ATL1 among them.
         elsewhere: (region, kind) => (kind === 'shared' ? (region === 'nyc2' ? 'atl1' : 'nyc2') : region === 'nyc1' ? 'tor1' : 'nyc1'),
         volumePlace: async (p, kind) => {
             if (kind !== 'shared') return undefined;
-            const offer = (await p.listOffers({ kind: 'gpu' })).find((o) => o.regions.includes('nyc2'));
+            const offer = (await p.listOffers({ kind: 'gpu' })).find((o) => (o.regions as readonly string[]).includes('nyc2'));
             return offer && { offer, region: 'nyc2' };
         },
         userDataOf: (fake) => lastBody(fake, 'POST', /^\/v2\/droplets$/)?.user_data,
@@ -98,6 +121,8 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         },
         extra: async () => ({ image: CUDA_IMAGE, env: { MODE: 'probe' }, ports: ['8888/http'], command: ['nvidia-smi', '-L'] }),
         anyRegion: 'US-TX-3',
+        regions: RUNPOD_ENUMS.regions,
+        volumeAskedIn: (fake) => lastBody(fake, 'POST', /^\/v2\/network-volumes$/)?.dataCenter,
         unknownId: 'pod_missing',
         refused: { userData: '#!/bin/bash\ntrue\n' },
         anyGpuCount: true,
@@ -127,6 +152,7 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         },
         extra: async () => ({ image: CUDA_IMAGE, env: { MODE: 'probe' }, ports: ['8080/tcp'], command: ['nvidia-smi', '-L'] }),
         anyRegion: 'Sweden, SE',
+        regions: {},
         unknownId: '1',
         // An instance has no tags (its userData is a script run before its command).
         refused: { tags: ['contract'] },
@@ -169,6 +195,8 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         // Lambda requires a key: the fake account has one.
         extra: async (p) => ({ sshKeyIds: [(await (p as LambdaCloud).listSSHKeys())[0].id], userData: '#cloud-config\n' }),
         anyRegion: 'us-east-1',
+        regions: LAMBDA_ENUMS.regions,
+        volumeAskedIn: (fake) => lastBody(fake, 'POST', /^\/api\/v1\/filesystems$/)?.region,
         unknownId: 'f'.repeat(32),
         refused: { env: { MODE: 'probe' } },
         elsewhere: (region) => (region === 'us-west-1' ? 'us-east-1' : 'us-west-1'),
@@ -187,6 +215,13 @@ export const CONTRACT_SUBJECTS: ContractSubject[] = [
         extra: async () => ({ userData: '#cloud-config\n' }),
         // Where the fake's H100 has no stock: the type exists there, and a create is refused for want of it.
         anyRegion: 'fr-par-2',
+        regions: SCALEWAY_ENUMS.regions,
+        // A region stands for a zone of it: the offer's first there with stock, else the first (this provider reads every zone).
+        placedIn: (own, stock = []) => ((SCALEWAY_REGIONS as readonly string[]).includes(own)
+            ? SCALEWAY_ZONES.filter((z) => z.startsWith(`${own}-`)).find((z) => stock.includes(z)) ?? SCALEWAY_ZONES.find((z) => z.startsWith(`${own}-`))!
+            : own),
+        // A volume is made in the zone its path names.
+        volumeAskedIn: (fake) => /\/zones\/([^/]+)\/volumes$/.exec([...fake.calls].reverse().find((c) => c.method === 'POST' && /^\/block\/v1\/zones\/[^/]+\/volumes$/.test(c.path))?.path ?? '')?.[1],
         // A server id is a UUID, asked of every zone.
         unknownId: '00000000-0000-4000-8000-ffffffffffff',
         refused: { env: { MODE: 'probe' } },

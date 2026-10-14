@@ -8,12 +8,15 @@
 // ScalewayTypes; the API client (api.ts) builds on them, never the other way.
 
 import type { EnumTranslations } from '../../Core/BaseProvider';
-import { errorText, gpuName, gpuVendor, located, sshKeyFingerprint } from '../../Core/utils';
-import { MACHINE_TYPES, REGION_TYPES } from '../../constants';
+import { asCountry, errorText, gpuName, gpuVendor, located, regionTable, sshKeyFingerprint } from '../../Core/utils';
+import { MACHINE_TYPES } from '../../constants';
+import type { COUNTRY_TYPES } from '../../constants';
 import type {
     Billing, Endpoint, EndpointStatus, GpuVendor, ImageStatus, InitializedSSHKeyData, Offer, RefusableOption, Server, ServerImage, ServerStatus, Volume, VolumeStatus,
 } from '../../types';
+import { SCALEWAY_PLACES } from './places';
 import { SCALEWAY_REGIONS, SCALEWAY_ZONES } from './types';
+import type { ScalewayRegionName } from './types';
 import type {
     ScalewayBlockVolume, ScalewayBlockVolumeStatus, ScalewayContainer, ScalewayContainerSize, ScalewayContainerStatus, ScalewayErrorBody, ScalewayFileSystem,
     ScalewayFileSystemStatus, ScalewayImage, ScalewayImageState, ScalewayOfferRaw, ScalewayRegion, ScalewayServer, ScalewayServerState, ScalewayServerType,
@@ -103,9 +106,9 @@ export function billingOf(name: string, t?: ScalewayServerType): Billing | undef
     return t && (gpuOf(t) ? BILLING_PER_MINUTE : BILLING_PER_HOUR);
 }
 
-/** The country a zone or a region is in: the two letters its name begins with ('fr-par-2', 'nl-ams': 'FR', 'NL'). */
-export function countryOf(place: string): string {
-    return place.slice(0, 2).toUpperCase();
+/** The country a zone or a region is in: the two letters its name begins with ('fr-par-2', 'nl-ams': 'FR', 'NL'), where ISO gives a country them. */
+export function countryOf(place: string): COUNTRY_TYPES | undefined {
+    return asCountry(place.slice(0, 2).toUpperCase());
 }
 
 /** Scaleway's GPU OS image of Ubuntu 24.04 (Marketplace label), which boots every GPU type and no other: the NVIDIA driver, and Docker with NVIDIA's runtime to run CUDA containers in. */
@@ -114,27 +117,14 @@ export const SCALEWAY_GPU_IMAGE = 'ubuntu_noble_gpu_os_13_nvidia';
 export const SCALEWAY_CPU_IMAGE = 'ubuntu_noble';
 
 /**
- * The library's enums by Scaleway's names: a region is its first zone, `_N` the zone; each Ubuntu is its Marketplace
- * label, and with `cuda` its GPU OS image's (the NVIDIA driver and Docker with NVIDIA's runtime; none of Ubuntu 20.04).
- * A plain label boots only types without GPUs and a GPU OS one only GPU types (Marketplace: compatible_commercial_types).
+ * The library's enums by Scaleway's names. The regions are its places' (SCALEWAY_PLACES): a city is its region
+ * (FRANCE_PARIS: fr-par), which stands for its first zone where a call makes something in a zone (zoneOf), and a
+ * zone its own (FRANCE_PARIS_2: fr-par-2). Each Ubuntu is its Marketplace label, and with `cuda` its GPU OS image's
+ * (the NVIDIA driver and Docker with NVIDIA's runtime; none of Ubuntu 20.04). A plain label boots only types without
+ * GPUs and a GPU OS one only GPU types (Marketplace: compatible_commercial_types).
  */
-export const SCALEWAY_ENUMS: EnumTranslations = Object.freeze({
-    regions: {
-        [REGION_TYPES.PARIS]: 'fr-par-1',
-        [REGION_TYPES.PARIS_1]: 'fr-par-1',
-        [REGION_TYPES.PARIS_2]: 'fr-par-2',
-        [REGION_TYPES.PARIS_3]: 'fr-par-3',
-        [REGION_TYPES.AMSTERDAM]: 'nl-ams-1',
-        [REGION_TYPES.AMSTERDAM_1]: 'nl-ams-1',
-        [REGION_TYPES.AMSTERDAM_2]: 'nl-ams-2',
-        [REGION_TYPES.AMSTERDAM_3]: 'nl-ams-3',
-        [REGION_TYPES.WARSAW]: 'pl-waw-1',
-        [REGION_TYPES.WARSAW_1]: 'pl-waw-1',
-        [REGION_TYPES.WARSAW_2]: 'pl-waw-2',
-        [REGION_TYPES.WARSAW_3]: 'pl-waw-3',
-        [REGION_TYPES.MILAN]: 'it-mil-1',
-        [REGION_TYPES.MILAN_1]: 'it-mil-1',
-    },
+export const SCALEWAY_ENUMS = Object.freeze({
+    regions: regionTable(SCALEWAY_PLACES, (p) => p.name),
     machines: {
         [MACHINE_TYPES.UBUNTU_24]: SCALEWAY_CPU_IMAGE,
         [MACHINE_TYPES.UBUNTU_22]: 'ubuntu_jammy',
@@ -144,7 +134,7 @@ export const SCALEWAY_ENUMS: EnumTranslations = Object.freeze({
         [MACHINE_TYPES.UBUNTU_24]: SCALEWAY_GPU_IMAGE,
         [MACHINE_TYPES.UBUNTU_22]: 'ubuntu_jammy_gpu_os_12',
     },
-});
+} as const satisfies EnumTranslations);
 
 // ── records ──────────────────────────────────────────────────────────────
 
@@ -166,7 +156,7 @@ export function gpuOf(t?: ScalewayServerType): { count: number, name: string, ve
 }
 
 /** A type as an offer: priced in USD at `eurToUsd`, its regions the zones with stock now. */
-export function toOffer(name: string, raw: ScalewayOfferRaw, regions: ScalewayZone[], eurToUsd: number): Offer<ScalewayOfferRaw> {
+export function toOffer(name: string, raw: ScalewayOfferRaw, regions: ScalewayZone[], eurToUsd: number): Offer<ScalewayOfferRaw, ScalewayRegionName> {
     const t = raw.serverType;
     const g = gpuOf(t);
     const local = t.volumes_constraint.max_size / GB;
@@ -189,7 +179,7 @@ export function toOffer(name: string, raw: ScalewayOfferRaw, regions: ScalewayZo
 }
 
 /** A server, with its type's record when the catalog has it (its GPUs, price and billing). */
-export function toServer(s: ScalewayServer, type: ScalewayServerType | undefined, eurToUsd: number): Server<ScalewayServer> {
+export function toServer(s: ScalewayServer, type: ScalewayServerType | undefined, eurToUsd: number): Server<ScalewayServer, ScalewayRegionName> {
     const { ip, ipv6, privateIp } = serverAddresses(s);
     const g = gpuOf(type);
     return {
@@ -221,7 +211,7 @@ export function toServer(s: ScalewayServer, type: ScalewayServerType | undefined
 }
 
 /** A Block Storage volume as a volume, named by its zone (`fr-par-2/<uuid>`): its servers are those it is attached to. */
-export function toVolume(v: ScalewayBlockVolume): Volume<ScalewayBlockVolume> {
+export function toVolume(v: ScalewayBlockVolume): Volume<ScalewayBlockVolume, ScalewayRegionName> {
     const servers = (v.references ?? []).filter((r) => r.product_resource_type === 'instance_server' && (r.status === 'attached' || r.status === 'attaching'));
     return {
         provider: SCALEWAY_ID,
@@ -238,7 +228,7 @@ export function toVolume(v: ScalewayBlockVolume): Volume<ScalewayBlockVolume> {
     };
 }
 
-export function toImage(i: ScalewayImage): ServerImage<ScalewayImage> {
+export function toImage(i: ScalewayImage): ServerImage<ScalewayImage, ScalewayRegionName> {
     const bytes = imageVolumes(i).reduce((sum, v) => sum + v.size, 0);
     return {
         provider: SCALEWAY_ID,
@@ -374,7 +364,7 @@ export function parseContainerSizeId(id: string): ScalewayContainerSize | null {
 }
 
 /** A container size as an endpoint offer: no GPU, billed per second while an instance runs, in every region. */
-export function toContainerOffer(s: ScalewayContainerSize, eurToUsd: number): Offer<ScalewayContainerSize> {
+export function toContainerOffer(s: ScalewayContainerSize, eurToUsd: number): Offer<ScalewayContainerSize, ScalewayRegionName> {
     const eurPerHour = ((s.mvcpu / 1000) * CONTAINER_PRICE.vcpuSecond + (s.memoryBytes / 1e9) * CONTAINER_PRICE.gbSecond) * 3600;
     return {
         provider: SCALEWAY_ID, id: containerSizeId(s), gpu: '', vendor: null, gpuCount: 0, vramGb: 0, pricePerHour: eurPerHour * eurToUsd,
@@ -410,7 +400,7 @@ export function parseRegionalId(ref: string): { region?: ScalewayRegion, id: str
 }
 
 /** A serverless container as an endpoint, named `fr-par/<uuid>`. Scaleway stops an idle instance after 15 min. */
-export function toEndpoint(c: ScalewayContainer): Endpoint<ScalewayContainer> {
+export function toEndpoint(c: ScalewayContainer): Endpoint<ScalewayContainer, ScalewayRegionName> {
     return {
         provider: SCALEWAY_ID,
         id: `${c.region}/${c.id}`,
@@ -421,7 +411,7 @@ export function toEndpoint(c: ScalewayContainer): Endpoint<ScalewayContainer> {
         image: c.image,
         port: c.port,
         offerId: containerSizeId({ mvcpu: c.mvcpu_limit, memoryBytes: c.memory_limit_bytes }),
-        region: c.region,
+        region: c.region as ScalewayRegionName,
         minWorkers: c.min_scale,
         maxWorkers: c.max_scale,
         idleTimeoutSeconds: 900,
@@ -456,13 +446,13 @@ export const FILE_SYSTEM_STATUS: Readonly<Record<ScalewayFileSystemStatus, Volum
 });
 
 /** A filesystem as a volume, named `fr-par/<uuid>`: shared, mounted at a path (default /mnt/<name>); 'attached' while an Instance has it. */
-export function toFileSystemVolume(f: ScalewayFileSystem): Volume<ScalewayFileSystem> {
+export function toFileSystemVolume(f: ScalewayFileSystem): Volume<ScalewayFileSystem, ScalewayRegionName> {
     const status = FILE_SYSTEM_STATUS[f.status] ?? 'unknown';
     return {
         provider: SCALEWAY_ID,
         id: `${f.region}/${f.id}`,
         name: f.name,
-        region: f.region,
+        region: f.region as ScalewayRegionName,
         shared: true,
         sizeGb: f.size / GB,
         status: status === 'available' && f.number_of_attachments > 0 ? 'attached' : status,
@@ -512,6 +502,6 @@ export function isCopyOf(image: ScalewayImage, sourceId: string): boolean {
 }
 
 /** An image with every region createServer boots it in: its zone, and those of its copies among `images`. */
-export function toImageWithCopies(image: ScalewayImage, images: ScalewayImage[]): ServerImage<ScalewayImage> {
+export function toImageWithCopies(image: ScalewayImage, images: ScalewayImage[]): ServerImage<ScalewayImage, ScalewayRegionName> {
     return { ...toImage(image), regions: [image.zone, ...images.filter((i) => isCopyOf(i, image.id)).map((i) => i.zone)] };
 }

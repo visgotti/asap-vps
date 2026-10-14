@@ -77,13 +77,13 @@ const SSH_RETRY = { maxRetries: 30, retryTimeout: 10_000 };
         expect(offers.find((o) => o.id === SIZE)).toMatchObject({ gpuCount: 0, vendor: null });
         for (const k of await vps.listSSHKeys()) expect(k).toEqual({ id: expect.any(String), name: expect.any(String), publicKey: expect.any(String), fingerprint: expect.stringMatching(/^SHA256:/) });
         // The zones REGION_TYPES maps onto are zones the account reads.
-        for (const r of [REGION_TYPES.PARIS_1, REGION_TYPES.AMSTERDAM, REGION_TYPES.WARSAW_2, REGION_TYPES.MILAN]) {
-            expect(vps.api.zones).toContain(SCALEWAY_ENUMS.regions?.[r]);
+        for (const r of [REGION_TYPES.FRANCE_PARIS_1, REGION_TYPES.NETHERLANDS_AMSTERDAM, REGION_TYPES.POLAND_WARSAW_2, REGION_TYPES.ITALY_MILAN] as const) {
+            expect(vps.api.zones).toContain(SCALEWAY_ENUMS.regions[r]);
         }
         // The labels MACHINE_TYPES maps onto are Marketplace's own.
         const labels = (await vps.api.listMarketplaceImages()).map((i) => i.label);
-        for (const t of [MACHINE_TYPES.UBUNTU_24, MACHINE_TYPES.UBUNTU_22, MACHINE_TYPES.UBUNTU_20]) expect(labels).toContain(SCALEWAY_ENUMS.machines?.[t]);
-        for (const t of [MACHINE_TYPES.UBUNTU_24, MACHINE_TYPES.UBUNTU_22]) expect(labels).toContain(SCALEWAY_ENUMS.cudaMachines?.[t]);
+        for (const t of [MACHINE_TYPES.UBUNTU_24, MACHINE_TYPES.UBUNTU_22, MACHINE_TYPES.UBUNTU_20] as const) expect(labels).toContain(SCALEWAY_ENUMS.machines[t]);
+        for (const t of [MACHINE_TYPES.UBUNTU_24, MACHINE_TYPES.UBUNTU_22] as const) expect(labels).toContain(SCALEWAY_ENUMS.cudaMachines[t]);
     }, 5 * 60_000);
 
     it('addSSHKey registers a key once and returns that registration for the same key again; deleteSSHKey removes it', async () => {

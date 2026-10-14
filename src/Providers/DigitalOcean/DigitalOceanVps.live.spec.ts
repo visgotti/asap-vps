@@ -14,6 +14,7 @@ import { sshKeyFingerprint } from '../../Core/utils';
 import { AuthError, QuotaError } from '../../errors';
 import { deleteRunKeys, liveOptions, liveRequested, loadCredentials, newRunName, runMatcher, startWatchdog, sweepLeftovers, teardown, trackSSHKeys } from '../../testing/live';
 import type { InitializedSSHKeyData, SSHKeyData } from '../../types';
+import type { DigitalOceanRegionName } from './types';
 import { DigitalOcean } from './DigitalOcean';
 
 const requested = liveRequested('digitalocean-vps');
@@ -21,7 +22,7 @@ const { freeOnly } = liveOptions();
 const paid = freeOnly ? it.skip : it;
 /** The smallest size the existing tests used; and the regions REGION_TYPES names on DigitalOcean. */
 const SIZE = 's-1vcpu-1gb';
-const REGIONS = ['nyc3', 'nyc1', 'nyc2'];
+const REGIONS: DigitalOceanRegionName[] = ['nyc3', 'nyc1', 'nyc2'];
 const SSH_RETRY = { maxRetries: 30, retryTimeout: 10_000 };
 /** How long DigitalOcean's list of keys may lag its writes (seconds, observed 2026-10-05) before a key is expected listed, or gone. */
 const LIST_LAG_MS = 60_000;

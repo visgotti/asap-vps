@@ -16,7 +16,7 @@
 import { NotSupportedError } from './errors';
 import type {
     CostEstimate, CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, DiskImageFormat, Endpoint, EndpointRequestInit, ImportImageOptions, InitializedSSHKeyData,
-    LogOptions, Offer, OfferQuery, PlatformTypes, Server, ServerImage, ServerListOptions, Volume, WaitOptions,
+    LogOptions, Offer, OfferQuery, PlatformTypes, RegionChoice, Server, ServerImage, ServerListOptions, Volume, WaitOptions,
 } from './types';
 
 // ── the capabilities ─────────────────────────────────────────────────────
@@ -30,18 +30,18 @@ export interface ICompute<T extends PlatformTypes = PlatformTypes> {
     /** The provider's id: what its offers, servers and errors report. */
     readonly id: string;
     /** What can be rented, with price and where it can be created now. Cheapest first. */
-    listOffers(query?: OfferQuery): Promise<Offer<T['offer']>[]>;
+    listOffers(query?: OfferQuery): Promise<Offer<T['offer'], T['regionName']>[]>;
     /**
      * Asks the provider for a server and returns at once, usually `pending`
      * (waitUntilRunning waits). Throws CapacityError when this offer or region
      * has no stock right now. An option the provider cannot honor is refused
      * (NotSupportedError) before anything is rented, never dropped.
      */
-    createServer(options: CreateServerOptions<T>): Promise<Server<T['server']>>;
+    createServer(options: CreateServerOptions<T>): Promise<Server<T['server'], T['regionName']>>;
     /** null when the provider has no such server. */
-    getServer(id: string): Promise<Server<T['server']> | null>;
+    getServer(id: string): Promise<Server<T['server'], T['regionName']> | null>;
     /** The account's servers, every one of them (other people's included): pick yours by name. */
-    listServers(options?: ServerListOptions): Promise<Server<T['server']>[]>;
+    listServers(options?: ServerListOptions): Promise<Server<T['server'], T['regionName']>[]>;
     /**
      * Idempotent: deleting a server that is already gone succeeds. A provider
      * whose delete waits (Scaleway deletes the server's volumes as they come
@@ -49,9 +49,9 @@ export interface ICompute<T extends PlatformTypes = PlatformTypes> {
      */
     deleteServer(id: string, o?: WaitOptions): Promise<void>;
     /** Poll getServer until `done` accepts what it read (a server, or null once it is gone). */
-    waitForServer(id: string, done: (s: Server<T['server']> | null) => boolean, o?: WaitOptions): Promise<Server<T['server']> | null>;
+    waitForServer(id: string, done: (s: Server<T['server'], T['regionName']> | null) => boolean, o?: WaitOptions): Promise<Server<T['server'], T['regionName']> | null>;
     /** Until the server is running (a VM also needs its public address); throws when it errors or disappears instead. */
-    waitUntilRunning(id: string, o?: WaitOptions & { requireIp?: boolean }): Promise<Server<T['server']>>;
+    waitUntilRunning(id: string, o?: WaitOptions & { requireIp?: boolean }): Promise<Server<T['server'], T['regionName']>>;
     /** Delete, and keep asking until the provider says it is gone: true only when verified. */
     deleteServerAndWait(id: string, o?: WaitOptions): Promise<boolean>;
     /** What the server's current run has cost so far, from its rate and billing start; null when the provider reports neither. */
@@ -124,16 +124,16 @@ export interface IImages<T extends PlatformTypes = PlatformTypes> {
      * the account may hold images that are not yours to boot or delete, so pick
      * yours by name.
      */
-    listImages(): Promise<ServerImage<T['image']>[]>;
+    listImages(): Promise<ServerImage<T['image'], T['regionName']>[]>;
     /** null when the provider has no such image. */
-    getImage(id: string): Promise<ServerImage<T['image']> | null>;
+    getImage(id: string): Promise<ServerImage<T['image'], T['regionName']> | null>;
     /**
      * Capture a server's disk as a bootable image, and wait until it is
      * available (minutes for tens of GB). The server keeps its state: stop it
      * first when the image must be consistent. With `capabilities.images.scope`
      * 'region' the image boots only in the server's region (until IImageCopy adds more).
      */
-    createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<T['image']>>;
+    createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<T['image'], T['regionName']>>;
     /** Idempotent: deleting an image that is already gone succeeds. */
     deleteImage(id: string): Promise<void>;
 }
@@ -150,7 +150,7 @@ export interface IImageImport<T extends PlatformTypes = PlatformTypes> {
      * wait 1 h). A file the platform cannot read is an error, and so is a wait
      * that runs out: either way the import is deleted, and nothing is left billing.
      */
-    importImage(options: ImportImageOptions<T>): Promise<ServerImage<T['image']>>;
+    importImage(options: ImportImageOptions<T>): Promise<ServerImage<T['image'], T['regionName']>>;
 }
 
 /**
@@ -160,13 +160,13 @@ export interface IImageImport<T extends PlatformTypes = PlatformTypes> {
  */
 export interface IServerless<T extends PlatformTypes = PlatformTypes> {
     /** What a worker can run on, priced per hour while it runs (the serverless price), cheapest first; in stock unless the query says otherwise. */
-    listEndpointOffers(query?: OfferQuery): Promise<Offer<T['endpointOffer']>[]>;
+    listEndpointOffers(query?: OfferQuery): Promise<Offer<T['endpointOffer'], T['regionName']>[]>;
     /** The account's endpoints. */
-    listEndpoints(): Promise<Endpoint<T['endpoint']>[]>;
+    listEndpoints(): Promise<Endpoint<T['endpoint'], T['regionName']>[]>;
     /** null when the account has no such endpoint. */
-    getEndpoint(id: string): Promise<Endpoint<T['endpoint']> | null>;
+    getEndpoint(id: string): Promise<Endpoint<T['endpoint'], T['regionName']> | null>;
     /** The endpoint, once it takes requests ('ready'): a request starts a worker where none runs. */
-    createEndpoint(options: CreateEndpointOptions<T>): Promise<Endpoint<T['endpoint']>>;
+    createEndpoint(options: CreateEndpointOptions<T>): Promise<Endpoint<T['endpoint'], T['regionName']>>;
     /** Deletes it and stops its workers, and waits until it is gone where the platform deletes it in the background; one gone already is no error. */
     deleteEndpoint(id: string, o?: WaitOptions): Promise<void>;
     /**
@@ -180,8 +180,8 @@ export interface IServerless<T extends PlatformTypes = PlatformTypes> {
 
 /** Make a region-bound image bootable in more regions. */
 export interface IImageCopy<T extends PlatformTypes = PlatformTypes> {
-    /** Copies the image to every region it is not in yet, and waits until it is in all of them. */
-    copyImage(id: string, regions: string[], o?: WaitOptions): Promise<ServerImage<T['image']>>;
+    /** Copies the image to every region it is not in yet (each a RegionChoice: the platform's own name, or a library region it has), and waits until it is in all of them. */
+    copyImage(id: string, regions: Array<RegionChoice<T>>, o?: WaitOptions): Promise<ServerImage<T['image'], T['regionName']>>;
 }
 
 /**
@@ -195,11 +195,11 @@ export interface IVolumes<T extends PlatformTypes = PlatformTypes> {
      * The account's volumes, every one of them: the account may hold volumes
      * that are not yours to mount or delete, so pick yours by name.
      */
-    listVolumes(): Promise<Volume<T['volume']>[]>;
+    listVolumes(): Promise<Volume<T['volume'], T['regionName']>[]>;
     /** null when the provider has no such volume. */
-    getVolume(id: string): Promise<Volume<T['volume']> | null>;
+    getVolume(id: string): Promise<Volume<T['volume'], T['regionName']> | null>;
     /** An empty volume in `region`, once it can be mounted. It bills until deleteVolume, mounted or not. */
-    createVolume(options: CreateVolumeOptions<T>): Promise<Volume<T['volume']>>;
+    createVolume(options: CreateVolumeOptions<T>): Promise<Volume<T['volume'], T['regionName']>>;
     /**
      * Deletes the volume and its data, and waits until it is gone where the
      * platform deletes it in the background (a shared filesystem: `o`).
@@ -393,8 +393,16 @@ export interface Capable {
 /** The platform types a provider was written for (its ICompute's), else the defaults. */
 export type TypesOf<P> = P extends ICompute<infer T> ? T : PlatformTypes;
 
-/** `P`, known to have capability `C`: its methods, and its traits in `capabilities`. */
-export type With<P, C extends CapabilityName> = P & CapabilityInterfaces<TypesOf<P>>[C] & { readonly capabilities: { readonly [K in C]: Readonly<CapabilityTraits[K]> } };
+/**
+ * `P`, known to have capability `C`: its methods, and its traits in
+ * `capabilities`. A union of providers is narrowed provider by provider, each
+ * with its own platform's types: a call on it takes what every one of them
+ * takes (a region all of them have, which is seldom one), as a union's
+ * createServer does. Narrow it to one (by `id`) to use that one's.
+ */
+export type With<P, C extends CapabilityName> = P extends unknown
+    ? P & CapabilityInterfaces<TypesOf<P>>[C] & { readonly capabilities: { readonly [K in C]: Readonly<CapabilityTraits[K]> } }
+    : never;
 
 /** Whether `p` has capability `c`; when it does, `p` is typed with that capability's methods and traits. */
 export function supports<P extends Capable, C extends CapabilityName>(p: P, c: C): p is With<P, C> {

@@ -26,7 +26,7 @@ function made(o: FakeScalewayOptions = {}, params: Partial<ScalewayParams> = {})
 
 type Fake = ReturnType<typeof fakeScaleway>;
 const creates = (fake: Fake) => fake.calls.filter((c) => c.method === 'POST' && /\/servers$/.test(c.path));
-const server = { name: 'web-1', offer: 'DEV1-S', region: REGION_TYPES.PARIS_1, image: MACHINE_TYPES.UBUNTU_24 };
+const server = { name: 'web-1', offer: 'DEV1-S', region: REGION_TYPES.FRANCE_PARIS_1 as const, image: MACHINE_TYPES.UBUNTU_24 };
 
 describe('Scaleway as a VPS host: offers', () => {
     it('offers every x86 Instance type without GPUs (Arm ones are created by id), each once, with no GPU', async () => {
@@ -71,19 +71,22 @@ describe('Scaleway as a VPS host: the library\'s enums', () => {
         expect(SCALEWAY_ENUMS.cudaMachines).toEqual({ ubuntu24: 'ubuntu_noble_gpu_os_13_nvidia', ubuntu22: 'ubuntu_jammy_gpu_os_12' });
     });
 
-    it('maps the Scaleway members of REGION_TYPES onto its zones, and refuses any other before anything is created', async () => {
+    it('maps the Scaleway members of REGION_TYPES onto its regions and zones, a region standing for a zone of it, and refuses any other before anything is created', async () => {
         expect(SCALEWAY_ENUMS.regions).toEqual({
-            paris: 'fr-par-1', paris_1: 'fr-par-1', paris_2: 'fr-par-2', paris_3: 'fr-par-3',
-            amsterdam: 'nl-ams-1', amsterdam_1: 'nl-ams-1', amsterdam_2: 'nl-ams-2', amsterdam_3: 'nl-ams-3',
-            warsaw: 'pl-waw-1', warsaw_1: 'pl-waw-1', warsaw_2: 'pl-waw-2', warsaw_3: 'pl-waw-3',
-            milan: 'it-mil-1', milan_1: 'it-mil-1',
+            france_paris: 'fr-par', france_paris_1: 'fr-par-1', france_paris_2: 'fr-par-2', france_paris_3: 'fr-par-3',
+            netherlands_amsterdam: 'nl-ams', netherlands_amsterdam_1: 'nl-ams-1', netherlands_amsterdam_2: 'nl-ams-2', netherlands_amsterdam_3: 'nl-ams-3',
+            poland_warsaw: 'pl-waw', poland_warsaw_1: 'pl-waw-1', poland_warsaw_2: 'pl-waw-2', poland_warsaw_3: 'pl-waw-3',
+            italy_milan: 'it-mil', italy_milan_1: 'it-mil-1',
         });
-        for (const zone of Object.values(SCALEWAY_ENUMS.regions ?? {})) expect(isScalewayZone(zone as string)).toBe(true);
+        // A numbered member is a zone, and a city's its region.
+        for (const [region, name] of Object.entries(SCALEWAY_ENUMS.regions)) expect([region, /_\d$/.test(region) ? isScalewayZone(name) : !isScalewayZone(name)]).toEqual([region, true]);
         const { vps, fake } = made();
-        await vps.deleteServer((await vps.createServer({ ...server, region: REGION_TYPES.AMSTERDAM })).id);
+        await vps.deleteServer((await vps.createServer({ ...server, region: REGION_TYPES.NETHERLANDS_AMSTERDAM })).id);
         expect(creates(fake).pop()?.path).toMatch(/\/zones\/nl-ams-1\/servers$/);
         // DigitalOcean's regions are not Scaleway's.
-        await expect(vps.createServer({ ...server, region: REGION_TYPES.NYC_1 })).rejects.toThrow(/region "nyc1" \(REGION_TYPES has no scaleway region by that name\) is not supported/);
+        // A compile error on Scaleway's own type, and refused at run time where the compiler did not see it.
+        // @ts-expect-error Scaleway has no New York
+        await expect(vps.createServer({ ...server, region: REGION_TYPES.US_NEW_YORK_1 })).rejects.toThrow(/region "us_new_york_1" \(REGION_TYPES has no scaleway region by that name\) is not supported/);
         expect(creates(fake)).toHaveLength(1);
     });
 });
@@ -108,7 +111,7 @@ describe('Scaleway as a VPS host: createServer', () => {
     it('boots plain Ubuntu on a type without GPUs unless told otherwise, and takes any zone, a label, an image of the Project\'s own, or a GPU type by id', async () => {
         const { fake, vps } = made();
         await vps.createServer({ name: 'default', offer: 'DEV1-S', region: 'fr-par-1' });
-        await vps.createServer({ name: 'gpu', region: REGION_TYPES.WARSAW_2, offer: 'L4-1-24G', image: 'ubuntu_noble_gpu_os_13_nvidia' });
+        await vps.createServer({ name: 'gpu', region: REGION_TYPES.POLAND_WARSAW_2, offer: 'L4-1-24G', image: 'ubuntu_noble_gpu_os_13_nvidia' });
         await vps.createServer({ name: 'by-zone', region: 'nl-ams-1', offer: 'PLAY2-NANO', image: 'debian_bookworm' });
         expect(creates(fake).map((c) => [c.path.split('/')[4], c.body.commercial_type, c.body.image])).toEqual([
             ['fr-par-1', 'DEV1-S', Scaleway.CPU_IMAGE], ['pl-waw-2', 'L4-1-24G', 'ubuntu_noble_gpu_os_13_nvidia'], ['nl-ams-1', 'PLAY2-NANO', 'debian_bookworm'],
@@ -148,8 +151,9 @@ describe('Scaleway as a VPS host: createServer', () => {
         const { fake, vps } = made({}, { zones: 'fr-par,nl-ams-1' });
         await expect(vps.createServer({ ...server, offer: 'NOT-A-TYPE' })).rejects.toThrow(/NOT-A-TYPE is not offered in fr-par-1/);
         await expect(vps.createServer({ ...server, offer: '' })).rejects.toThrow(/needs an offer/);
+        // @ts-expect-error there is no zone fr-par-9: Scaleway's types know its zones
         await expect(vps.createServer({ ...server, region: 'fr-par-9' })).rejects.toThrow(/unknown Scaleway zone "fr-par-9"/);
-        await expect(vps.createServer({ ...server, region: REGION_TYPES.WARSAW_2 })).rejects.toThrow(/zone pl-waw-2 is not one of this provider's zones/);
+        await expect(vps.createServer({ ...server, region: REGION_TYPES.POLAND_WARSAW_2 })).rejects.toThrow(/zone pl-waw-2 is not one of this provider's zones/);
         await expect(vps.createServer({ ...server, gpuCount: 1 })).rejects.toBeInstanceOf(NotSupportedError);
         expect(creates(fake)).toHaveLength(0);
         // A label Scaleway does not have: refused by Scaleway at the create, so nothing exists to start.
@@ -178,7 +182,7 @@ describe('Scaleway as a VPS host: createServer', () => {
         await expect(vps2.createServer(server)).rejects.toMatchObject({ status: 500, retriable: false });
         expect(posts).toBe(1);
         // The account's GPU quota: nothing will be created until it changes.
-        const gpu = { ...server, region: REGION_TYPES.WARSAW_2, offer: 'L4-1-24G', image: 'ubuntu_noble_gpu_os_13_nvidia' };
+        const gpu = { ...server, region: REGION_TYPES.POLAND_WARSAW_2 as const, offer: 'L4-1-24G', image: 'ubuntu_noble_gpu_os_13_nvidia' };
         await vps.createServer(gpu);
         await expect(vps.createServer(gpu)).rejects.toBeInstanceOf(QuotaError);
     });

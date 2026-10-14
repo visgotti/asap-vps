@@ -2,8 +2,19 @@
 // (https://docs.vast.ai/api-reference/openapi.yaml, read 2026-09-29 and
 // 2026-10-06), and VastTypes, which types its records and create options by them.
 
+import type { COUNTRY_TYPES } from '../../constants';
 import type { MountPath, ProviderParams, VolumeSize } from '../../types';
 import type { VAST_REFUSED } from './mappers';
+
+/**
+ * Vast's own names for its places: a machine (`machine:<id>`: where a volume
+ * is, and an offer's place), or where a machine's host says it is: "<place>,
+ * <CC>" ('Texas, US', ', US'), its code in capitals, or the code alone ('SE'),
+ * the shapes Vast was seen to write (VAST_LOCATIONS, places.ts). A code alone
+ * is typed as a country's (COUNTRY_TYPES, every code ISO gives one): a record
+ * whose host wrote another comes typed all the same, and is in no country.
+ */
+export type VastRegionName = `machine:${number}` | `${string}, ${Uppercase<string>}` | `${COUNTRY_TYPES}`;
 
 export type VastAIParams = ProviderParams & {
     /** Machines below this reliability score are not offered (default 0.95). */
@@ -226,4 +237,10 @@ export type VastTypes = {
     volumeSize: VolumeSize,
     volumeKind: {},
     mount: MountPath,
+    /** A marketplace has no place the library names: each offer is one machine, which says where it is. */
+    region: never,
+    /** A machine as a region (machineRegion), or where its host is. */
+    regionName: VastRegionName,
+    /** Its machines are wherever their hosts are: every country the library names, and any other code. */
+    country: COUNTRY_TYPES,
 };

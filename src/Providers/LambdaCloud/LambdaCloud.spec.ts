@@ -54,7 +54,7 @@ describe('LambdaCloud', () => {
 
     it('an image by the library\'s names is the newest of Lambda\'s family for it: plain Ubuntu, or with cuda Lambda Stack; it has none of Ubuntu 20.04', async () => {
         const { p, fake } = make();
-        const launch = { name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] };
+        const launch = { name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1' as const, sshKeyIds: ['laptop'] };
         const images: Array<[Parameters<LambdaCloud['createServer']>[0]['image'], string]> = [
             [MACHINE_TYPES.UBUNTU_24, 'ubuntu-24-04'], [MACHINE_TYPES.UBUNTU_22, 'ubuntu-22-04'], [{ os: 'ubuntu24' }, 'ubuntu-24-04'],
             [{ os: 'ubuntu24', cuda: '12.8' }, 'lambda-stack-24-04'], [{ os: MACHINE_TYPES.UBUNTU_22, cuda: '13.0' }, 'lambda-stack-22-04'],
@@ -73,7 +73,7 @@ describe('LambdaCloud', () => {
         const waits: number[] = [];
         const fake = fakeLambda();
         const p = new LambdaCloud({ apiKey: 'lambda-test', fetchImpl: fake.fetchImpl, sleep: async (ms) => { waits.push(ms); } });
-        const launch = { name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] };
+        const launch = { name: 'a', offer: 'gpu_1x_a10', region: 'us-east-1' as const, sshKeyIds: ['laptop'] };
         const { id } = await p.waitUntilRunning((await p.createServer(launch)).id, fast);
         const since = (from: number) => fake.calls.slice(from).map((c) => `${c.method} ${c.path}`);
         let from = fake.calls.length;
@@ -122,7 +122,7 @@ describe('LambdaCloud', () => {
     it('reads the GPU count an instance type\'s name states, and refuses a gpuCount other than it before anything launches', async () => {
         expect(['gpu_8x_a100_80gb_sxm4', 'gpu_1x_a10', 'gpu_16x_b200', 'cpu_4x_general', 'my_gpu_2x_a10'].map((t) => LambdaCloud.gpuCountOf(t))).toEqual([8, 1, 16, undefined, undefined]);
         const { p, fake } = make();
-        const o = { name: 'a', offer: 'gpu_8x_a100_80gb_sxm4', region: 'us-east-1', sshKeyIds: ['laptop'] };
+        const o = { name: 'a', offer: 'gpu_8x_a100_80gb_sxm4', region: 'us-east-1' as const, sshKeyIds: ['laptop'] };
         await expect(p.createServer({ ...o, gpuCount: 1 })).rejects.toThrow('createServer option "gpuCount" 1: this offer has 8 GPU(s); pick an offer with 1 is not supported');
         expect(fake.calls.filter((c) => c.path === '/api/v1/instance-operations/launch')).toEqual([]);
         await expect(p.createServer({ ...o, gpuCount: 8 })).resolves.toMatchObject({ name: 'a', gpuCount: 8 });
@@ -250,7 +250,7 @@ describe('LambdaCloud launch limits', () => {
         const { p, fake } = make();
         const [key] = await p.listSSHKeys();
         const [second, third] = [await p.addSSHKey(testPublicKey('two'), 'second'), await p.addSSHKey(testPublicKey('three'), 'third')];
-        const launch = { offer: 'gpu_1x_a10', region: 'us-east-1' };
+        const launch = { offer: 'gpu_1x_a10', region: 'us-east-1' as const };
         const one = await p.createServer({ name: 'one-key', ...launch, sshKeyIds: [key.id] });
         // One key: named at the launch, and no user data for it.
         expect(launches(fake).pop()?.body).toMatchObject({ ssh_key_names: ['laptop'] });
@@ -283,7 +283,7 @@ describe('LambdaCloud launch limits', () => {
     it('refuses a name over 64 characters and a tag key Lambda rejects; accepts its own format', async () => {
         const { p, fake } = make();
         const [key] = await p.listSSHKeys();
-        const base = { offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: [key.id] };
+        const base = { offer: 'gpu_1x_a10', region: 'us-east-1' as const, sshKeyIds: [key.id] };
         await expect(p.createServer({ ...base, name: 'x'.repeat(65) })).rejects.toThrow(/at most 64/);
         for (const tag of ['Owner=me', 'my_tag=1', 'a=1', 'lambda-ai-x=1', `ok=${'v'.repeat(129)}`]) {
             await expect(p.createServer({ ...base, name: 'tagged', tags: [tag] })).rejects.toBeInstanceOf(ProviderError);
@@ -417,7 +417,7 @@ describe('Lambda filesystems', () => {
         const { fake, p } = make();
         const models = await p.createVolume({ name: 'models', region: 'us-east-1' });
         const data = await p.createVolume({ name: 'data', region: 'us-east-1' });
-        const o = { offer: 'gpu_1x_a10', region: 'us-east-1', sshKeyIds: ['laptop'] };
+        const o = { offer: 'gpu_1x_a10', region: 'us-east-1' as const, sshKeyIds: ['laptop'] };
         const path = `/data/${'x'.repeat(250)}`;
         expect(path).toHaveLength(256);
         await p.createServer({ ...o, name: 'a', mounts: [{ volume: models }, { volume: data.id, path }] });

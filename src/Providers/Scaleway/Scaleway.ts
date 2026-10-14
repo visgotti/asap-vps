@@ -23,11 +23,11 @@
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { BaseProvider, ResolvedMount } from '../../Core/BaseProvider';
 import { randomBytes } from 'crypto';
-import { filterOffers, findSSHKey, isKind, pickSSHKeys, restartWatch, S3Client, stageDownload, timeLeft, urlSource, waitOf } from '../../Core/utils';
+import { computeKind, filterOffers, findSSHKey, isKind, pickSSHKeys, readOfferQuery, restartWatch, S3Client, stageDownload, timeLeft, urlSource, waitOf } from '../../Core/utils';
 import { CapacityError, NotFoundError, NotSupportedError, ProviderError, quotedMessage } from '../../errors';
 import type {
     CreateEndpointOptions, CreateServerOptions, CreateVolumeOptions, Endpoint, EndpointRequestInit, ImageSpec, ImportImageOptions, InitializedSSHKeyData, Offer, OfferQuery,
-    Server, ServerImage, ServerListOptions, Volume, WaitOptions,
+    RegionChoice, Server, ServerImage, ServerListOptions, Volume, WaitOptions,
 } from '../../types';
 import { ScalewayApi } from './api';
 import {
@@ -38,7 +38,7 @@ import {
 import { SCALEWAY_REGIONS } from './types';
 import type {
     ScalewayBlockVolume, ScalewayContainer, ScalewayContainerSize, ScalewayCreateServerBody, ScalewayFileSystem, ScalewayImage, ScalewayOfferRaw, ScalewayParams,
-    ScalewayRegion, ScalewayServer, ScalewayServerType, ScalewayTypes, ScalewayVolumeTemplate, ScalewayZone,
+    ScalewayRegion, ScalewayRegionName, ScalewayServer, ScalewayServerType, ScalewayTypes, ScalewayVolumeTemplate, ScalewayZone,
 } from './types';
 
 /** What Scaleway can do, and how. */
@@ -95,7 +95,8 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * cannot boot on a GPU type, so an image prepared on one could not move to a
      * GPU); an Arm type is created by its id.
      */
-    public async listOffers(query: OfferQuery = {}): Promise<Offer<ScalewayOfferRaw>[]> {
+    public async listOffers(query: OfferQuery = {}): Promise<Offer<ScalewayOfferRaw, ScalewayRegionName>[]> {
+        if (readOfferQuery(query).matchesNone) return [];
         const zones = await this.api.forZones(async (zone) => {
             const [types, stock] = await Promise.all([this.api.serverTypes(zone), this.api.availability(zone)]);
             return { zone, types, stock };
@@ -134,7 +135,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * zone. Scaleway does not mount them: the server formats (when new) and
      * mounts each. They are the caller's: deleteServer and createImage leave them.
      */
-    public async createServer(o: CreateServerOptions<ScalewayTypes>): Promise<Server<ScalewayServer>> {
+    public async createServer(o: CreateServerOptions<ScalewayTypes>): Promise<Server<ScalewayServer, ScalewayRegionName>> {
         this.rejectOptions(o, SCALEWAY_REFUSED);
         const resolved = this.resolveOffer(o);
         // An image by the library's names is Scaleway's label for it on the type rented (imageFor, once the type is read); any other is Scaleway's own name.
@@ -190,7 +191,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
         return toServer(await this.api.launchServer(zone, body, { userData, filesystems: files.map((x) => x.fs.id) }), type, this.api.eurToUsd);
     }
 
-    public async getServer(id: string): Promise<Server<ScalewayServer> | null> {
+    public async getServer(id: string): Promise<Server<ScalewayServer, ScalewayRegionName> | null> {
         const server = await this.api.findServer(id);
         return server ? toServer(server, (await this.catalog(server.zone))[server.commercial_type], this.api.eurToUsd) : null;
     }
@@ -200,11 +201,12 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * included: pick yours by name. `kind` keeps those with GPUs or without; a
      * server of a type no longer in the catalog is always listed.
      */
-    public async listServers(options: ServerListOptions = {}): Promise<Server<ScalewayServer>[]> {
+    public async listServers(options: ServerListOptions = {}): Promise<Server<ScalewayServer, ScalewayRegionName>[]> {
+        const kind = computeKind(options.kind);
         const perZone = await this.api.forZones(async (zone) => {
             const [servers, types] = await Promise.all([this.api.listServers(zone), this.catalog(zone)]);
             return servers
-                .filter((s) => !types[s.commercial_type] || isKind(gpuOf(types[s.commercial_type])?.count ?? 0, options.kind))
+                .filter((s) => !types[s.commercial_type] || isKind(gpuOf(types[s.commercial_type])?.count ?? 0, kind))
                 .map((s) => toServer(s, types[s.commercial_type], this.api.eurToUsd));
         });
         return perZone.flat();
@@ -303,13 +305,13 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * regions getImage gives it: its zone, and those of its copies (copyImage),
      * which are images of their zone and listed too.
      */
-    public async listImages(): Promise<ServerImage<ScalewayImage>[]> {
+    public async listImages(): Promise<ServerImage<ScalewayImage, ScalewayRegionName>[]> {
         const all = (await this.api.forZones((zone) => this.api.listImages(zone))).flat();
         return all.map((image) => toImageWithCopies(image, all));
     }
 
     /** By `fr-par-2/<uuid>`, or a bare id asked of every zone; its regions: its zone and those of its copies (copyImage). */
-    public async getImage(id: string): Promise<ServerImage<ScalewayImage> | null> {
+    public async getImage(id: string): Promise<ServerImage<ScalewayImage, ScalewayRegionName> | null> {
         const image = await this.findImage(id);
         return image ? toImageWithCopies(image, await this.copiesOf(image)) : null;
     }
@@ -328,7 +330,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * answered `500 internal_server_error` once: seen once, not retried, but one
      * more reason the request always names them when there is a mount.
      */
-    public async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<ScalewayImage>> {
+    public async createImage(serverId: string, o: { name: string } & WaitOptions): Promise<ServerImage<ScalewayImage, ScalewayRegionName>> {
         const s = await this.need(serverId);
         const mounted = new Set(mountedVolumeIds(s));
         // Its own volumes by id, each snapshot of its own type; named only when a mount has to be left out.
@@ -364,7 +366,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * (Scaleway boots no legacy BIOS). A file Scaleway cannot read is an error,
      * and leaves nothing behind. Default wait 1 h. Needs the Project.
      */
-    public async importImage(o: ImportImageOptions<ScalewayTypes>): Promise<ServerImage<ScalewayImage>> {
+    public async importImage(o: ImportImageOptions<ScalewayTypes>): Promise<ServerImage<ScalewayImage, ScalewayRegionName>> {
         if (!/^https?:\/\/[^/]+\/./i.test(o.url)) throw new ProviderError(this.id, `an image is imported from an http(s) URL of a file, not "${o.url}"`);
         const zone = this.zoneOf(this.regionName(o.region));
         const project = this.api.requireProject('import an image');
@@ -410,15 +412,17 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * source. The result is the source, its regions every zone it or a copy is
      * in. Only the root disk comes: an image with more volumes is refused.
      */
-    public async copyImage(id: string, regions: string[], o: WaitOptions = {}): Promise<ServerImage<ScalewayImage>> {
+    public async copyImage(id: string, regions: Array<RegionChoice<ScalewayTypes>>, o: WaitOptions = {}): Promise<ServerImage<ScalewayImage, ScalewayRegionName>> {
+        // Where, read first: a region of the library's Scaleway has none of, or no zone of this provider's, is refused before the image is read.
+        const zones = [...new Set(regions.map((r) => this.zoneOf(this.regionName(r))))];
         const source = await this.findImage(id);
         if (!source) throw new NotFoundError(this.id, `no image ${id}`);
         if (source.state !== 'available') throw new ProviderError(this.id, `image ${zonedId(source.zone, source.id)} is ${source.state}: it is copied once available`);
         const root = source.root_volume;
         if (!root) throw new ProviderError(this.id, `image ${zonedId(source.zone, source.id)} has no root volume to copy`);
         if (Object.keys(source.extra_volumes).length) throw new NotSupportedError(this.id, 'copying an image with more than its root volume (only the root disk would come)');
-        const have = new Set<string>([source.zone, ...(await this.copiesOf(source)).map((c) => c.zone)]);
-        const targets = [...new Set(regions.map((r) => this.zoneOf(this.regionName(r))))].filter((z) => !have.has(z));
+        const have = new Set<ScalewayZone>([source.zone, ...(await this.copiesOf(source)).map((c) => c.zone)]);
+        const targets = zones.filter((z) => !have.has(z));
         if (!targets.length) return { ...toImage(source), regions: [...have] };
         const project = this.api.requireProject('copy an image');
         const wait = waitOf(o, { timeoutMs: 2 * 60 * 60_000, intervalMs: 15_000 });
@@ -461,7 +465,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * Project) in every zone, named `fr-par-2/<uuid>`, and its File Storage
      * filesystems (`shared`) in the regions of the zones, named `fr-par/<uuid>`.
      */
-    public async listVolumes(): Promise<Volume<ScalewayBlockVolume | ScalewayFileSystem>[]> {
+    public async listVolumes(): Promise<Volume<ScalewayBlockVolume | ScalewayFileSystem, ScalewayRegionName>[]> {
         const [blocks, files] = await Promise.all([
             this.api.forZones((zone) => this.api.listBlockVolumes(zone)),
             Promise.all(this.fileRegions().map((r) => this.api.listFileSystems(r))),
@@ -470,7 +474,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
     }
 
     /** A Block Storage volume by `fr-par-2/<uuid>`, a filesystem by `fr-par/<uuid>`, or either by a bare id asked of every zone and region. */
-    public async getVolume(id: string): Promise<Volume<ScalewayBlockVolume | ScalewayFileSystem> | null> {
+    public async getVolume(id: string): Promise<Volume<ScalewayBlockVolume | ScalewayFileSystem, ScalewayRegionName> | null> {
         if (parseRegionalId(id)?.region) {
             const f = await this.findFileSystem(id);
             return f ? toFileSystemVolume(f) : null;
@@ -486,10 +490,10 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * (`region`) of this provider, once it is `available` (default: up to 5
      * min). It bills until deleteVolume, attached or not. Needs the Project (`projectId`).
      */
-    public async createVolume(o: CreateVolumeOptions<ScalewayTypes> & { shared: true }): Promise<Volume<ScalewayFileSystem>>;
-    public async createVolume(o: CreateVolumeOptions<ScalewayTypes> & { shared?: false }): Promise<Volume<ScalewayBlockVolume>>;
-    public async createVolume(o: CreateVolumeOptions<ScalewayTypes>): Promise<Volume<ScalewayBlockVolume | ScalewayFileSystem>>;
-    public async createVolume(o: CreateVolumeOptions<ScalewayTypes>): Promise<Volume<ScalewayBlockVolume | ScalewayFileSystem>> {
+    public async createVolume(o: CreateVolumeOptions<ScalewayTypes> & { shared: true }): Promise<Volume<ScalewayFileSystem, ScalewayRegionName>>;
+    public async createVolume(o: CreateVolumeOptions<ScalewayTypes> & { shared?: false }): Promise<Volume<ScalewayBlockVolume, ScalewayRegionName>>;
+    public async createVolume(o: CreateVolumeOptions<ScalewayTypes>): Promise<Volume<ScalewayBlockVolume | ScalewayFileSystem, ScalewayRegionName>>;
+    public async createVolume(o: CreateVolumeOptions<ScalewayTypes>): Promise<Volume<ScalewayBlockVolume | ScalewayFileSystem, ScalewayRegionName>> {
         if (o.shared) return this.createFileSystem(o);
         const zone = this.zoneOf(this.regionName(o.region));
         if (!(o.sizeGb >= 1)) throw new ProviderError(this.id, `a volume is at least 1 GB, not ${o.sizeGb}`);
@@ -585,17 +589,17 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
     // ── serverless: Serverless Containers ────────────────────────────────
 
     /** Container sizes (CPU in proportion to memory), priced per second while an instance runs, in every region; cheapest first. No GPUs. */
-    public async listEndpointOffers(query: OfferQuery = {}): Promise<Offer<ScalewayContainerSize>[]> {
+    public async listEndpointOffers(query: OfferQuery = {}): Promise<Offer<ScalewayContainerSize, ScalewayRegionName>[]> {
         return filterOffers(CONTAINER_SIZES.map((s) => toContainerOffer(s, this.api.eurToUsd)), query);
     }
 
     /** The Project's serverless containers in the regions of this provider's zones, named `fr-par/<uuid>`. */
-    public async listEndpoints(): Promise<Endpoint<ScalewayContainer>[]> {
+    public async listEndpoints(): Promise<Endpoint<ScalewayContainer, ScalewayRegionName>[]> {
         return (await Promise.all(this.regions().map((r) => this.api.listContainers(r)))).flat().map(toEndpoint);
     }
 
     /** By `fr-par/<uuid>`, or a bare id asked of each region. */
-    public async getEndpoint(id: string): Promise<Endpoint<ScalewayContainer> | null> {
+    public async getEndpoint(id: string): Promise<Endpoint<ScalewayContainer, ScalewayRegionName> | null> {
         const c = await this.findContainer(id);
         return c ? toEndpoint(c) : null;
     }
@@ -610,7 +614,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * and dashes. Needs the Project (`projectId`). A deploy that fails is
      * thrown with Scaleway's message, and leaves nothing behind.
      */
-    public async createEndpoint(o: CreateEndpointOptions<ScalewayTypes>): Promise<Endpoint<ScalewayContainer>> {
+    public async createEndpoint(o: CreateEndpointOptions<ScalewayTypes>): Promise<Endpoint<ScalewayContainer, ScalewayRegionName>> {
         const c = o.container;
         if (c.registryAuth) throw new NotSupportedError(this.id, 'createEndpoint option "container.registryAuth" (Scaleway pulls a public image, or one of the Project\'s own registry)');
         if (o.idleTimeoutSeconds !== undefined) throw new NotSupportedError(this.id, 'createEndpoint option "idleTimeoutSeconds" (Scaleway stops an idle instance after 15 minutes)');
@@ -744,7 +748,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * provider's with File Storage (Paris), once available. One that fails is
      * deleted, and its failure thrown. Needs the Project.
      */
-    private async createFileSystem(o: CreateVolumeOptions<ScalewayTypes> & { shared: true }): Promise<Volume<ScalewayFileSystem>> {
+    private async createFileSystem(o: CreateVolumeOptions<ScalewayTypes> & { shared: true }): Promise<Volume<ScalewayFileSystem, ScalewayRegionName>> {
         const size = Math.ceil(o.sizeGb);
         if (!(size >= 25 && size <= 50000)) throw new ProviderError(this.id, `a shared volume (a filesystem) is 25-50000 GB, not ${o.sizeGb}`);
         const region = this.providerRegion(o.region);
@@ -790,7 +794,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      * on the way is deleted (the snapshot, the image), and the failure thrown.
      */
     private async imageFromObject(zone: ScalewayZone, from: { bucket: string, key: string, name: string, project: string }, wait: Required<WaitOptions>,
-        extra?: Partial<ScalewayTypes['imageImportBody']>): Promise<ServerImage<ScalewayImage>> {
+        extra?: Partial<ScalewayTypes['imageImportBody']>): Promise<ServerImage<ScalewayImage, ScalewayRegionName>> {
         const made = await this.api.importBlockSnapshot(zone, { bucket: from.bucket, key: from.key, name: from.name, project_id: from.project });
         let image: ScalewayImage | undefined;
         try {
@@ -890,7 +894,8 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
      */
     private zoneFor(o: CreateServerOptions<ScalewayTypes>, region: string | undefined, imageZone: ScalewayZone | undefined, mounts: ResolvedMount[]): ScalewayZone {
         const volumeZones = mounts.map((m) => ({ id: m.id, zone: parseZonedId(m.id)?.zone })).filter((v): v is { id: string, zone: ScalewayZone } => !!v.zone);
-        const zone = this.zoneOf((o.region !== undefined ? region : undefined) ?? imageZone ?? volumeZones[0]?.zone ?? region);
+        const stock = typeof o.offer === 'string' ? [] : o.offer.regions;
+        const zone = this.zoneOf((o.region !== undefined ? region : undefined) ?? imageZone ?? volumeZones[0]?.zone ?? region, stock);
         if (imageZone && imageZone !== zone) {
             throw new ProviderError(this.id, `image ${o.image} is in ${imageZone}, not ${zone}: a Scaleway image boots in its own zone only`);
         }
@@ -899,9 +904,20 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
         return zone;
     }
 
-    /** `zone` as one of this provider's zones, or why it is not one. */
-    private zoneOf(zone: string | undefined): ScalewayZone {
+    /**
+     * `zone` as one of this provider's zones, or why it is not one. A region
+     * (fr-par, which REGION_TYPES.FRANCE_PARIS is) stands for a zone of it:
+     * the first of `stock` (an offer's zones with stock) there, else this
+     * provider's first zone there.
+     */
+    private zoneOf(zone: string | undefined, stock: readonly string[] = []): ScalewayZone {
         if (!zone) throw new ProviderError(this.id, 'a Scaleway server needs a zone (one of the offer\'s regions)');
+        if ((SCALEWAY_REGIONS as readonly string[]).includes(zone)) {
+            const mine = this.api.zones.filter((z) => regionOfZone(z) === zone);
+            const picked = mine.find((z) => stock.includes(z)) ?? mine[0];
+            if (!picked) throw new ProviderError(this.id, `region ${zone} has none of this provider's zones (${this.api.zones.join(', ')})`);
+            return picked;
+        }
         if (!isScalewayZone(zone)) throw new ProviderError(this.id, `unknown Scaleway zone "${zone}" (zones: ${this.api.zones.join(', ')})`);
         if (!this.api.zones.includes(zone)) {
             throw new ProviderError(this.id, `zone ${zone} is not one of this provider's zones (${this.api.zones.join(', ')}): a server there would not be listed`);
@@ -962,7 +978,7 @@ export class Scaleway extends BaseProvider<ScalewayTypes, ScalewayApi> implement
     }
 
     /** The type's record: the offer's own, or the zone's table. A type the zone does not offer is a place with no stock for it. */
-    private async typeOf(zone: ScalewayZone, name: string, offer?: Offer<ScalewayOfferRaw>): Promise<ScalewayServerType> {
+    private async typeOf(zone: ScalewayZone, name: string, offer?: Offer<ScalewayOfferRaw, ScalewayRegionName>): Promise<ScalewayServerType> {
         const own = (offer?.raw as Partial<ScalewayOfferRaw> | undefined)?.serverType;
         const type = own ?? (await this.api.serverTypes(zone))[name];
         if (!type) throw new CapacityError(this.id, `${name} is not offered in ${zone}`);

@@ -19,7 +19,7 @@ import {
     deleteRunVolumes, liveOptions, liveRequested, loadCredentials, newRunName, runMatcher, startWatchdog, sweepLeftovers, teardown, TEST_IMAGE, TEST_IMAGE_CUDA, trackVolumes,
 } from '../../testing/live';
 import type { Offer, Server, Volume } from '../../types';
-import type { VastInstance, VastOffer, VastVolume } from './types';
+import type { VastInstance, VastOffer, VastRegionName, VastVolume } from './types';
 import { VastAI } from './VastAI';
 
 const requested = liveRequested('vast');
@@ -39,7 +39,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     let watchdog: { doneFile: string } | undefined;
     let refused = false;
     let volumeIds = new Set<string>();
-    let volume: Volume<VastVolume> | undefined;
+    let volume: Volume<VastVolume, VastRegionName> | undefined;
     const need = () => {
         if (!volume) throw new Error('no volume (an earlier step failed)');
         return volume;
@@ -83,12 +83,12 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     paid('createVolume makes a volume on a GPU offer\'s machine; an instance rented there mounts it at /data and writes to it; deleted, it lets go of it', async () => {
         const offers = (await p.listOffers({ maxPricePerHour, minCudaVersion: TEST_IMAGE_CUDA })).slice(0, 8);
         if (!offers.length) throw new Error(`no GPU at or under $${maxPricePerHour}/h runs CUDA ${TEST_IMAGE_CUDA} right now`);
-        let first: Server<VastInstance> | undefined;
+        let first: Server<VastInstance, VastRegionName> | undefined;
         // A machine with no room for a volume, a taken offer, a dead host: the next offer's machine.
         for (const offer of offers) {
             const region = offer.regions.find((r) => r.startsWith('machine:'))!;
-            let vol: Volume<VastVolume> | undefined;
-            let made: Server<VastInstance> | undefined;
+            let vol: Volume<VastVolume, VastRegionName> | undefined;
+            let made: Server<VastInstance, VastRegionName> | undefined;
             try {
                 vol = await p.createVolume({ name: volumeName, region, sizeGb: 2 });
                 made = await p.createServer({
@@ -120,7 +120,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
     paid('a second instance rented on the same machine mounts it, and reads the file the first wrote', async () => {
         const vol = need();
-        let offers: Offer<VastOffer>[] = [];
+        let offers: Offer<VastOffer, VastRegionName>[] = [];
         for (let i = 0; i < 30 && !offers.length; i++) {
             if (i) await sleep(10_000);
             offers = await p.offersOn(vol.region);

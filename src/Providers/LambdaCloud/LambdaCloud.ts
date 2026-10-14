@@ -9,12 +9,12 @@
 
 import type { CapabilityDescriptor, ProviderCapabilities } from '../../capabilities';
 import { BaseProvider } from '../../Core/BaseProvider';
-import { authorizeKeysScript, filterOffers, findSSHKey, isKind, pickSSHKeys, timeLeft, waitOf } from '../../Core/utils';
+import { authorizeKeysScript, computeKind, filterOffers, findSSHKey, isKind, pickSSHKeys, readOfferQuery, timeLeft, waitOf } from '../../Core/utils';
 import { falseIfNotFound, NotFoundError, NotSupportedError, nullIfNotFound, ProviderError } from '../../errors';
 import type { CreateServerOptions, CreateVolumeOptions, InitializedSSHKeyData, Offer, OfferQuery, ProviderParams, Server, ServerListOptions, Volume, WaitOptions } from '../../types';
 import { LambdaApi } from './api';
 import { LAMBDA_BILLING, LAMBDA_ENUMS, LAMBDA_ID, LAMBDA_MOUNT_PATH, LAMBDA_REFUSED, LAMBDA_SSH_USER, toOffer, toServer, toSSHKey, toVolume } from './mappers';
-import type { LambdaFilesystem, LambdaFilesystemMount, LambdaInstance, LambdaInstanceTypes, LambdaSSHKeyData, LambdaTypes } from './types';
+import type { LambdaFilesystem, LambdaFilesystemMount, LambdaInstance, LambdaInstanceTypes, LambdaRegionName, LambdaSSHKeyData, LambdaTypes } from './types';
 
 /** What Lambda can do, and how: no stop, and no images of a server. */
 export const LAMBDA_CAPABILITIES = {
@@ -43,7 +43,10 @@ export class LambdaCloud extends BaseProvider<LambdaTypes, LambdaApi> implements
         super(new LambdaApi(params));
     }
 
-    public async listOffers(query: OfferQuery = {}): Promise<Offer<LambdaInstanceTypes[string]>[]> {
+    public async listOffers(query: OfferQuery = {}): Promise<Offer<LambdaInstanceTypes[string], LambdaRegionName>[]> {
+        // Every instance type it rents has GPUs: a question about machines without them, or no country allowed, has no answer here.
+        const read = readOfferQuery(query);
+        if (read.matchesNone || read.kind === 'cpu' || query.gpuCount === 0) return [];
         const { data } = await this.api.call<{ data: LambdaInstanceTypes }>('GET', '/api/v1/instance-types');
         return filterOffers(Object.values(data ?? {}).filter((t) => t.instance_type?.specs?.gpus > 0).map(toOffer), query);
     }
@@ -58,7 +61,7 @@ export class LambdaCloud extends BaseProvider<LambdaTypes, LambdaApi> implements
      * (under /home, /lambda/nfs or /data; default its own mount point,
      * /lambda/nfs/<name>): one elsewhere is refused before anything is launched.
      */
-    public async createServer(o: CreateServerOptions<LambdaTypes>): Promise<Server<LambdaInstance>> {
+    public async createServer(o: CreateServerOptions<LambdaTypes>): Promise<Server<LambdaInstance, LambdaRegionName>> {
         this.rejectOptions(o, LAMBDA_REFUSED);
         const { id: type, offer, region } = this.resolveOffer(o);
         this.checkFixedGpuCount(o, offer?.gpuCount ?? LambdaCloud.gpuCountOf(type));
@@ -102,7 +105,7 @@ export class LambdaCloud extends BaseProvider<LambdaTypes, LambdaApi> implements
         return (await this.getServer(id).catch(() => null)) ?? { ...toServer(launched), offerId: type };
     }
 
-    public async getServer(id: string): Promise<Server<LambdaInstance> | null> {
+    public async getServer(id: string): Promise<Server<LambdaInstance, LambdaRegionName> | null> {
         const found = await nullIfNotFound(this.api.call<{ data: LambdaInstance }>('GET', `/api/v1/instances/${encodeURIComponent(id)}`));
         return found ? toServer(found.data) : null;
     }
@@ -114,10 +117,11 @@ export class LambdaCloud extends BaseProvider<LambdaTypes, LambdaApi> implements
     }
 
     /** The account's instances, with GPUs or without unless `kind` says which. */
-    public async listServers(options: ServerListOptions = {}): Promise<Server<LambdaInstance>[]> {
+    public async listServers(options: ServerListOptions = {}): Promise<Server<LambdaInstance, LambdaRegionName>[]> {
+        const kind = computeKind(options.kind);
         const { data } = await this.api.call<{ data: LambdaInstance[] }>('GET', '/api/v1/instances');
         // An instance whose type is not reported is kept as one with GPUs: Lambda's are.
-        return (data ?? []).filter((i) => isKind(i.instance_type?.specs?.gpus ?? 1, options.kind)).map(toServer);
+        return (data ?? []).filter((i) => isKind(i.instance_type?.specs?.gpus ?? 1, kind)).map(toServer);
     }
 
     public async deleteServer(id: string): Promise<void> {
@@ -152,12 +156,12 @@ export class LambdaCloud extends BaseProvider<LambdaTypes, LambdaApi> implements
     // ── volumes ──────────────────────────────────────────────────────────
 
     /** The account's filesystems, in every region. */
-    public async listVolumes(): Promise<Volume<LambdaFilesystem>[]> {
+    public async listVolumes(): Promise<Volume<LambdaFilesystem, LambdaRegionName>[]> {
         return (await this.filesystems()).map(toVolume);
     }
 
     /** Lambda reads filesystems only as a list: this is a lookup in it. */
-    public async getVolume(id: string): Promise<Volume<LambdaFilesystem> | null> {
+    public async getVolume(id: string): Promise<Volume<LambdaFilesystem, LambdaRegionName> | null> {
         const f = (await this.filesystems()).find((x) => x.id === id);
         return f ? toVolume(f) : null;
     }
@@ -168,7 +172,7 @@ export class LambdaCloud extends BaseProvider<LambdaTypes, LambdaApi> implements
      * it holds until deleteVolume. Its name is 1-60 characters (a letter, then
      * letters, digits and dashes), unique in the account.
      */
-    public async createVolume(o: CreateVolumeOptions<LambdaTypes>): Promise<Volume<LambdaFilesystem>> {
+    public async createVolume(o: CreateVolumeOptions<LambdaTypes>): Promise<Volume<LambdaFilesystem, LambdaRegionName>> {
         // Not in its type; code typed for any provider may still pass it.
         if ((o as { sizeGb?: unknown }).sizeGb !== undefined) throw new NotSupportedError(this.id, 'createVolume option "sizeGb" (a filesystem grows as it fills)');
         if (!/^[a-zA-Z][0-9a-zA-Z-]{0,59}$/.test(o.name)) throw new ProviderError(this.id, `filesystem name "${o.name}": 1-60 characters, a letter then letters, digits and dashes`);

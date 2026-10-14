@@ -15,6 +15,8 @@ export const LAMBDA_ENDPOINTS = {
     // ── Instances ──
     /** Each type with the regions that have capacity for it now. */
     listInstanceTypes: { operationId: 'listInstanceTypes', method: 'GET', path: '/api/v1/instance-types', docs: `${DOCS}#listInstanceTypes` },
+    /** Every region, with its description: what LAMBDA_REGIONS is held to (npm run places:check). */
+    listRegions: { operationId: 'listRegions', method: 'GET', path: '/api/v1/regions', docs: `${DOCS}#listRegions` },
     /** Exactly one SSH key, by name; filesystems by name or with a mount point. */
     launchInstance: { operationId: 'launchInstance', method: 'POST', path: '/api/v1/instance-operations/launch', docs: `${DOCS}#launchInstance` },
     /** Every instance, at once (pagination is the caller's to ask for). */
