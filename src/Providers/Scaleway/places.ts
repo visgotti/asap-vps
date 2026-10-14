@@ -1,7 +1,9 @@
 // Scaleway's regions and zones: the reference its translation of the library's regions is made from
-// (SCALEWAY_ENUMS.regions), and what `npm run places:check` holds Scaleway's API definitions to. Read on 2026-10-14: the
-// zones from the instance v1 OpenAPI spec's `zone` parameter, the regions from the containers v1 spec's `region`, and each
-// region's city from scaleway.com/en/docs/console/account/reference-content/products-availability. A region's member is the
+// (SCALEWAY_ENUMS.regions), and what `npm run places:check` holds Scaleway's own list to. Read on 2026-10-14: the zones
+// from the instance v1 OpenAPI spec's `zone` parameter, the regions from the containers v1 spec's `region`, and each
+// region's city from scaleway.com/en/docs/console/account/reference-content/products-availability. Its Go SDK lists the
+// same (scaleway-sdk-go scw/locality.go: AllZones, AllRegions), and that is what the check reads: the specs' site answers
+// a datacenter's address, as a CI runner's is, with a challenge page. A region's member is the
 // region itself (FRANCE_PARIS: fr-par), a zone's its own (FRANCE_PARIS_2: fr-par-2); where a call makes something in a zone,
 // a region stands for its first zone this provider reads (Scaleway.zoneOf). SCALEWAY_ZONES and SCALEWAY_REGIONS (types.ts)
 // are these names, and npm run scaleway:spec holds them to the specs too.

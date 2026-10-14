@@ -165,7 +165,7 @@ for (const provider of providersFromEnv(process.env)) {
 
 A provider's types say what it picked: `TypesOf<Scaleway>["region"]` is its regions, `TypesOf<Scaleway>["regionName"]` its own names for its places, and `TypesOf<Scaleway>["country"]` the countries it has places in. A new provider does not compile until it says all three. The test suite holds every region it claims to a country it claims (`REGION_COUNTRIES` says where each region is), and checks that no name of the library's passes for one of its own.
 
-All three are made from one list, the provider's places as its own API lists them (`src/Providers/<Platform>/places.ts`, which says where and when each was read), and so is its translation table. `npm run places:check` reads the same listings again (DigitalOcean's, RunPod's and Lambda's own, Scaleway's specs, a new sample of Vast's offers, and ISO's list of countries) and fails on a place opened, closed or renamed since.
+All three are made from one list, the provider's places as its own API lists them (`src/Providers/<Platform>/places.ts`, which says where and when each was read), and so is its translation table. `npm run places:check` reads the same listings again (DigitalOcean's, RunPod's and Lambda's own, Scaleway's SDK's, a new sample of Vast's offers, and ISO's list of countries) and fails on a place opened, closed or renamed since.
 
 A country is one of ISO's codes, and nothing else compiles:
 

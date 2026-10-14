@@ -17,8 +17,9 @@
 # activity in a public repository: Actions > "Places" > Enable workflow.
 #
 # The keys are the live suites' (live.yml), the ones the check reads and no
-# other: Scaleway's specs and ISO's list need none. Like ci.yml, the job runs
-# on GitHub's runners or on the self-hosted ones the variable CI_RUNS_ON names.
+# other: Scaleway's list (its Go SDK's, on GitHub) and ISO's need none. Like
+# ci.yml, the job runs on GitHub's runners or on the self-hosted ones the
+# variable CI_RUNS_ON names.
 name: Places
 
 on:

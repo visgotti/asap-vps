@@ -4,25 +4,23 @@
 //
 //   npm run places:check                          every source, each provider's key read as the live suites read it
 //   npm run places:check -- runpod lambda         those only: digitalocean, runpod, lambda, scaleway, vast, countries
-//   npm run places:check -- --specs DIR           Scaleway's specs from DIR (instance.yml, containers.yml: scaleway:spec's files)
 //
 // What it compares, each with the source its data was read from:
 //   - DigitalOcean: GET /v2/regions, each datacenter's slug, name and `available`;
 //   - RunPod: GET /v2/catalog/datacenters, each data center's id, region and networkVolumeTypes, and that its name is its id;
 //   - Lambda: GET /api/v1/regions, each region's name and description;
-//   - Scaleway: its zones (the instance v1 spec's `zone` parameter) and its regions (the containers v1 spec's `region`);
+//   - Scaleway: its zones and regions as its Go SDK lists them (scw/locality.go: AllZones, AllRegions), the same as its
+//     specs' (what its data was read from), whose site answers a datacenter's address, a CI runner's, with a challenge;
 //   - Vast.ai, which lists no places (a machine is where its host is): a new sample of rentable asks, read as its data's
 //     was (VAST_SAMPLE), every location in it one the library reads a country of the library's from; the countries the
 //     data's sample had and this one has not, and the other way round, are listed;
 //   - countries: ISO's list, as the first copy COUNTRY_TYPES was read from has it: the same codes.
-// A place added, gone or changed, or a location read to no country, is a failure: update the data from what this says,
+// A place added, gone or changed, a location read to no country, or a source that cannot be read, is a failure (the
+// others are read all the same): update the data from what this says,
 // and the types, the tables and the tests follow (src/Providers/places.spec.ts). A field a source has that the data does
 // not hold is listed, not failed: leaving one out is a choice, but it should be a visible one. A provider whose key is
 // not set is skipped, and said to be; nothing of a key is printed.
 
-import * as fs from 'fs';
-import * as path from 'path';
-import * as yaml from 'js-yaml';
 import { COUNTRY_TYPES } from '../src/constants';
 import { DigitalOceanApi } from '../src/Providers/DigitalOcean/api';
 import { DIGITALOCEAN_DATACENTERS } from '../src/Providers/DigitalOcean/places';
@@ -191,21 +189,43 @@ export function checkCountries(codes: readonly string[]): Report {
 
 /** The first of the two copies of ISO's list COUNTRY_TYPES was read from (src/constants.ts). */
 export const ISO_COUNTRIES = 'https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with-Regional-Codes/master/all/all.json';
-const SCALEWAY_SPECS = 'https://www.scaleway.com/en/developers/api';
+/** Scaleway's Go SDK's list of its zones and regions: its specs' own, served to any address. */
+export const SCALEWAY_LOCALITIES = 'https://raw.githubusercontent.com/scaleway/scaleway-sdk-go/master/scw/locality.go';
+
+/**
+ * The zones and regions the SDK's locality.go lists (AllZones, AllRegions), each
+ * by its name ('fr-par-1'). Throws where it lists none, or names a constant it
+ * gives no name: a file of another shape is not read as no places.
+ */
+export function sdkLocalities(go: string): { zones: string[], regions: string[] } {
+    const names = new Map([...go.matchAll(/^\s*(\w+)\s*=\s*(?:Zone|Region)\("([^"]+)"\)/gm)].map((m) => [m[1], m[2]]));
+    const list = (name: string) => {
+        const body = new RegExp(`^var ${name} = \\[\\](?:Zone|Region)\\{([^}]*)\\}`, 'm').exec(go)?.[1];
+        if (body === undefined) throw new Error(`the SDK's locality.go has no ${name}`);
+        const constants = body.replace(/\/\/.*$/gm, '').split(/[\s,]+/).filter(Boolean);
+        if (!constants.length) throw new Error(`the SDK's ${name} is empty`);
+        return constants.map((c) => {
+            const value = names.get(c);
+            if (value === undefined) throw new Error(`the SDK's ${name} names ${c}, which locality.go gives no name`);
+            return value;
+        });
+    };
+    return { zones: list('AllZones'), regions: list('AllRegions') };
+}
+
+/** A public source's text: one that answers anything but a success (a challenge page, an outage) is not read. */
+async function fetchText(url: string): Promise<string> {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url} answered ${r.status} ${r.statusText}`.trim());
+    return r.text();
+}
+
+/** An error as one line of the report: its first line, at most 300 characters (an answer it quotes can be a page long). */
+export function oneLine(e: unknown): string {
+    return (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 300);
+}
 
 const args = process.argv.slice(2);
-const option = (name: string) => (args.includes(`--${name}`) ? args[args.indexOf(`--${name}`) + 1] : undefined);
-
-/** One of Scaleway's specs, read as scaleway:spec reads it: from its URL, or from --specs DIR. */
-async function scalewaySpec(api: string, file: string): Promise<any> {
-    const dir = option('specs');
-    return yaml.load(dir ? fs.readFileSync(path.join(dir, file), 'utf8') : await (await fetch(`${SCALEWAY_SPECS}/${api}/schema.yml`)).text());
-}
-
-/** What a path parameter of a spec's GET takes. */
-function parameterValues(spec: any, at: string, name: string): string[] {
-    return spec.paths[at].get.parameters.find((p: { name: string }) => p.name === name).schema.enum;
-}
 
 /** A new sample of Vast's asks, read as its data's was (VAST_SAMPLE): each location by how many distinct asks are there. */
 async function sampleVast(api: VastApi): Promise<Map<string | null, number>> {
@@ -238,10 +258,10 @@ export const SOURCES: Record<string, Source> = {
         check: async (apiKey) => checkLambda((await new LambdaApi({ apiKey }).call<{ data: Array<{ name: string, description: string }> }>('GET', '/api/v1/regions')).data),
     },
     scaleway: {
-        title: 'Scaleway: the instance v1 spec\'s zones and the containers v1 spec\'s regions against SCALEWAY_PLACES',
+        title: 'Scaleway: its Go SDK\'s zones and regions (scw/locality.go) against SCALEWAY_PLACES',
         check: async () => {
-            const [instance, containers] = await Promise.all([scalewaySpec('instance/v1', 'instance.yml'), scalewaySpec('serverless-containers/v1', 'containers.yml')]);
-            return checkScaleway(parameterValues(instance, '/instance/v1/zones/{zone}/servers', 'zone'), parameterValues(containers, '/containers/v1/regions/{region}/containers', 'region'));
+            const { zones, regions } = sdkLocalities(await fetchText(SCALEWAY_LOCALITIES));
+            return checkScaleway(zones, regions);
         },
     },
     vast: {
@@ -250,17 +270,18 @@ export const SOURCES: Record<string, Source> = {
     },
     countries: {
         title: `countries: ISO's list (${ISO_COUNTRIES}) against COUNTRY_TYPES`,
-        check: async () => checkCountries(((await (await fetch(ISO_COUNTRIES)).json()) as Array<{ 'alpha-2': string }>).map((c) => c['alpha-2'])),
+        check: async () => checkCountries((JSON.parse(await fetchText(ISO_COUNTRIES)) as Array<{ 'alpha-2': string }>).map((c) => c['alpha-2'])),
     },
 };
 
 async function main(): Promise<void> {
-    const named = args.filter((a, i) => !a.startsWith('--') && args[i - 1] !== '--specs');
+    const named = args.filter((a) => !a.startsWith('--'));
     const unknown = named.filter((n) => !SOURCES[n]);
     if (unknown.length) throw new Error(`no such source: ${unknown.join(', ')} (there are ${Object.keys(SOURCES).join(', ')})`);
     loadCredentials();
     let failures = 0;
     const skipped: string[] = [];
+    const unread: string[] = [];
     for (const [name, source] of Object.entries(SOURCES).filter(([n]) => !named.length || named.includes(n))) {
         const apiKey = source.keyEnv ? process.env[source.keyEnv] : '';
         if (source.keyEnv && !apiKey) {
@@ -268,7 +289,15 @@ async function main(): Promise<void> {
             continue;
         }
         console.log(`== ${source.title}`);
-        const report = await source.check(apiKey ?? '');
+        let report: Report;
+        try {
+            report = await source.check(apiKey ?? '');
+        } catch (e) {
+            // A source that cannot be read is no agreement: a failure, and the others are read all the same.
+            console.log(`  FAIL it could not be read: ${oneLine(e)}`);
+            unread.push(name);
+            continue;
+        }
         for (const d of report.drift) console.log(`  FAIL ${explain(d)}`);
         failures += report.drift.length;
         console.log(`  ${report.drift.length ? '    ' : 'ok  '} read ${report.read}${report.drift.length ? '' : ': the data agrees'}`);
@@ -276,8 +305,12 @@ async function main(): Promise<void> {
         if (report.unheld.length) console.log(`       fields the data does not hold (a choice, listed so it is a visible one): ${report.unheld.join(', ')}`);
     }
     if (skipped.length) console.log(`\nskipped: ${skipped.join('; ')}`);
-    console.log(failures ? `\n${failures} DIFFERENCE(S): update the data from what is above` : '\nevery place read agrees with its data');
-    process.exit(failures ? 1 : 0);
+    const said = [
+        ...(failures ? [`${failures} DIFFERENCE(S): update the data from what is above`] : []),
+        ...(unread.length ? [`NOT READ: ${unread.join(', ')} (nothing is known of them: read them again)`] : []),
+    ];
+    console.log(`\n${said.length ? said.join('\n') : 'every place read agrees with its data'}`);
+    process.exit(said.length ? 1 : 0);
 }
 
 if (require.main === module) {

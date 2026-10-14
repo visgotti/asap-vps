@@ -16,7 +16,7 @@ import { RUNPOD_DATA_CENTERS } from '../src/Providers/RunPod/places';
 import { SCALEWAY_PLACES } from '../src/Providers/Scaleway/places';
 import { VAST_LOCATIONS } from '../src/Providers/VastAI/places';
 import {
-    checkCountries, checkDigitalOcean, checkLambda, checkRunPod, checkScaleway, checkVast, diffPlaces, explain, listing, SOURCES, unheld, vastSample,
+    checkCountries, checkDigitalOcean, checkLambda, checkRunPod, checkScaleway, checkVast, diffPlaces, explain, listing, oneLine, sdkLocalities, SOURCES, unheld, vastSample,
 } from './places-check';
 import type { ListedDataCenter } from './places-check';
 
@@ -146,6 +146,32 @@ describe('each source against its data', () => {
         expect(checkCountries(codes)).toEqual({ read: '249 codes', drift: [], unheld: [], notes: [] });
         expect(checkCountries([...codes.filter((c) => c !== 'AN'), 'XK'].reverse()).drift).toEqual([{ what: 'added', name: 'XK', now: {} }]);
         expect(checkCountries(codes.filter((c) => c !== 'NA')).drift).toEqual([{ what: 'gone', name: 'NA', was: {} }]);
+    });
+});
+
+describe('Scaleway\'s places as its Go SDK lists them, and a source that cannot be read', () => {
+    const go = [
+        'package scw', '', 'const (',
+        '\t// ZoneFrPar1 represents the fr-par-1 zone', '\tZoneFrPar1 = Zone("fr-par-1")', '\tZoneFrPar2 = Zone("fr-par-2")', '\tZoneItMil1 = Zone("it-mil-1")', ')', '',
+        '// AllZones is an array that list all zones', 'var AllZones = []Zone{', '\tZoneFrPar1,', '\t// a comment in the list', '\tZoneItMil1,', '}', '',
+        'const (', '\tRegionFrPar = Region("fr-par")', '\tRegionItMil = Region("it-mil")', ')', '',
+        'var AllRegions = []Region{', '\tRegionFrPar,', '\tRegionItMil,', '}', '',
+    ].join('\n');
+
+    it('sdkLocalities reads AllZones and AllRegions by their names, in their order: a constant they leave out is none of them', () => {
+        expect(sdkLocalities(go)).toEqual({ zones: ['fr-par-1', 'it-mil-1'], regions: ['fr-par', 'it-mil'] });
+    });
+
+    it('a file of another shape is refused, never read as no places: a page in its place, a list gone, empty, or naming what it does not name', () => {
+        expect(() => sdkLocalities('<!DOCTYPE html><title>Just a moment...</title>')).toThrow('the SDK\'s locality.go has no AllZones');
+        expect(() => sdkLocalities(go.replace('var AllRegions', 'var Regions'))).toThrow('the SDK\'s locality.go has no AllRegions');
+        expect(() => sdkLocalities(go.replace(/var AllZones = \[\]Zone\{[^}]*\}/, 'var AllZones = []Zone{\n}'))).toThrow('the SDK\'s AllZones is empty');
+        expect(() => sdkLocalities(go.replace('\tZoneFrPar1,\n', '\tZoneFrPar9,\n'))).toThrow('the SDK\'s AllZones names ZoneFrPar9, which locality.go gives no name');
+    });
+
+    it('oneLine: an error as one line of the report, at most 300 characters, whatever was thrown', () => {
+        expect([oneLine(new Error('GET x answered 403 Forbidden\n<!DOCTYPE html>')), oneLine('said as a string'), oneLine(42)]).toEqual(['GET x answered 403 Forbidden', 'said as a string', '42']);
+        expect(oneLine(new Error('x'.repeat(400)))).toBe('x'.repeat(300));
     });
 });
 
