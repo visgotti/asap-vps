@@ -33,7 +33,8 @@ export class VastApi extends ApiClient {
         if (r.status === 401 || code === 'auth_error') return new AuthError(this.id, msg, o);
         // The machine was rented by someone else (or is gone): try another offer.
         if (r.status === 410 || code === 'no_such_ask' || /no_such_ask/.test(msg)) return new CapacityError(this.id, msg, o);
-        if (/balance|credit|insufficient funds/i.test(msg)) return new QuotaError(this.id, msg, o);
+        // The account's daily search quota, spent (429 "Daily search row quota exhausted", observed 2026-10-14): no wait undoes it before the day's turn.
+        if (/balance|credit|insufficient funds|quota exhausted/i.test(msg)) return new QuotaError(this.id, msg, o);
         if (r.status === 403) return new AuthError(this.id, msg, o);
         if (r.status === 404) return new NotFoundError(this.id, msg, o);
         if (r.status === 429) return new ProviderError(this.id, msg, { ...o, retriable: true });

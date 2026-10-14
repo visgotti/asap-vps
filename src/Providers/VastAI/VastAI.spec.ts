@@ -317,6 +317,20 @@ describe('Vast.ai API facts', () => {
         expect(sent).toBe(4);
     });
 
+    it('a daily search quota spent (seen 2026-10-14) is a QuotaError, which nothing retries: only the HTTP layer\'s few tries of any 429 are spent on it', async () => {
+        const fake = fakeVast();
+        let sent = 0;
+        const p = new VastAI({ apiKey: 'vast-test', sleep: noSleep, fetchImpl: answering(fake, (method, path) => {
+            if (method !== 'POST' || path !== '/api/v0/bundles/') return undefined;
+            sent++;
+            return json(429, { success: false, msg: 'Daily search row quota exhausted' });
+        }) });
+        const e = await p.listOffers().catch((x) => x);
+        expect([e.constructor.name, e.status, e.message, isRetriable(e)]).toEqual(['QuotaError', 429, 'vast: POST /api/v0/bundles/ -> 429 Daily search row quota exhausted', false]);
+        // The first search's tries, as for any 429 (http reads no body before it tries again); then no other search.
+        expect(sent).toBe(4);
+    });
+
     it('a key added with no name goes as the bare key', async () => {
         const { p, fake } = make();
         const line = testPublicKey('ignored');
